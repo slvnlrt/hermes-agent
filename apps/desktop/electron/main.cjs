@@ -23,6 +23,7 @@ const { fileURLToPath, pathToFileURL } = require('node:url')
 const { execFileSync, spawn } = require('node:child_process')
 const { isWindowsBinaryPathInWsl, isWslEnvironment } = require('./bootstrap-platform.cjs')
 const { runBootstrap } = require('./bootstrap-runner.cjs')
+const { canImportHermesCli, verifyHermesCli } = require('./backend-probes.cjs')
 const {
   DATA_URL_READ_MAX_BYTES,
   DEFAULT_FETCH_TIMEOUT_MS,
@@ -1350,15 +1351,28 @@ function resolveHermesBackend(dashboardArgs) {
     }
 
     if (hermesCommand) {
-      return {
-        label: `existing Hermes CLI at ${hermesCommand}`,
-        command: hermesCommand,
-        args: dashboardArgs,
-        bootstrap: false,
-        env: {},
-        kind: 'command',
-        shell: isCommandScript(hermesCommand)
+      // Smoke-test the candidate before trusting it. A `hermes` shim
+      // left behind by a half-uninstalled pip install (or a venv
+      // entry-point pointing at a deleted interpreter) still resolves
+      // via findOnPath but explodes on spawn -- the user then sees a
+      // dead backend instead of the first-launch installer. The cheap
+      // `--version` probe (see backend-probes.cjs) catches that case
+      // and lets the resolver fall through to step 6 / bootstrap.
+      const shellForProbe = isCommandScript(hermesCommand)
+      if (verifyHermesCli(hermesCommand, { shell: shellForProbe })) {
+        return {
+          label: `existing Hermes CLI at ${hermesCommand}`,
+          command: hermesCommand,
+          args: dashboardArgs,
+          bootstrap: false,
+          env: {},
+          kind: 'command',
+          shell: shellForProbe
+        }
       }
+      rememberLog(
+        `Ignoring existing Hermes CLI at ${hermesCommand}: --version probe failed; falling through to bootstrap.`
+      )
     }
   }
 
@@ -1367,15 +1381,28 @@ function resolveHermesBackend(dashboardArgs) {
   //    take ownership.
   const python = findSystemPython()
   if (python) {
-    return {
-      kind: 'python',
-      label: `installed hermes_cli module via ${python}`,
-      command: python,
-      args: ['-m', 'hermes_cli.main', ...dashboardArgs],
-      bootstrap: false,
-      env: {},
-      shell: false
+    // Same smoke-test rationale as step 4: a system Python in the
+    // SUPPORTED_VERSIONS range can be registered (PEP 514) without
+    // having hermes_cli installed -- common on dev boxes that have
+    // a python.org install from prior unrelated work. Returning that
+    // backend hands the spawn step a guaranteed ModuleNotFoundError.
+    // Verify the import works before trusting the candidate; on
+    // failure, fall through to step 6 so the bootstrap runner pulls
+    // a uv-managed 3.11 into %LOCALAPPDATA%\hermes\hermes-agent\venv.
+    if (canImportHermesCli(python)) {
+      return {
+        kind: 'python',
+        label: `installed hermes_cli module via ${python}`,
+        command: python,
+        args: ['-m', 'hermes_cli.main', ...dashboardArgs],
+        bootstrap: false,
+        env: {},
+        shell: false
+      }
     }
+    rememberLog(
+      `Ignoring system Python ${python}: hermes_cli is not importable; falling through to bootstrap.`
+    )
   }
 
   // 6. Nothing usable yet -- signal the bootstrap runner that we need to
