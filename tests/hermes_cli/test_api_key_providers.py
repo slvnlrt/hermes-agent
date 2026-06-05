@@ -692,22 +692,67 @@ class TestRuntimeProviderResolution:
 class TestHasAnyProviderConfigured:
 
     def test_glm_key_counts(self, monkeypatch, tmp_path):
+        import yaml
         from hermes_cli import config as config_module
         monkeypatch.setenv("GLM_API_KEY", "test-key")
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            yaml.dump({"model": {"default": "my-configured-model"}})
+        )
         monkeypatch.setattr(config_module, "get_env_path", lambda: hermes_home / ".env")
         monkeypatch.setattr(config_module, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         from hermes_cli.main import _has_any_provider_configured
         assert _has_any_provider_configured() is True
 
     def test_minimax_key_counts(self, monkeypatch, tmp_path):
+        import yaml
         from hermes_cli import config as config_module
         monkeypatch.setenv("MINIMAX_API_KEY", "test-key")
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            yaml.dump({"model": {"default": "my-configured-model"}})
+        )
         monkeypatch.setattr(config_module, "get_env_path", lambda: hermes_home / ".env")
         monkeypatch.setattr(config_module, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        from hermes_cli.main import _has_any_provider_configured
+        assert _has_any_provider_configured() is True
+
+    def test_stale_env_key_without_hermes_config_does_not_skip_onboarding(
+        self, monkeypatch, tmp_path
+    ):
+        """Regression test for #38471."""
+        from hermes_cli import config as config_module
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-stale-key-from-some-other-tool")
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        monkeypatch.setattr(config_module, "get_env_path", lambda: hermes_home / ".env")
+        monkeypatch.setattr(config_module, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr("hermes_cli.copilot_auth.resolve_copilot_token", lambda: ("", ""))
+        monkeypatch.setattr("hermes_cli.auth.get_auth_status", lambda _pid: {})
+        monkeypatch.setattr(
+            "agent.anthropic_adapter.read_claude_code_credentials", lambda: None,
+        )
+        from hermes_cli.main import _has_any_provider_configured
+        assert _has_any_provider_configured() is False
+
+    def test_stale_env_key_with_hermes_config_counts(self, monkeypatch, tmp_path):
+        import yaml
+        from hermes_cli import config as config_module
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-user-key-from-onboarding")
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            yaml.dump({"model": {"default": "anthropic/claude-opus-4.6", "provider": "openrouter"}})
+        )
+        monkeypatch.setattr(config_module, "get_env_path", lambda: hermes_home / ".env")
+        monkeypatch.setattr(config_module, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         from hermes_cli.main import _has_any_provider_configured
         assert _has_any_provider_configured() is True
 

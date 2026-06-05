@@ -665,12 +665,14 @@ def _has_any_provider_configured() -> bool:
     for pconfig in PROVIDER_REGISTRY.values():
         if pconfig.auth_type == "api_key":
             provider_env_vars.update(pconfig.api_key_env_vars)
-    if any(os.getenv(v) for v in provider_env_vars):
+    # Env-detected keys only count once Hermes has been explicitly set up
+    # — same precedent as the Claude Code path below. See #38471.
+    if _has_hermes_config and any(os.getenv(v) for v in provider_env_vars):
         return True
 
     # Check .env file for keys
     env_file = get_env_path()
-    if env_file.exists():
+    if _has_hermes_config and env_file.exists():
         try:
             for line in env_file.read_text(encoding="utf-8").splitlines():
                 line = line.strip()
