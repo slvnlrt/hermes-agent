@@ -1109,26 +1109,9 @@ def load_gateway_config() -> GatewayConfig:
             # Mattermost config bridge moved into plugins/platforms/mattermost/
             # adapter.py::_apply_yaml_config — see #25443 (apply_yaml_config_fn).
 
-            # Matrix settings → env vars (env vars take precedence)
-            matrix_cfg = yaml_cfg.get("matrix", {})
-            if isinstance(matrix_cfg, dict):
-                if "require_mention" in matrix_cfg and not os.getenv("MATRIX_REQUIRE_MENTION"):
-                    os.environ["MATRIX_REQUIRE_MENTION"] = str(matrix_cfg["require_mention"]).lower()
-                frc = matrix_cfg.get("free_response_rooms")
-                if frc is not None and not os.getenv("MATRIX_FREE_RESPONSE_ROOMS"):
-                    if isinstance(frc, list):
-                        frc = ",".join(str(v) for v in frc)
-                    os.environ["MATRIX_FREE_RESPONSE_ROOMS"] = str(frc)
-                # allowed_rooms: if set, bot ONLY responds in these rooms (whitelist)
-                ar = matrix_cfg.get("allowed_rooms")
-                if ar is not None and not os.getenv("MATRIX_ALLOWED_ROOMS"):
-                    if isinstance(ar, list):
-                        ar = ",".join(str(v) for v in ar)
-                    os.environ["MATRIX_ALLOWED_ROOMS"] = str(ar)
-                if "auto_thread" in matrix_cfg and not os.getenv("MATRIX_AUTO_THREAD"):
-                    os.environ["MATRIX_AUTO_THREAD"] = str(matrix_cfg["auto_thread"]).lower()
-                if "dm_mention_threads" in matrix_cfg and not os.getenv("MATRIX_DM_MENTION_THREADS"):
-                    os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
+            # Matrix settings → env vars: migrated to the matrix plugin's
+            # apply_yaml_config_fn hook (plugins/platforms/matrix/adapter.py).
+            # #41112 / #3823.
 
             # Feishu settings → env vars (env vars take precedence)
             feishu_cfg = yaml_cfg.get("feishu", {})
