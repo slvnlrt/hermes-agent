@@ -854,8 +854,18 @@ class TestWebServerEndpoints:
             # The proc should have been reaped and removed.
             assert waited, "proc.wait() was not called"
             assert name not in web_server._ACTION_PROCS
+
+            # A second poll, after the handle is gone, must still report the
+            # real exit code/pid from _ACTION_RESULTS rather than None.
+            status2 = self.client.get(f"/api/actions/{name}/status")
+            assert status2.status_code == 200
+            data2 = status2.json()
+            assert data2["running"] is False
+            assert data2["exit_code"] == 0
+            assert data2["pid"] == 99999
         finally:
             web_server._ACTION_PROCS.pop(name, None)
+            web_server._ACTION_RESULTS.pop(name, None)
 
     def test_get_status_filters_unconfigured_gateway_platforms(self, monkeypatch):
         import gateway.config as gateway_config

@@ -1698,6 +1698,10 @@ async def get_action_status(name: str, lines: int = 200):
             except Exception:
                 pass
             _ACTION_PROCS.pop(name, None)
+            # Preserve the result so subsequent polls keep reporting the real
+            # exit code/pid instead of falling back to None once the handle
+            # is gone.
+            _ACTION_RESULTS[name] = {"exit_code": exit_code, "pid": pid}
 
     return {
         "name": name,
