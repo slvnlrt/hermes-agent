@@ -281,14 +281,37 @@ function normalizeSshConfig(entry) {
   if (!entry || typeof entry !== 'object' || entry.mode !== 'ssh') {
     return null
   }
-  const host = String(entry.host || '').trim()
+  let host = String(entry.host || '').trim()
+  if (!host) {
+    return null
+  }
+  // Parse a user@host[:port] target typed into the single host field. Explicit
+  // user/port fields win, so filling the User field after typing user@host does
+  // NOT double up into user@user@host. A bare ~/.ssh/config alias is preserved.
+  let parsedUser
+  let parsedPort
+  const at = host.indexOf('@')
+  if (at > 0) {
+    parsedUser = host.slice(0, at)
+    host = host.slice(at + 1)
+  }
+  // Only split a trailing :port when there's exactly one colon and a numeric
+  // suffix — leaves IPv6 literals (multiple colons) and bare aliases alone.
+  if ((host.match(/:/g) || []).length === 1) {
+    const [h, p] = host.split(':')
+    if (/^\d+$/.test(p)) {
+      host = h
+      parsedPort = Number.parseInt(p, 10)
+    }
+  }
   if (!host) {
     return null
   }
   const out = { mode: 'ssh', host }
-  const user = String(entry.user || '').trim()
+  const user = String(entry.user || '').trim() || parsedUser || ''
   if (user) out.user = user
-  const port = Number.parseInt(String(entry.port ?? ''), 10)
+  const explicitPort = Number.parseInt(String(entry.port ?? ''), 10)
+  const port = Number.isInteger(explicitPort) && explicitPort > 0 ? explicitPort : parsedPort
   if (Number.isInteger(port) && port > 0 && port !== 22) {
     out.port = port
   }

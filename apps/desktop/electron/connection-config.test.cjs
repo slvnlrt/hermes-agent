@@ -430,6 +430,37 @@ test('normalizeSshConfig preserves a non-default port', () => {
   })
 })
 
+test('normalizeSshConfig parses user@host typed into the host field', () => {
+  assert.deepEqual(normalizeSshConfig({ mode: 'ssh', host: 'jonny@mac-mini' }), {
+    mode: 'ssh',
+    host: 'mac-mini',
+    user: 'jonny'
+  })
+})
+
+test('normalizeSshConfig parses user@host:port and drops a default :22', () => {
+  assert.deepEqual(normalizeSshConfig({ mode: 'ssh', host: 'jonny@box:2222' }), {
+    mode: 'ssh',
+    host: 'box',
+    user: 'jonny',
+    port: 2222
+  })
+  assert.deepEqual(normalizeSshConfig({ mode: 'ssh', host: 'box:22' }), { mode: 'ssh', host: 'box' })
+})
+
+test('normalizeSshConfig: explicit user/port win over user@host:port (no user@user@host)', () => {
+  assert.deepEqual(
+    normalizeSshConfig({ mode: 'ssh', host: 'jonny@box:2222', user: 'admin', port: 2200 }),
+    { mode: 'ssh', host: 'box', user: 'admin', port: 2200 }
+  )
+})
+
+test('normalizeSshConfig leaves a bare ~/.ssh/config alias and IPv6 literals alone', () => {
+  assert.deepEqual(normalizeSshConfig({ mode: 'ssh', host: 'mac-mini' }), { mode: 'ssh', host: 'mac-mini' })
+  // IPv6 (multiple colons) must NOT be split as host:port
+  assert.deepEqual(normalizeSshConfig({ mode: 'ssh', host: 'fe80::1' }), { mode: 'ssh', host: 'fe80::1' })
+})
+
 test('profileSshOverride returns a profile-scoped ssh descriptor or null', () => {
   const config = { profiles: { work: { mode: 'ssh', host: 'mac-mini', user: 'jonny' }, other: { mode: 'remote', url: 'http://x' } } }
   assert.deepEqual(profileSshOverride(config, 'work'), { mode: 'ssh', host: 'mac-mini', user: 'jonny' })
