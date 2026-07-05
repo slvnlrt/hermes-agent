@@ -327,6 +327,29 @@ def get_session_env(name: str, default: str = "") -> str:
     return os.getenv(name, default)
 
 
+def get_verified_principal(default: str = "") -> str:
+    """Return the verified platform identity of the current message's speaker.
+
+    This is a documented accessor over the ``HERMES_SESSION_USER_ID`` context
+    variable, which the gateway sets **per message** from the transport-verified
+    ``source.user_id`` (e.g. Teams ``aad_object_id``, Signal UUID) and
+    propagates into tool threads via ``copy_context``. In a shared/group session
+    the same cached agent handles several speakers, but this var is rebound on
+    every turn, so it always reflects the current turn's speaker.
+
+    Authorization guarantee: the value is the platform's **verified** id for the
+    speaker. The display name (``HERMES_SESSION_USER_NAME``) is user-controlled
+    and is NEVER an authorization signal — always gate on this id, never on the
+    name.
+
+    Scope: reliably set on the gateway path. On the CLI / cron / other
+    entrypoints the var may be unset and this returns *default* (empty string) —
+    callers that gate on it must decide their own policy for the empty case
+    (typically: trust the local operator, or fail closed).
+    """
+    return get_session_env("HERMES_SESSION_USER_ID", default)
+
+
 def async_delivery_supported() -> bool:
     """Whether the current session can deliver a background completion later.
 
