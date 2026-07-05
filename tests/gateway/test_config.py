@@ -1024,6 +1024,89 @@ class TestLoadGatewayConfig:
             "C01ABC": "Code review mode",
         }
 
+    def test_loads_discord_channel_overrides_toolsets_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "discord:\n"
+            "  channel_overrides:\n"
+            "    \"123\":\n"
+            "      toolsets: [hermes-channel-safe]\n"
+            "    456:\n"
+            "      toolsets: [hermes-channel-safe]\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        overrides = config.platforms[Platform.DISCORD].channel_overrides
+        # numeric YAML key (456) is normalized to a string at load time
+        assert overrides["123"].toolsets == ["hermes-channel-safe"]
+        assert overrides["456"].toolsets == ["hermes-channel-safe"]
+
+    def test_loads_telegram_channel_overrides_toolsets_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "telegram:\n"
+            "  channel_overrides:\n"
+            '    "-1001234567":\n'
+            "      toolsets: [hermes-channel-safe]\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        overrides = config.platforms[Platform.TELEGRAM].channel_overrides
+        assert overrides["-1001234567"].toolsets == ["hermes-channel-safe"]
+
+    def test_loads_slack_channel_overrides_toolsets_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "slack:\n"
+            "  channel_overrides:\n"
+            '    "C01ABC":\n'
+            "      toolsets: [hermes-channel-safe]\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        overrides = config.platforms[Platform.SLACK].channel_overrides
+        assert overrides["C01ABC"].toolsets == ["hermes-channel-safe"]
+
+    def test_loads_slack_channel_overrides_memory_mode_from_config_yaml(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "slack:\n"
+            "  channel_overrides:\n"
+            '    "C01ABC":\n'
+            '      memory_mode: "off"\n'
+            "    C02XYZ:\n"
+            "      memory_mode: full\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        overrides = config.platforms[Platform.SLACK].channel_overrides
+        assert overrides["C01ABC"].memory_mode == "off"
+        assert overrides["C02XYZ"].memory_mode == "full"
+
     def test_bridges_feishu_allow_bots_from_config_yaml_to_env(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

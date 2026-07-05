@@ -418,6 +418,15 @@ class ChannelOverride:
     model: Optional[str] = None
     provider: Optional[str] = None
     system_prompt: Optional[str] = None
+    # Per-channel toolset override (list of toolset names). None = inherit the
+    # platform default toolset unchanged. Used to lock a shared/team channel to
+    # a restricted profile (e.g. ["hermes-channel-safe"]).
+    toolsets: Optional[List[str]] = None
+    # Per-channel memory mode: "full" (default) or "off". "off" disables memory
+    # reads and writes for this conversation. None = inherit the default (full).
+    # "ambient" is reserved (spec vague 1 §W3) but unimplemented — an
+    # unrecognized value is treated as absent by the resolver.
+    memory_mode: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
@@ -427,16 +436,27 @@ class ChannelOverride:
             out["provider"] = self.provider
         if self.system_prompt is not None:
             out["system_prompt"] = self.system_prompt
+        if self.toolsets is not None:
+            out["toolsets"] = list(self.toolsets)
+        if self.memory_mode is not None:
+            out["memory_mode"] = self.memory_mode
         return out
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ChannelOverride":
         if not data:
             return cls()
+        raw_toolsets = data.get("toolsets")
+        toolsets: Optional[List[str]] = None
+        if isinstance(raw_toolsets, list):
+            names = [str(v).strip() for v in raw_toolsets if str(v).strip()]
+            toolsets = names or None
         return cls(
             model=data.get("model"),
             provider=data.get("provider"),
             system_prompt=data.get("system_prompt"),
+            toolsets=toolsets,
+            memory_mode=data.get("memory_mode"),
         )
 
 

@@ -821,6 +821,44 @@ platform_toolsets:
   google_chat: [hermes-google_chat]
 
 # =============================================================================
+# Per-Channel Overrides (channel_overrides: toolsets + memory_mode)
+# =============================================================================
+# channel_overrides resolves config PER CONVERSATION (by chat_id, with parent
+# inheritance for forum threads / child channels) rather than per-platform. It
+# already carries model / provider / system_prompt overrides; the toolsets and
+# memory_mode keys extend the same mechanism to tool access and memory.
+#
+# Precedence: platform default (platform_toolsets above) < parent channel <
+# exact channel/thread id — an exact entry wins over an inherited parent one,
+# which wins over the platform default. A channel override REPLACES the
+# platform default toolset list (not merged).
+#
+# Lives under each platform's own section (discord:, telegram:, slack:,
+# mattermost:), keyed by that platform's chat_id (Discord channel/thread id,
+# Telegram chat id, Slack channel id). Numeric YAML keys are normalized to
+# strings at load time — quote them or leave them bare, both work.
+#
+#   toolsets: same names as platform_toolsets (presets or individual toolsets).
+#     Use this to restrict a shared/team channel without touching the operator's
+#     own DM: give a shared channel only the `hermes-channel-safe` preset (web
+#     research + read-only tools; no terminal/execute_code/write/delegate_task/
+#     kanban/cronjob/memory) while a DM keeps the full default.
+#
+#   memory_mode: "full" (default, today's behavior) or "off" (no memory
+#     reads/writes for that conversation — built-in MEMORY.md/USER.md and any
+#     configured external memory provider are both skipped). "ambient" is a
+#     reserved name for a future partial mode; it is NOT implemented and is
+#     currently treated the same as leaving the key unset.
+#
+#   slack:
+#     channel_overrides:
+#       "C0TEAMCHANNEL":
+#         toolsets: [hermes-channel-safe]
+#         memory_mode: "off"   # don't let cross-user channel chatter leak into memory
+#       "C0OPSCHANNEL":
+#         toolsets: [hermes-slack]   # another channel keeps full access
+#
+# =============================================================================
 # Gateway Platform Settings
 # =============================================================================
 # Optional per-platform messaging settings.
