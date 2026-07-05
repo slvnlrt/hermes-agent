@@ -13264,7 +13264,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
 
+    def _channel_override_for_source(self, source: "SessionSource") -> "Optional[ChannelOverride]":
+        """Per-channel override for ``source`` via ``channel_overrides``.
 
+        Resolves exactly like model/system_prompt overrides
+        (:func:`_get_channel_override`): exact channel/thread id
+        (``source.chat_id``) wins, then parent channel
+        (``source.parent_chat_id``) for forum threads / child channels.
+        Returns None when the gateway has no structured ``self.config``
+        (tests, early startup) or no override applies.
+        """
+        config = getattr(self, "config", None)
+        if not config:
+            return None
+        return _get_channel_override(
+            config,
+            source.platform,
+            str(source.chat_id) if source.chat_id else "",
+            thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
+            parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
+        )
+
+    def _resolve_channel_toolset_override(self, source: "SessionSource") -> Optional[List[str]]:
+        """Per-channel/thread toolset override for ``source``.
+
+        Reads ``toolsets`` off the resolved ``channel_overrides`` entry
+        (exact channel/thread beats parent). Returns None when no override
+        applies, meaning the platform default toolset applies unchanged
+        (full backward compatibility).
+        """
+        override = self._channel_override_for_source(source)
+        return override.toolsets if override else None
+
+    def _resolve_channel_memory_mode(self, source: "SessionSource") -> Optional[str]:
+        """Per-channel/thread memory mode for ``source``.
+
+        Reads ``memory_mode`` off the resolved ``channel_overrides`` entry.
+        Returns "full" or "off"; an unset or unrecognized value (including
+        the reserved-but-unimplemented "ambient") yields None — callers treat
+        None as the default (memory stays on).
+        """
+        override = self._channel_override_for_source(source)
+        if not override or override.memory_mode is None:
+            return None
+        mode = str(override.memory_mode).strip().lower()
+        return mode if mode in ("full", "off") else None
 
     async def _run_background_task(
         self,
@@ -13306,8 +13350,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             from hermes_cli.tools_config import _get_platform_tools
             enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            _toolset_override = self._resolve_channel_toolset_override(source)
+            if _toolset_override is not None:
+                # channel/thread override REPLACES the platform default —
+                # simplest, safest precedence for v1 (no partial-compose
+                # ambiguity between a restrictive channel list and the
+                # platform's broader default).
+                enabled_toolsets = sorted(set(_toolset_override))
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
+            _channel_memory_mode = self._resolve_channel_memory_mode(source)
 
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
@@ -13363,6 +13415,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
+                    skip_memory=(_channel_memory_mode == "off"),
                 )
                 try:
                     return agent.run_conversation(
@@ -16972,8 +17025,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        _toolset_override = self._resolve_channel_toolset_override(source)
+        if _toolset_override is not None:
+            # channel/thread override REPLACES the platform default — see
+            # the matching comment in _run_background_task for why v1
+            # picks replace over compose.
+            enabled_toolsets = sorted(set(_toolset_override))
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
+        _channel_memory_mode = self._resolve_channel_memory_mode(source)
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -18084,12 +18144,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
             # schemas for prompt cache hits.
+            _cache_keys = self._extract_cache_busting_config(user_config)
+            # Include the resolved channel_memory_modes value so an operator
+            # flipping a channel between "full" and "off" invalidates any
+            # already-cached agent for that session on the very next turn,
+            # the same way an enabled_toolsets edit does — rather than only
+            # taking effect after the cached agent is next evicted.
+            _cache_keys["channel_memory_mode"] = _channel_memory_mode or "full"
             _sig = self._agent_config_signature(
                 turn_route["model"],
                 turn_route["runtime"],
                 enabled_toolsets,
                 combined_ephemeral,
-                cache_keys=self._extract_cache_busting_config(user_config),
+                cache_keys=_cache_keys,
                 user_id=getattr(source, "user_id", None),
                 user_id_alt=getattr(source, "user_id_alt", None),
             )
@@ -18250,6 +18317,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
+                    skip_memory=(_channel_memory_mode == "off"),
                 )
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
