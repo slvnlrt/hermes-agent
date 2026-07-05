@@ -200,7 +200,10 @@ class TestSlackApprovalAction:
             await adapter._handle_approval_action(ack, body, action)
 
         ack.assert_called_once()
-        mock_resolve.assert_called_once_with("agent:main:slack:group:C1:1111", "once")
+        # Resolution is bound to the verified clicker id.
+        mock_resolve.assert_called_once_with(
+            "agent:main:slack:group:C1:1111", "once", clicker_id="U_NORBERT"
+        )
 
         # Message should be updated with decision
         mock_client.chat_update.assert_called_once()
@@ -211,7 +214,7 @@ class TestSlackApprovalAction:
     async def test_prevents_double_click(self):
         adapter = _make_adapter()
         _attach_auth_runner(adapter)
-        adapter._approval_resolved["1234.5678"] = True  # Already resolved
+        adapter._approval_resolved["1234.5678"] = False
 
         ack = AsyncMock()
         body = {
@@ -224,12 +227,16 @@ class TestSlackApprovalAction:
             "value": "some-session",
         }
 
-        with patch("tools.approval.resolve_gateway_approval") as mock_resolve:
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+
+        # resolve reports 0 resolved → already handled / expired: the card must
+        # NOT be updated a second time.
+        with patch("tools.approval.resolve_gateway_approval", return_value=0):
             await adapter._handle_approval_action(ack, body, action)
 
-        # Should have acked but NOT resolved
         ack.assert_called_once()
-        mock_resolve.assert_not_called()
+        mock_client.chat_update.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_deny_action(self):
@@ -253,9 +260,52 @@ class TestSlackApprovalAction:
         with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
             await adapter._handle_approval_action(ack, body, action)
 
-        mock_resolve.assert_called_once_with("session-key", "deny")
+        mock_resolve.assert_called_once_with(
+            "session-key", "deny", clicker_id="U_ALICE"
+        )
         update_kwargs = mock_client.chat_update.call_args[1]
         assert "Denied by alice" in update_kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_wrong_requester_click_rejected(self):
+        """An allowlisted user who is not the requester cannot resolve or
+        update the card, and gets an ephemeral rejection."""
+        from tools.approval import REQUESTER_MISMATCH
+
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._approval_resolved["1234.5678"] = False
+
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "1234.5678", "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": "cmd"}},
+            ]},
+            "channel": {"id": "C1"},
+            "user": {"name": "mallory", "id": "U_OTHER"},
+        }
+        action = {
+            "action_id": "hermes_approve_once",
+            "value": "agent:main:slack:group:C1:1111",
+        }
+
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+        mock_client.chat_postEphemeral = AsyncMock()
+
+        with patch(
+            "tools.approval.resolve_gateway_approval", return_value=REQUESTER_MISMATCH
+        ) as mock_resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        mock_resolve.assert_called_once_with(
+            "agent:main:slack:group:C1:1111", "once", clicker_id="U_OTHER"
+        )
+        # No card update, and the double-click token is untouched so the real
+        # requester can still resolve.
+        mock_client.chat_update.assert_not_called()
+        assert adapter._approval_resolved.get("1234.5678") is False
+        mock_client.chat_postEphemeral.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_global_allowlist_blocks_unauthorized_click(self, monkeypatch):

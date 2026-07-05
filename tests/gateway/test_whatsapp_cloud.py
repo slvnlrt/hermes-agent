@@ -1945,7 +1945,9 @@ class TestDispatchInteractiveReplyApproval:
         calls = []
         monkeypatch.setattr(
             "tools.approval.resolve_gateway_approval",
-            lambda session_key, choice: calls.append((session_key, choice)) or 1,
+            lambda session_key, choice, clicker_id=None: (
+                calls.append((session_key, choice, clicker_id)) or 1
+            ),
         )
 
         raw = {
@@ -1959,7 +1961,8 @@ class TestDispatchInteractiveReplyApproval:
         handled = await adapter._dispatch_interactive_reply(raw, {})
 
         assert handled is True
-        assert calls == [("sess-app-1", "approve")]
+        # Resolution is bound to the verified clicker (wa_id from `from`).
+        assert calls == [("sess-app-1", "approve", "15551234567")]
         assert "app1" not in adapter._exec_approval_state
         confirm_payload = adapter._http_client.post.call_args.kwargs["json"]
         assert confirm_payload["type"] == "text"
@@ -1977,7 +1980,9 @@ class TestDispatchInteractiveReplyApproval:
         choices_seen = []
         monkeypatch.setattr(
             "tools.approval.resolve_gateway_approval",
-            lambda session_key, choice: choices_seen.append(choice) or 1,
+            lambda session_key, choice, clicker_id=None: (
+                choices_seen.append(choice) or 1
+            ),
         )
 
         raw = {
@@ -1993,6 +1998,40 @@ class TestDispatchInteractiveReplyApproval:
         assert choices_seen == ["deny"]
         confirm_payload = adapter._http_client.post.call_args.kwargs["json"]
         assert "Denied" in confirm_payload["text"]["body"]
+
+    @pytest.mark.asyncio
+    async def test_wrong_requester_tap_rejected(self, monkeypatch):
+        """A mismatched (but allowlisted) tapper cannot resolve or drop state."""
+        from tools.approval import REQUESTER_MISMATCH
+
+        adapter = _make_adapter()
+        adapter._exec_approval_state["app3"] = "sess-app-3"
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(
+            return_value=_mock_httpx_response(200, {"messages": [{"id": "x"}]})
+        )
+
+        monkeypatch.setattr(
+            "tools.approval.resolve_gateway_approval",
+            lambda session_key, choice, clicker_id=None: REQUESTER_MISMATCH,
+        )
+
+        raw = {
+            "from": "15559999999",
+            "type": "interactive",
+            "interactive": {
+                "type": "button_reply",
+                "button_reply": {"id": "appr:app3:approve", "title": "Approve"},
+            },
+        }
+        handled = await adapter._dispatch_interactive_reply(raw, {})
+
+        # Claimed (True) but state is preserved so the real requester can resolve.
+        assert handled is True
+        assert adapter._exec_approval_state.get("app3") == "sess-app-3"
+        # The tapper is told why nothing happened.
+        reject_payload = adapter._http_client.post.call_args.kwargs["json"]
+        assert "Only the user who ran this command" in reject_payload["text"]["body"]
 
 
 class TestDispatchInteractiveReplySlashConfirm:

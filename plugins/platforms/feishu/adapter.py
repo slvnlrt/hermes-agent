@@ -2711,10 +2711,40 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
-        sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(operator, "user_id", "") or ""))
+        operator_user_id = str(getattr(operator, "user_id", "") or "")
+        operator_union_id = str(getattr(operator, "union_id", "") or "")
+        sender_id = SimpleNamespace(open_id=open_id, user_id=operator_user_id)
         if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
             logger.warning("[Feishu] Unauthorized approval click by %s", open_id or "<unknown>")
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        # Verified clicker identity, mirroring how the message path builds
+        # ``source.user_id_alt or source.user_id`` (union_id preferred, then the
+        # tenant-scoped user_id, then the app-scoped open_id). Binding the
+        # resolution to the requester happens synchronously here so a mismatched
+        # (but allowlisted) clicker gets a clear rejection instead of a
+        # misleading confirmation card.
+        clicker_id = operator_union_id or operator_user_id or open_id
+        from tools.approval import gateway_approval_requester_blocks
+        if gateway_approval_requester_blocks(state.get("session_key", ""), clicker_id):
+            logger.warning(
+                "[Feishu] approval click by %s rejected: not the requester",
+                clicker_id or "<unknown>",
+            )
+            # Leave the original card (buttons intact) so the real requester can
+            # still resolve it; a toast tells the mismatched clicker why nothing
+            # happened. Returning an empty response performs no card update.
+            if P2CardActionTriggerResponse is None:
+                return None
+            response = P2CardActionTriggerResponse()
+            try:
+                response.toast = {
+                    "type": "error",
+                    "content": "Only the user who ran this command can approve or deny it.",
+                }
+            except Exception:
+                pass
+            return response
 
         callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
         expected_chat_id = str(state.get("chat_id", "") or "")
@@ -2739,6 +2769,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 user_name=user_name,
                 open_id=open_id,
                 chat_id=chat_id,
+                clicker_id=clicker_id,
             ),
         ):
             return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
@@ -2818,6 +2849,7 @@ class FeishuAdapter(BasePlatformAdapter):
         *,
         open_id: str = "",
         chat_id: str = "",
+        clicker_id: str = "",
     ) -> None:
         """Pop approval state and unblock the waiting agent thread."""
         state = self._approval_state.get(approval_id)
@@ -2834,19 +2866,34 @@ class FeishuAdapter(BasePlatformAdapter):
                 approval_id, expected_chat_id, chat_id,
             )
             return
-        state = self._approval_state.pop(approval_id, None)
-        if not state:
-            logger.debug("[Feishu] Approval %s already resolved while validating callback", approval_id)
-            return
+        # Bind the resolution to the verified requester BEFORE popping state, so
+        # a mismatched (but allowlisted) clicker cannot drop another user's
+        # pending approval. The sync handler already rejects mismatches; this is
+        # defense-in-depth for direct callers.
         try:
-            from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(state["session_key"], choice)
-            logger.info(
-                "Feishu button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                count, state["session_key"], choice, user_name,
+            from tools.approval import resolve_gateway_approval, REQUESTER_MISMATCH
+        except Exception as exc:
+            logger.error("Failed to import gateway approval resolver: %s", exc)
+            return
+        session_key = state["session_key"]
+        try:
+            count = resolve_gateway_approval(
+                session_key, choice, clicker_id=(clicker_id or open_id),
             )
         except Exception as exc:
             logger.error("Failed to resolve gateway approval from Feishu button: %s", exc)
+            return
+        if count == REQUESTER_MISMATCH:
+            logger.warning(
+                "[Feishu] approval %s not resolved: clicker is not the requester",
+                approval_id,
+            )
+            return
+        self._approval_state.pop(approval_id, None)
+        logger.info(
+            "Feishu button resolved %d approval(s) for session %s (choice=%s, user=%s)",
+            count, session_key, choice, user_name,
+        )
 
     async def _resolve_update_prompt(
         self,

@@ -1733,7 +1733,10 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if len(parts) != 3:
                 return False
             _, approval_id, choice = parts
-            session_key = self._exec_approval_state.pop(approval_id, None)
+            # Peek (do NOT pop yet): the requester binding check must run before
+            # we consume the approval state so a mismatched (but allowlisted)
+            # clicker can't drop another user's pending approval.
+            session_key = self._exec_approval_state.get(approval_id)
             if not session_key:
                 logger.info(
                     "[whatsapp_cloud] approval tap with no matching state "
@@ -1742,16 +1745,34 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 )
                 return False
             if choice not in ("approve", "deny"):
-                self._exec_approval_state[approval_id] = session_key
                 return False
             try:
-                from tools.approval import resolve_gateway_approval
+                from tools.approval import resolve_gateway_approval, REQUESTER_MISMATCH
             except ImportError:
                 logger.warning(
                     "[whatsapp_cloud] approval resolver unavailable"
                 )
                 return False
-            count = resolve_gateway_approval(session_key, choice)
+            # wa_id of the tapper — same namespace as source.user_id.
+            clicker_id = str(raw_message.get("from") or "")
+            count = resolve_gateway_approval(
+                session_key, choice, clicker_id=clicker_id,
+            )
+            if count == REQUESTER_MISMATCH:
+                logger.warning(
+                    "[whatsapp_cloud] approval tap by %s rejected: not the requester",
+                    clicker_id,
+                )
+                try:
+                    await self.send(
+                        clicker_id,
+                        "⛔ Only the user who ran this command can approve or deny it.",
+                    )
+                except Exception:
+                    logger.exception("[whatsapp_cloud] approval reject notice failed")
+                return True
+            # Resolved (or already resolved): consume the state now.
+            self._exec_approval_state.pop(approval_id, None)
             if not count:
                 logger.info(
                     "[whatsapp_cloud] approval resolver reported no waiter "

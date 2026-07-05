@@ -3263,10 +3263,21 @@ class MatrixAdapter(BasePlatformAdapter):
                     )
                     return
                 try:
-                    from tools.approval import resolve_gateway_approval
+                    from tools.approval import resolve_gateway_approval, REQUESTER_MISMATCH
 
-                    count = resolve_gateway_approval(prompt.session_key, choice)
-                    if count:
+                    # Bind to the verified reactor: the Matrix sender id is the
+                    # same namespace as source.user_id, so only the requester
+                    # may resolve their own approval.
+                    count = resolve_gateway_approval(
+                        prompt.session_key, choice, clicker_id=sender,
+                    )
+                    if count == REQUESTER_MISMATCH:
+                        await self._send_invalid_reaction_feedback(
+                            room_id,
+                            reacts_to,
+                            "Only the user who ran this command can approve or deny it.",
+                        )
+                    elif count:
                         prompt.resolved = True
                         self._approval_prompts_by_event.pop(reacts_to, None)
                         self._approval_prompt_by_session.pop(prompt.session_key, None)

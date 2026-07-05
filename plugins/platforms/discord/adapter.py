@@ -6900,7 +6900,41 @@ def _define_discord_view_classes() -> None:
                 )
                 return
 
+            # Bind the resolution to the verified clicker BEFORE marking this
+            # view resolved or editing the embed, so a mismatched (but
+            # allowlisted) clicker cannot lock out the real requester. The
+            # clicker id is in the same namespace as source.user_id
+            # (str(author.id)).
+            clicker_id = str(interaction.user.id)
+            from tools.approval import resolve_gateway_approval, REQUESTER_MISMATCH
+            try:
+                count = resolve_gateway_approval(
+                    self.session_key, choice, clicker_id=clicker_id,
+                )
+            except Exception as exc:
+                logger.error("Failed to resolve gateway approval from button: %s", exc)
+                await interaction.response.send_message(
+                    "Something went wrong resolving this approval~", ephemeral=True
+                )
+                return
+
+            if count == REQUESTER_MISMATCH:
+                await interaction.response.send_message(
+                    "⛔ Only the user who ran this command can approve or deny it.",
+                    ephemeral=True,
+                )
+                return
+            if count <= 0:
+                await interaction.response.send_message(
+                    "This approval has already been resolved~", ephemeral=True
+                )
+                return
+
             self.resolved = True
+            logger.info(
+                "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
+                count, self.session_key, choice, interaction.user.display_name,
+            )
 
             # Update the embed with the decision
             embed = interaction.message.embeds[0] if interaction.message.embeds else None
@@ -6913,17 +6947,6 @@ def _define_discord_view_classes() -> None:
                 child.disabled = True
 
             await interaction.response.edit_message(embed=embed, view=self)
-
-            # Unblock the waiting agent thread via the gateway approval queue
-            try:
-                from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice)
-                logger.info(
-                    "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                    count, self.session_key, choice, interaction.user.display_name,
-                )
-            except Exception as exc:
-                logger.error("Failed to resolve gateway approval from button: %s", exc)
 
         @discord.ui.button(label="Allow Once", style=discord.ButtonStyle.green)
         async def allow_once(

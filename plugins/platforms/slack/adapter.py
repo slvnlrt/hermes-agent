@@ -3616,7 +3616,41 @@ class SlackAdapter(BasePlatformAdapter):
         }
         choice = choice_map.get(action_id, "deny")
 
-        # Prevent double-clicks — atomic pop; first caller gets False, others get True (default)
+        # Resolve first, binding the decision to the verified clicker. This must
+        # precede the double-click token pop and the card update so a mismatched
+        # (but allowlisted) clicker cannot lock out the real requester.
+        from tools.approval import resolve_gateway_approval, REQUESTER_MISMATCH
+        try:
+            count = resolve_gateway_approval(session_key, choice, clicker_id=user_id)
+        except Exception as exc:
+            logger.error(
+                "Failed to resolve gateway approval from Slack button: %s",
+                exc, exc_info=True,
+            )
+            return
+        if count == REQUESTER_MISMATCH:
+            logger.warning(
+                "[Slack] approval click by %s (%s) rejected: not the requester",
+                user_name, user_id,
+            )
+            try:
+                await self._get_client(channel_id).chat_postEphemeral(
+                    channel=channel_id,
+                    user=user_id,
+                    text="⛔ Only the user who ran this command can approve or deny it.",
+                )
+            except Exception:
+                pass
+            return
+        if count <= 0:
+            # Already resolved (incl. genuine double-click) or expired.
+            return
+        logger.info(
+            "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)",
+            count, session_key, choice, user_name,
+        )
+
+        # Prevent duplicate card updates — atomic pop; first caller gets False, others get True (default)
         if self._approval_resolved.pop(msg_ts, True):
             return
 
@@ -3662,24 +3696,7 @@ class SlackAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[Slack] Failed to update approval message: %s", e)
 
-        # Resolve the approval — this unblocks the agent thread
-        try:
-            from tools.approval import resolve_gateway_approval
-
-            count = resolve_gateway_approval(session_key, choice)
-            logger.info(
-                "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                count,
-                session_key,
-                choice,
-                user_name,
-            )
-        except Exception as exc:
-            logger.error(
-                "Failed to resolve gateway approval from Slack button: %s", exc
-            )
-
-        # (approval state already consumed by atomic pop above)
+        # (approval already resolved and bound to the requester above)
 
     # ----- Thread context fetching -----
 

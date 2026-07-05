@@ -1184,6 +1184,12 @@ class TeamsAdapter(BasePlatformAdapter):
                 body=AdaptiveCardActionMessageResponse(value="Unknown action."),
             )
 
+        # Verified identity of the clicker (aad_object_id preferred, stable).
+        # Used both for the allowlist gate below and to bind the resolution to
+        # the original requester in resolve_gateway_approval.
+        from_account = ctx.activity.from_
+        clicker_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
+
         # Only authorized users may click approval buttons.
         # Default-deny: require either TEAMS_ALLOWED_USERS or an explicit
         # TEAMS_ALLOW_ALL_USERS=true opt-in. Without one of these set, the
@@ -1204,8 +1210,6 @@ class TeamsAdapter(BasePlatformAdapter):
                         value="⛔ Approval buttons require TEAMS_ALLOWED_USERS to be configured."
                     ),
                 )
-            from_account = ctx.activity.from_
-            clicker_id = getattr(from_account, "aad_object_id", None) or getattr(from_account, "id", "")
             allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
             if "*" not in allowed_ids and clicker_id not in allowed_ids:
                 logger.warning("[teams] Unauthorized card action by %s — ignoring", clicker_id)
@@ -1237,7 +1241,34 @@ class TeamsAdapter(BasePlatformAdapter):
                 ),
             )
 
-        resolve_gateway_approval(session_key, choice)
+        from tools.approval import REQUESTER_MISMATCH
+
+        count = resolve_gateway_approval(session_key, choice, clicker_id=clicker_id)
+        if count == REQUESTER_MISMATCH:
+            # A different (though allowlisted) user clicked: only the verified
+            # requester may resolve their own approval. Do not build the
+            # misleading confirmation card below.
+            logger.warning(
+                "[teams] card action by %s rejected: not the approval's requester",
+                clicker_id,
+            )
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionMessageResponse(
+                    value="⛔ Only the user who ran this command can approve or deny it."
+                ),
+            )
+        if count <= 0:
+            # Nothing was resolved (already handled / expired concurrently):
+            # avoid showing a confirmation card that implies this click acted.
+            return InvokeResponse(
+                status=200,
+                body=AdaptiveCardActionCardResponse(
+                    value=AdaptiveCard()
+                    .with_version("1.4")
+                    .with_body([TextBlock(text="⚠️ Approval already resolved or expired.", wrap=True)])
+                ),
+            )
 
         label_map = {
             "once": "✅ Allowed (once)",
