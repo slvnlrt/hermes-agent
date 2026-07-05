@@ -291,3 +291,42 @@ class TestResolveToolsetIncludeRegistry:
 
     def test_registry_only_toolset_static_view_is_empty(self):
         assert resolve_toolset("__definitely_not_a_real_toolset__", include_registry=False) == []
+
+
+class TestChannelSafeToolset:
+    """`hermes-channel-safe` is the restricted profile for shared/team
+    channels (channel_toolsets override) — must never carry a tool that
+    can act on the host, persist state, hand off work, or reach another
+    conversation.
+    """
+
+    def test_is_valid_and_resolves(self):
+        assert validate_toolset("hermes-channel-safe") is True
+        tools = set(resolve_toolset("hermes-channel-safe"))
+        assert tools == {
+            "web_search", "web_extract",
+            "vision_analyze",
+            "read_file", "search_files",
+            "session_search",
+            "clarify",
+        }
+
+    def test_excludes_dangerous_tools(self):
+        tools = set(resolve_toolset("hermes-channel-safe"))
+        dangerous = {
+            "terminal", "process", "execute_code",
+            "write_file", "patch",
+            "delegate_task",
+            "cronjob",
+            "memory",
+            "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
+            "kanban_heartbeat", "kanban_comment", "kanban_create",
+            "kanban_link", "kanban_unblock",
+            "browser_navigate", "browser_click", "browser_type",
+        }
+        assert not (tools & dangerous), f"unsafe tools leaked in: {tools & dangerous}"
+
+    def test_excluded_from_hermes_gateway_union(self):
+        # Not a per-platform bundle — must not be pulled into the gateway
+        # union toolset.
+        assert "hermes-channel-safe" not in TOOLSETS["hermes-gateway"]["includes"]
