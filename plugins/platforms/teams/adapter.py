@@ -18,6 +18,11 @@ Configuration in config.yaml:
           client_secret: "your-secret"      # or TEAMS_CLIENT_SECRET env var
           tenant_id: "your-tenant-id"       # or TEAMS_TENANT_ID env var
           port: 3978                        # or TEAMS_PORT env var
+          public_base_url: "https://bot.example.com"  # or TEAMS_PUBLIC_BASE_URL —
+            # public origin of this webhook server (e.g. the tunnel hostname).
+            # Enables outbound file delivery: local media are served from
+            # short-lived capability URLs under /media/ instead of base64 data
+            # URIs, which Teams silently drops for non-image content.
 """
 
 from __future__ import annotations
@@ -27,7 +32,9 @@ import html
 import json
 import logging
 import os
+import secrets
 import time
+from collections import OrderedDict
 from typing import Any, Dict, Optional, Tuple
 from urllib.parse import quote
 
@@ -108,6 +115,50 @@ _DEFAULT_PORT = 3978
 # aiohttp client_max_size keeps oversized/chunked request bodies bounded.
 _MAX_BODY_BYTES = 1_048_576
 _WEBHOOK_PATH = "/api/messages"
+# Outbound media capability URLs: default lifetime and registry bound.
+_MEDIA_URL_TTL_DEFAULT = 900  # seconds
+_MEDIA_URL_MAX_ENTRIES = 256
+
+
+class _MediaUrlRegistry:
+    """Short-lived capability-URL registry for outbound media downloads.
+
+    Teams silently drops non-image attachments delivered as raw ``Attachment``
+    payloads (base64 data URI or otherwise): real outbound file delivery needs
+    either the file-consent flow or a fetchable URL. This registry backs the
+    URL route: ``register()`` maps an already-validated local path to an
+    unguessable token; ``GET /media/{token}/...`` serves the file while the
+    token is live. Possession of the link is the capability — same trust level
+    as the attachment it replaces (anyone who can read the chat can click it).
+
+    Only paths that already passed the gateway media-delivery filter are ever
+    registered, so the route can't serve anything the chat wasn't sent.
+    """
+
+    def __init__(self, ttl_seconds: int = _MEDIA_URL_TTL_DEFAULT,
+                 max_entries: int = _MEDIA_URL_MAX_ENTRIES):
+        self._ttl = max(1, int(ttl_seconds))
+        self._max = max(1, int(max_entries))
+        # token -> (realpath, monotonic expiry). Insertion-ordered for FIFO cap.
+        self._entries: "OrderedDict[str, Tuple[str, float]]" = OrderedDict()
+
+    def register(self, path: str) -> str:
+        self._purge()
+        token = secrets.token_urlsafe(32)
+        self._entries[token] = (os.path.realpath(path), time.monotonic() + self._ttl)
+        while len(self._entries) > self._max:
+            self._entries.popitem(last=False)
+        return token
+
+    def resolve(self, token: str) -> Optional[str]:
+        self._purge()
+        entry = self._entries.get(token)
+        return entry[0] if entry else None
+
+    def _purge(self) -> None:
+        now = time.monotonic()
+        for token in [t for t, (_, exp) in self._entries.items() if exp <= now]:
+            del self._entries[token]
 
 
 def _parse_bool(value: Any, *, default: bool = False) -> bool:
@@ -749,6 +800,30 @@ class TeamsAdapter(BasePlatformAdapter):
         self._port = _coerce_port(
             extra.get("port") or os.getenv("TEAMS_PORT", str(_DEFAULT_PORT))
         )
+        # Public origin of this webhook server (tunnel hostname). When set,
+        # outbound local media are delivered via short-lived /media/ capability
+        # URLs instead of base64 data URIs (which Teams drops for non-images).
+        self._public_base_url = str(
+            extra.get("public_base_url") or os.getenv("TEAMS_PUBLIC_BASE_URL", "")
+        ).strip().rstrip("/")
+        if self._public_base_url and not self._public_base_url.startswith(
+            ("https://", "http://")
+        ):
+            logger.warning(
+                "[teams] public_base_url %r is not an http(s) origin — ignoring",
+                self._public_base_url,
+            )
+            self._public_base_url = ""
+        if self._public_base_url.startswith("http://"):
+            logger.warning(
+                "[teams] public_base_url uses plain http — media capability URLs "
+                "will transit unencrypted; use https in production"
+            )
+        try:
+            _media_ttl = int(os.getenv("TEAMS_MEDIA_URL_TTL", str(_MEDIA_URL_TTL_DEFAULT)))
+        except ValueError:
+            _media_ttl = _MEDIA_URL_TTL_DEFAULT
+        self._media_urls = _MediaUrlRegistry(ttl_seconds=_media_ttl)
         self._app: Optional["App"] = None
         self._runner: Optional["web.AppRunner"] = None
         self._dedup = MessageDeduplicator(max_size=1000)
@@ -796,6 +871,11 @@ class TeamsAdapter(BasePlatformAdapter):
             # webhook.py / raft, #58536/#58902).
             aiohttp_app = web.Application(client_max_size=_MAX_BODY_BYTES)
             aiohttp_app.router.add_get("/health", lambda _: web.Response(text="ok"))
+            # Outbound media capability URLs (see _MediaUrlRegistry). Registered
+            # unconditionally: without TEAMS_PUBLIC_BASE_URL the registry stays
+            # empty and every request 404s.
+            aiohttp_app.router.add_get("/media/{token}", self._serve_media)
+            aiohttp_app.router.add_get("/media/{token}/{filename}", self._serve_media)
 
             self._app = App(
                 client_id=self._client_id,
@@ -1399,6 +1479,34 @@ class TeamsAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    async def _serve_media(self, request: "web.Request") -> "web.StreamResponse":
+        """Serve a registered outbound media file from its capability URL.
+
+        The token is the whole capability: unguessable (32 random bytes),
+        short-lived (registry TTL), and only ever mapped to paths that already
+        passed the gateway media-delivery filter. Anything else — unknown,
+        expired, or a file that vanished — is an indistinguishable 404.
+        """
+        token = request.match_info.get("token", "")
+        path = self._media_urls.resolve(token)
+        if not path or not os.path.isfile(path):
+            return web.Response(status=404, text="not found")
+        return web.FileResponse(path, headers={"Cache-Control": "private, no-store"})
+
+    def _build_public_media_url(self, path: str) -> Optional[str]:
+        """Register `path` and return its public capability URL (None if no base URL).
+
+        The trailing filename segment is cosmetic (nicer link text, lets the
+        client infer the type); the token alone addresses the file.
+        """
+        if not self._public_base_url:
+            return None
+        token = self._media_urls.register(path)
+        return (
+            f"{self._public_base_url}/media/{token}/"
+            f"{quote(os.path.basename(path))}"
+        )
+
     async def _send_media_attachment(
         self,
         chat_id: str,
@@ -1407,13 +1515,21 @@ class TeamsAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         media_label: str = "media",
     ) -> SendResult:
-        """Send any media file/URL as a Teams attachment.
+        """Send any media file/URL to a Teams chat.
 
-        Remote ``http(s)://`` URLs are attached by reference; local paths
-        (with optional ``file://`` prefix) are base64-encoded into a data
-        URI. MIME type is guessed from the path/extension, falling back to
-        ``default_mime``. Shared by send_image / send_video / send_voice /
-        send_document so every media kind uses the same Attachment path.
+        Remote ``http(s)://`` URLs are attached by reference. Local paths
+        (with optional ``file://`` prefix) depend on ``public_base_url``:
+
+        - configured → the file is served from a short-lived capability URL
+          (see ``_MediaUrlRegistry``); images are attached by reference (the
+          client renders them inline), everything else is delivered as a
+          markdown download link — Teams does not materialize non-image
+          ``Attachment`` payloads, whatever the content_url form.
+        - not configured → images fall back to the legacy base64 data URI;
+          non-images get an explicit "couldn't deliver" notice instead of the
+          silent drop the data URI used to produce.
+
+        Shared by send_image / send_video / send_voice / send_document.
         """
         if not self._app:
             return SendResult(success=False, error="Teams app not initialized")
@@ -1427,11 +1543,43 @@ class TeamsAdapter(BasePlatformAdapter):
                 content_url = source
                 mime_type = mimetypes.guess_type(source.split("?")[0])[0] or default_mime
             else:
-                # Local path — encode as base64 data URI
-                path = source.removeprefix("file://")
+                path = os.path.realpath(source.removeprefix("file://"))
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(path)
                 mime_type = mimetypes.guess_type(path)[0] or default_mime
-                with open(path, "rb") as f:
-                    content_url = f"data:{mime_type};base64,{base64.b64encode(f.read()).decode()}"
+                file_name = os.path.basename(path)
+                public_url = self._build_public_media_url(path)
+
+                if public_url and not mime_type.startswith("image/"):
+                    # Non-image: a raw Attachment is silently dropped by Teams,
+                    # so deliver a clickable download link instead.
+                    text = f"📎 [{file_name}]({public_url})"
+                    if caption:
+                        text = f"{caption}\n\n{text}"
+                    return await self.send(chat_id, text)
+                if public_url:
+                    content_url = public_url
+                elif mime_type.startswith("image/"):
+                    # Legacy path: inline data URI (images only).
+                    with open(path, "rb") as f:
+                        content_url = (
+                            f"data:{mime_type};base64,"
+                            f"{base64.b64encode(f.read()).decode()}"
+                        )
+                else:
+                    # No public base URL and not an image: Teams would drop the
+                    # attachment without a trace — tell the user instead.
+                    logger.warning(
+                        "[teams] cannot deliver %s attachment natively: set "
+                        "TEAMS_PUBLIC_BASE_URL to enable outbound file delivery",
+                        media_label,
+                    )
+                    return await self.send(
+                        chat_id,
+                        f"⚠️ Couldn't deliver the {media_label} attachment "
+                        f"({file_name}) — Teams outbound file delivery requires "
+                        f"TEAMS_PUBLIC_BASE_URL to be configured.",
+                    )
 
             attachment = Attachment(content_type=mime_type, content_url=content_url)
             activity = MessageActivityInput().add_attachments(attachment)
