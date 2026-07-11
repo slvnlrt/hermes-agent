@@ -1046,6 +1046,76 @@ def _strip_auto_continue_noise(content: Any) -> Any:
         text = text[end + 1 :].lstrip()
     return text
 
+# Markdown emphasis glued around a MEDIA: marker (``**MEDIA:/x.png**``) breaks
+# extract_media's extension anchor (the trailing ``**`` fails its boundary
+# lookahead), so the marker silently degrades to plain text and nothing is
+# delivered. LLMs bold delivery lines all the time — unwrap tightly-wrapped
+# emphasis before extraction. Only ``*``/``_`` emphasis is unwrapped: backtick
+# code spans stay protected on purpose (extract_media masks them so quoted
+# ``MEDIA:`` examples are never delivered), and single ``_`` is skipped because
+# underscores are common inside file names.
+_MEDIA_EMPHASIS_RE = re.compile(
+    r"(\*{1,3}|_{2,3})[ \t]*(MEDIA:[^\n]+?)[ \t]*\1",
+    re.IGNORECASE,
+)
+
+
+def _unwrap_media_emphasis(text: str) -> str:
+    """Strip markdown emphasis tightly wrapped around MEDIA: markers."""
+    if "MEDIA:" not in text.upper():
+        return text
+    return _MEDIA_EMPHASIS_RE.sub(r"\2", text)
+
+
+async def _notify_dropped_media(adapter, chat_id, dropped_paths, metadata=None) -> None:
+    """Send an explicit user notice for files the delivery filter withheld.
+
+    The filter used to drop paths with only a server-side log line: the
+    response text was already cleaned of MEDIA: tags, so the user saw a
+    normal reply, no file, and no explanation — and the agent kept believing
+    the delivery worked. Only basenames are surfaced; host directories never
+    reach the chat.
+    """
+    if not dropped_paths:
+        return
+    names = ", ".join(sorted({os.path.basename(str(p).rstrip("/")) or "?" for p in dropped_paths}))
+    try:
+        await adapter.send(
+            chat_id=chat_id,
+            content=(
+                f"⚠️ Couldn't deliver file(s): {names} — blocked by the media "
+                "delivery policy (outside the allowed directories, e.g. "
+                "~/.hermes/cache/…) or missing on disk."
+            ),
+            metadata=metadata,
+        )
+    except Exception as e:
+        logger.warning(
+            "[%s] dropped-media notice failed: %s", getattr(adapter, "name", "?"), e
+        )
+
+
+def _split_media_by_delivery_policy(media_files, local_files):
+    """Partition extracted paths into (kept_media, kept_local, dropped_raw).
+
+    Re-runs ``validate_media_delivery_path`` per raw path to identify drops:
+    the filter helpers normalize accepted paths (symlinks resolved), so a
+    naive before/after diff would misreport renamed survivors as dropped.
+    """
+    from gateway.platforms.base import BasePlatformAdapter, validate_media_delivery_path
+
+    kept_media = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    kept_local = BasePlatformAdapter.filter_local_delivery_paths(local_files)
+    dropped = [
+        str(p) for p, _v in (media_files or [])
+        if validate_media_delivery_path(str(p)) is None
+    ] + [
+        str(p) for p in (local_files or [])
+        if validate_media_delivery_path(str(p)) is None
+    ]
+    return kept_media, kept_local, dropped
+
+
 # Tools in this set return their deliverable artifact as a JSON payload with a
 # local-file path field rather than a literal ``MEDIA:`` tag (e.g. image_generate
 # returns ``{"success": true, "image": "/abs/path.png"}``). The auto-append path
@@ -13165,10 +13235,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # send_multiple_images (Telegram sendPhoto recompresses to ~1280px).
             force_document_attachments = "[[as_document]]" in response
 
-            from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
+            from gateway.platforms.base import should_send_media_as_audio
 
+            response = _unwrap_media_emphasis(response)
             media_files, cleaned = adapter.extract_media(response)
-            media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
             # Chain the cleaned text through each extractor (extract_media →
             # extract_images → extract_local_files) so MEDIA: tags and image URLs
             # are removed before the bare-path auto-detect runs. Previously the
@@ -13178,9 +13248,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # glued on. This matches the chain order in gateway/platforms/base.py.
             _, cleaned = adapter.extract_images(cleaned)
             local_files, _ = adapter.extract_local_files(cleaned)
-            local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
+            media_files, local_files, _dropped = _split_media_by_delivery_policy(
+                media_files, local_files
+            )
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+
+            if _dropped:
+                await _notify_dropped_media(
+                    adapter, event.source.chat_id, _dropped, _thread_meta
+                )
 
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
@@ -13433,9 +13510,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Extract media files from the response
             if response:
+                response = _unwrap_media_emphasis(response)
                 media_files, response = adapter.extract_media(response)
-                from gateway.platforms.base import BasePlatformAdapter
-                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+                media_files, _, _bg_dropped = _split_media_by_delivery_policy(
+                    media_files, []
+                )
+                if _bg_dropped:
+                    await _notify_dropped_media(
+                        adapter, source.chat_id, _bg_dropped, _thread_metadata
+                    )
                 images, text_content = adapter.extract_images(response)
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
