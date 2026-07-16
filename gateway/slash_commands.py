@@ -6133,7 +6133,7 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
+            resolve_gateway_approval, has_blocking_approval, REQUESTER_MISMATCH,
         )
 
         if not has_blocking_approval(session_key):
@@ -6154,7 +6154,14 @@ class GatewaySlashCommandsMixin:
         else:
             choice = "once"
 
-        count = resolve_gateway_approval(session_key, choice, resolve_all=resolve_all)
+        # Bind to the verified requester: typing /approve must not let one
+        # participant of a shared thread resolve another user's command.
+        clicker_id = source.user_id_alt or source.user_id
+        count = resolve_gateway_approval(
+            session_key, choice, resolve_all=resolve_all, clicker_id=clicker_id,
+        )
+        if count == REQUESTER_MISMATCH:
+            return t("gateway.approve.wrong_requester")
         if not count:
             return t("gateway.approve.no_pending")
 
@@ -6210,7 +6217,7 @@ class GatewaySlashCommandsMixin:
         session_key = self._session_key_for_source(source)
 
         from tools.approval import (
-            resolve_gateway_approval, has_blocking_approval,
+            resolve_gateway_approval, has_blocking_approval, REQUESTER_MISMATCH,
         )
 
         if not has_blocking_approval(session_key):
@@ -6233,10 +6240,15 @@ class GatewaySlashCommandsMixin:
         if reason:
             reason = reason[:280].strip()
 
+        # Bind to the verified requester (see /approve): only the user who ran
+        # the command may deny it in a shared thread.
+        clicker_id = source.user_id_alt or source.user_id
         count = resolve_gateway_approval(
             session_key, "deny", resolve_all=resolve_all,
-            reason=reason or None,
+            reason=reason or None, clicker_id=clicker_id,
         )
+        if count == REQUESTER_MISMATCH:
+            return t("gateway.deny.wrong_requester")
         if not count:
             return t("gateway.deny.no_pending")
 
