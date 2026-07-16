@@ -576,6 +576,31 @@ TOOLSETS = {
         "includes": []
     },
 
+    # Restricted profile for a shared/team channel (e.g. a Teams or Slack
+    # channel with multiple non-operator members): research + read-only,
+    # nothing that can act on the host, write durable state, hand off work,
+    # or reach other conversations. Intended as a `channel_toolsets` /
+    # `platform_toolsets` override value — not a per-platform bundle, so it
+    # is intentionally excluded from `hermes-gateway`'s union.
+    #
+    # Deliberately excluded: terminal/process (host access), execute_code,
+    # write_file/patch (durable writes), delegate_task (subagent spawn),
+    # kanban_* (multi-agent coordination), cronjob (scheduled actions),
+    # memory (writes persist cross-conversation — see `channel_memory_modes`
+    # for the per-conversation memory cutoff), browser automation (acts on
+    # external sites on the operator's behalf).
+    "hermes-channel-safe": {
+        "description": "Restricted channel toolset - web research and read-only tools only, no terminal/execution/write/delegation/kanban/cron/memory",
+        "tools": [
+            "web_search", "web_extract",
+            "vision_analyze",
+            "read_file", "search_files",
+            "session_search",
+            "clarify",
+        ],
+        "includes": []
+    },
+
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],
