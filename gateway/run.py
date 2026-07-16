@@ -6642,7 +6642,9 @@ class TurnRunner:
         # to the user immediately.
         from tools.approval import (
             register_gateway_notify,
+            reset_current_requester_id,
             reset_current_session_key,
+            set_current_requester_id,
             set_current_session_key,
             unregister_gateway_notify,
         )
@@ -6906,6 +6908,13 @@ class TurnRunner:
 
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
+        # Bind the verified requester so an approval created this turn is
+        # tied to the principal who triggered it. In a shared session the
+        # session key omits the user id, so without this any allowlisted
+        # participant could resolve another user's approval (confused
+        # deputy). Empty ("" for DM 1:1 / CLI) leaves the binding disabled.
+        _approval_requester_id = ctx.source.user_id_alt or ctx.source.user_id or ""
+        _approval_requester_token = set_current_requester_id(_approval_requester_id)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
         try:
             # If _prepare_inbound_message_text buffered image paths for native
@@ -6982,6 +6991,7 @@ class TurnRunner:
                 _clear_clarify_session(_approval_session_key)
             except Exception:
                 pass
+            reset_current_requester_id(_approval_requester_token)
             reset_current_session_key(_approval_session_token)
         # Canonicalize an explicitly emitted computer-use screenshot path at
         # the common result boundary. The streaming finalizer below and the
