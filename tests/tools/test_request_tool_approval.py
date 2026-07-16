@@ -20,7 +20,7 @@ def _isolate_approval_state(monkeypatch):
         lambda default="default": "test-session",
     )
     # Empty session + permanent approval stores so nothing pre-approves.
-    monkeypatch.setattr(approval, "is_approved", lambda sk, pk: False)
+    monkeypatch.setattr(approval, "is_approved", lambda sk, pk, rid="": False)
     # Not a yolo session (the shared gate checks this first).
     monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: False)
     monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False, raising=False)
@@ -33,7 +33,7 @@ def _isolate_approval_state(monkeypatch):
 
 class TestRequestToolApproval:
     def test_session_cached_approval_short_circuits(self, monkeypatch):
-        monkeypatch.setattr(approval, "is_approved", lambda sk, pk: True)
+        monkeypatch.setattr(approval, "is_approved", lambda sk, pk, rid="": True)
         # Should NOT prompt at all.
         monkeypatch.setattr(
             approval, "prompt_dangerous_approval",
@@ -64,7 +64,7 @@ class TestRequestToolApproval:
         monkeypatch.setattr(approval, "prompt_dangerous_approval", lambda *a, **k: "session")
         calls = {"session": [], "permanent": []}
         monkeypatch.setattr(approval, "approve_session",
-                            lambda sk, pk: calls["session"].append(pk))
+                            lambda sk, pk, rid="": calls["session"].append(pk))
         monkeypatch.setattr(approval, "approve_permanent",
                             lambda pk: calls["permanent"].append(pk))
         monkeypatch.setattr(approval, "save_permanent_allowlist", lambda x: None)
@@ -78,7 +78,7 @@ class TestRequestToolApproval:
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
         monkeypatch.setattr(approval, "prompt_dangerous_approval", lambda *a, **k: "always")
         persisted = {}
-        monkeypatch.setattr(approval, "approve_session", lambda sk, pk: None)
+        monkeypatch.setattr(approval, "approve_session", lambda sk, pk, rid="": None)
         monkeypatch.setattr(approval, "approve_permanent",
                             lambda pk: persisted.setdefault("key", pk))
         monkeypatch.setattr(approval, "save_permanent_allowlist",
