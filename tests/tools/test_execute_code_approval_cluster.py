@@ -119,15 +119,15 @@ def gw_session(monkeypatch):
 
     session_key = "cluster-test-session"
     token = A.set_current_session_key(session_key)
+    A.clear_session(session_key)
     with A._lock:
-        A._gateway_queues.pop(session_key, None)
         A._gateway_notify_cbs.pop(session_key, None)
     try:
         yield session_key
     finally:
         A.reset_current_session_key(token)
+        A.clear_session(session_key)
         with A._lock:
-            A._gateway_queues.pop(session_key, None)
             A._gateway_notify_cbs.pop(session_key, None)
 
 
@@ -209,9 +209,7 @@ def test_guard_gateway_user_approves_session_persists(gw_session):
     res2 = A.check_execute_code_guard("import os; print(2)", "local")
     assert res2["approved"] is True
     # Cleanup
-    with A._lock:
-        s = A._session_approved.get(gw_session, set())
-        s.discard("execute_code")
+    A.clear_session(gw_session)
 
 
 def test_guard_gateway_user_approves_always_persists(gw_session):
@@ -225,8 +223,7 @@ def test_guard_gateway_user_approves_always_persists(gw_session):
     # Cleanup
     with A._lock:
         A._permanent_approved.discard("execute_code")
-        s = A._session_approved.get(gw_session, set())
-        s.discard("execute_code")
+    A.clear_session(gw_session)
 
 
 def test_guard_session_approval_short_circuits_prompt(gw_session):
@@ -239,9 +236,7 @@ def test_guard_session_approval_short_circuits_prompt(gw_session):
         res = A.check_execute_code_guard("import os", "local")
         assert res["approved"] is True
     finally:
-        with A._lock:
-            s = A._session_approved.get(gw_session, set())
-            s.discard("execute_code")
+        A.clear_session(gw_session)
 
 
 def test_guard_gateway_user_denies_blocks(gw_session):
@@ -303,7 +298,7 @@ def test_terminal_smart_deny_owner_override_is_one_operation(gw_session, monkeyp
     """A human may override DENY, but a broad UI choice must not be persisted."""
     with A._lock:
         A._permanent_approved.discard("owner-override-test-danger")
-        A._session_approved.get(gw_session, set()).discard("owner-override-test-danger")
+    A.clear_session(gw_session)
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(A, "_smart_approve", lambda _command, _description: "deny")
     monkeypatch.setattr(
@@ -336,7 +331,7 @@ def test_execute_code_smart_deny_owner_override_is_one_operation(gw_session, mon
     """Never persist the coarse execute_code key after overriding smart DENY."""
     with A._lock:
         A._permanent_approved.discard("execute_code")
-        A._session_approved.get(gw_session, set()).discard("execute_code")
+    A.clear_session(gw_session)
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(A, "_smart_approve", lambda _command, _description: "deny")
 
@@ -358,8 +353,7 @@ def test_execute_code_smart_deny_owner_override_is_one_operation(gw_session, mon
 def test_smart_escalate_still_persists_session_choice(gw_session, monkeypatch):
     """The DENY restriction must not alter Smart ESCALATE's manual choices."""
     key = "smart-escalate-persistence"
-    with A._lock:
-        A._session_approved.get(gw_session, set()).discard(key)
+    A.clear_session(gw_session)
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(A, "_smart_approve", lambda _command, _description: "escalate")
     monkeypatch.setattr(
