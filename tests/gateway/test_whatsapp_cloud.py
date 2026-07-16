@@ -2115,7 +2115,9 @@ class TestDispatchInteractiveReplyAuthorization:
         calls = []
         monkeypatch.setattr(
             "tools.approval.resolve_gateway_approval",
-            lambda session_key, choice: calls.append((session_key, choice)) or 1,
+            lambda session_key, choice, clicker_id=None: (
+                calls.append((session_key, choice, clicker_id)) or 1
+            ),
         )
 
         raw = {
@@ -2146,7 +2148,9 @@ class TestDispatchInteractiveReplyAuthorization:
         calls = []
         monkeypatch.setattr(
             "tools.approval.resolve_gateway_approval",
-            lambda session_key, choice: calls.append((session_key, choice)) or 1,
+            lambda session_key, choice, clicker_id=None: (
+                calls.append((session_key, choice, clicker_id)) or 1
+            ),
         )
 
         raw = {
@@ -2160,7 +2164,7 @@ class TestDispatchInteractiveReplyAuthorization:
         handled = await adapter._dispatch_interactive_reply(raw, {})
 
         assert handled is True
-        assert calls == [("sess-app-1", "approve")]
+        assert calls == [("sess-app-1", "approve", "15551234567")]
 
 
 @pytest.mark.usefixtures("authorized_interactive_env")
