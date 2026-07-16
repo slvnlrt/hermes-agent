@@ -42,6 +42,16 @@ _approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_session_key",
     default="",
 )
+# Verified platform identity of the user whose message triggered the current
+# approval request. Set by the gateway alongside the session key (from
+# ``source.user_id_alt or source.user_id``) so the resolution path can bind an
+# approval to its original requester and reject a confused-deputy click from a
+# different allowlisted participant of the same shared session. Empty string =
+# no verified requester (DM 1:1, CLI, legacy) → no binding is enforced.
+_approval_requester_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_requester_id",
+    default="",
+)
 _approval_turn_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_turn_id",
     default="",
@@ -176,6 +186,31 @@ def set_current_session_key(session_key: str) -> contextvars.Token[str]:
 def reset_current_session_key(token: contextvars.Token[str]) -> None:
     """Restore the prior approval session key context."""
     _approval_session_key.reset(token)
+
+
+def set_current_requester_id(requester_id: str) -> contextvars.Token[str]:
+    """Bind the verified requester id for the current context.
+
+    Symmetric to :func:`set_current_session_key`. The gateway sets this from
+    the message ``source`` so an approval created during this turn records the
+    verified principal that requested it. Pass ``""`` when there is no verified
+    requester (DM 1:1, CLI) — no binding is then enforced at resolution.
+    """
+    return _approval_requester_id.set(requester_id or "")
+
+
+def reset_current_requester_id(token: contextvars.Token[str]) -> None:
+    """Restore the prior requester id context."""
+    _approval_requester_id.reset(token)
+
+
+def get_current_requester_id() -> str:
+    """Return the verified requester id bound to the current context.
+
+    Empty string when unset (CLI, cron, DM 1:1, legacy callers) — callers treat
+    this as "no requester binding" and skip the clicker==requester check.
+    """
+    return _approval_requester_id.get()
 
 
 def set_current_observability_context(
@@ -1476,7 +1511,15 @@ def detect_dangerous_command(command: str) -> tuple:
 
 _lock = threading.Lock()
 _pending: dict[str, dict] = {}
-_session_approved: dict[str, set] = {}
+# "Allow session" grants, scoped by (session_key, requester_id).
+#
+# A shared gateway session (thread/group) omits the user id from the session
+# key, so a flat session_key→patterns map would let a grant approved by user A
+# silently cover future dangerous commands run for user B in the same thread.
+# Keying by the verified requester binds each grant to the person who approved
+# it. A requester_id of "" is a wildcard (DM 1:1, CLI, legacy) that covers
+# everyone in the session, preserving pre-existing single-user behaviour.
+_session_approved: dict[tuple[str, str], set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
 
@@ -1506,6 +1549,15 @@ class _ApprovalEntry:
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 
+# Sentinel return value from ``resolve_gateway_approval`` when the clicker is
+# not the verified requester of the (oldest) pending approval and
+# ``approvals.require_requester_match`` is enabled. Distinct from 0 (nothing
+# pending / already resolved) so a caller can show a tailored "only the
+# requester can approve/deny this command" message instead of a generic
+# "already handled" one. Negative so any legacy ``if count:`` / ``count > 0``
+# truthiness check treats it as "not resolved".
+REQUESTER_MISMATCH: int = -1
+
 
 def register_gateway_notify(session_key: str, cb) -> None:
     """Register a per-session callback for sending approval requests to the user.
@@ -1532,9 +1584,32 @@ def unregister_gateway_notify(session_key: str) -> None:
         entry.event.set()
 
 
+def _requester_blocks(entry: "_ApprovalEntry", clicker_id) -> bool:
+    """Return True when *clicker_id* is not allowed to resolve *entry*.
+
+    The click is blocked only when all of the following hold:
+    - ``approvals.require_requester_match`` is enabled (default),
+    - a verified ``clicker_id`` was supplied by the caller (not ``None``),
+    - the entry recorded a non-empty verified ``requester_id``, and
+    - that requester differs from the clicker.
+
+    An entry with no recorded requester (``""`` — DM 1:1, CLI, legacy) is a
+    wildcard and is never blocked, preserving backward compatibility.
+    """
+    if clicker_id is None:
+        return False
+    if not _get_require_requester_match():
+        return False
+    requester_id = (entry.data or {}).get("requester_id") or ""
+    if not requester_id:
+        return False
+    return requester_id != clicker_id
+
+
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             clicker_id=None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
@@ -1546,19 +1621,38 @@ def resolve_gateway_approval(session_key: str, choice: str,
     deny (``/deny <reason>``).  It is relayed back to the agent in the
     BLOCKED message so it can adapt instead of only hearing "denied".
 
-    Returns the number of approvals resolved (0 means nothing was pending).
+    *clicker_id* is the verified platform identity of the user acting on the
+    approval (button click or ``/approve`` / ``/deny``). When supplied and
+    ``approvals.require_requester_match`` is enabled, an approval bound to a
+    different verified requester is NOT resolved and :data:`REQUESTER_MISMATCH`
+    is returned so the caller can tell the clicker that only the original
+    requester may approve/deny it. Passing ``None`` (the default) preserves the
+    legacy behaviour for callers that have not been updated.
+
+    Returns the number of approvals resolved (0 means nothing was pending),
+    or :data:`REQUESTER_MISMATCH` when the only actionable approval is bound to
+    a different requester.
     """
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
             return 0
         if resolve_all:
-            targets = list(queue)
-            queue.clear()
+            targets = [e for e in queue if not _requester_blocks(e, clicker_id)]
+            blocked_any = len(targets) != len(queue)
+            for entry in targets:
+                queue.remove(entry)
+            if not queue:
+                _gateway_queues.pop(session_key, None)
+            if not targets and blocked_any:
+                return REQUESTER_MISMATCH
         else:
+            oldest = queue[0]
+            if _requester_blocks(oldest, clicker_id):
+                return REQUESTER_MISMATCH
             targets = [queue.pop(0)]
-        if not queue:
-            _gateway_queues.pop(session_key, None)
+            if not queue:
+                _gateway_queues.pop(session_key, None)
 
     for entry in targets:
         entry.result = choice
@@ -1574,16 +1668,39 @@ def has_blocking_approval(session_key: str) -> bool:
         return bool(_gateway_queues.get(session_key))
 
 
+def gateway_approval_requester_blocks(session_key: str, clicker_id) -> bool:
+    """Return True when *clicker_id* may NOT resolve the oldest pending approval.
+
+    Non-mutating peek mirroring the check inside ``resolve_gateway_approval``.
+    Useful for surfaces (e.g. Feishu) that decide the confirmation UI in a
+    synchronous handler before the async resolve runs, so they can show a
+    "only the requester can approve" message instead of a misleading card.
+
+    Returns False (allowed) when nothing is pending, when the requester binding
+    is disabled/absent, or when the clicker is the bound requester.
+    """
+    with _lock:
+        queue = _gateway_queues.get(session_key)
+        if not queue:
+            return False
+        return _requester_blocks(queue[0], clicker_id)
+
+
 def submit_pending(session_key: str, approval: dict):
     """Store a pending approval request for a session."""
     with _lock:
         _pending[session_key] = approval
 
 
-def approve_session(session_key: str, pattern_key: str):
-    """Approve a pattern for this session only."""
+def approve_session(session_key: str, pattern_key: str, requester_id: str = ""):
+    """Approve a pattern for this session, scoped to *requester_id*.
+
+    The grant is keyed by ``(session_key, requester_id)`` so it only covers
+    future commands from the same verified requester. An empty *requester_id*
+    (DM 1:1, CLI, legacy) is a wildcard covering the whole session.
+    """
     with _lock:
-        _session_approved.setdefault(session_key, set()).add(pattern_key)
+        _session_approved.setdefault((session_key, requester_id or ""), set()).add(pattern_key)
 
 
 def enable_session_yolo(session_key: str) -> None:
@@ -1607,7 +1724,8 @@ def clear_session(session_key: str) -> None:
     if not session_key:
         return
     with _lock:
-        _session_approved.pop(session_key, None)
+        for key in [k for k in _session_approved if k[0] == session_key]:
+            _session_approved.pop(key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
@@ -1631,17 +1749,24 @@ def is_current_session_yolo_enabled() -> bool:
     return is_session_yolo_enabled(get_current_session_key(default=""))
 
 
-def is_approved(session_key: str, pattern_key: str) -> bool:
+def is_approved(session_key: str, pattern_key: str, requester_id: str = "") -> bool:
     """Check if a pattern is approved (session-scoped or permanent).
 
     Accept both the current canonical key and the legacy regex-derived key so
     existing command_allowlist entries continue to work after key migrations.
+
+    Session grants are matched against two scopes: the wildcard grant
+    ``(session_key, "")`` (DM 1:1 / CLI / legacy, covers everyone) and the
+    grant bound to *requester_id* — so a grant approved by one participant of a
+    shared session does not cover another.
     """
     aliases = _approval_key_aliases(pattern_key)
     with _lock:
         if any(alias in _permanent_approved for alias in aliases):
             return True
-        session_approvals = _session_approved.get(session_key, set())
+        session_approvals = set(_session_approved.get((session_key, ""), set()))
+        if requester_id:
+            session_approvals |= _session_approved.get((session_key, requester_id), set())
         return any(alias in session_approvals for alias in aliases)
 
 
@@ -1960,6 +2085,24 @@ def _get_approval_timeout() -> int:
         return 60
 
 
+def _get_require_requester_match() -> bool:
+    """Whether an approval may only be resolved by its verified requester.
+
+    Reads ``approvals.require_requester_match`` (default ``True``). When True,
+    a click / ``/approve`` from a participant other than the user who triggered
+    the dangerous command is refused (confused-deputy fix). When False, the
+    historical behaviour is preserved: any allowlisted user may resolve.
+
+    An approval that recorded no verified requester (empty ``requester_id`` —
+    DM 1:1, CLI, legacy) is never bound, regardless of this setting.
+    """
+    try:
+        value = _get_approval_config().get("require_requester_match", True)
+    except Exception:
+        return True
+    return is_truthy_value(value) if not isinstance(value, bool) else value
+
+
 def _get_cron_approval_mode() -> str:
     """Read the cron approval mode from config. Returns 'deny' or 'approve'."""
     try:
@@ -2155,7 +2298,8 @@ def _run_approval_gate(
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
-    if is_approved(session_key, pattern_key):
+    requester_id = get_current_requester_id()  # W1: lie l'approbation au demandeur vérifié
+    if is_approved(session_key, pattern_key, requester_id):
         return {"approved": True, "message": None}
 
     if approval_callback is None:
@@ -2264,9 +2408,9 @@ def _run_approval_gate(
                 }
 
             if choice == "session":
-                approve_session(session_key, pattern_key)
+                approve_session(session_key, pattern_key, requester_id)
             elif choice == "always":
-                approve_session(session_key, pattern_key)
+                approve_session(session_key, pattern_key, requester_id)
                 approve_permanent(pattern_key)
                 save_permanent_allowlist(_permanent_approved)
             return {"approved": True, "message": None}
@@ -2277,6 +2421,7 @@ def _run_approval_gate(
             "command": display_target,
             "pattern_key": pattern_key,
             "description": description,
+            "requester_id": requester_id,
         })
         return {
             "approved": False,
@@ -2306,9 +2451,9 @@ def _run_approval_gate(
         }
 
     if choice == "session":
-        approve_session(session_key, pattern_key)
+        approve_session(session_key, pattern_key, requester_id)
     elif choice == "always":
-        approve_session(session_key, pattern_key)
+        approve_session(session_key, pattern_key, requester_id)
         approve_permanent(pattern_key)
         save_permanent_allowlist(_permanent_approved)
 
@@ -2814,6 +2959,7 @@ def check_all_command_guards(command: str, env_type: str,
     warnings = []  # list of (pattern_key, description, is_tirith)
 
     session_key = get_current_session_key()
+    requester_id = get_current_requester_id()
 
     # Tirith block/warn → approvable warning with rich findings.
     # Previously, tirith "block" was a hard block with no approval prompt.
@@ -2824,11 +2970,11 @@ def check_all_command_guards(command: str, env_type: str,
         rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
         tirith_key = f"tirith:{rule_id}"
         tirith_desc = _format_tirith_description(tirith_result)
-        if not is_approved(session_key, tirith_key):
+        if not is_approved(session_key, tirith_key, requester_id):
             warnings.append((tirith_key, tirith_desc, True))
 
     if is_dangerous:
-        if not is_approved(session_key, pattern_key):
+        if not is_approved(session_key, pattern_key, requester_id):
             warnings.append((pattern_key, description, False))
 
     # Nothing to warn about
@@ -2910,6 +3056,9 @@ def check_all_command_guards(command: str, env_type: str,
                 # Smart DENY overrides are one-operation decisions, so the UI
                 # must not offer a permanent scope.
                 "allow_permanent": not has_tirith and not smart_denied_for_owner,
+                # Verified principal that triggered this command, so the
+                # resolution path can bind approval to its requester.
+                "requester_id": requester_id,
             }
             if smart_denied_for_owner:
                 approval_data["smart_denied"] = True
@@ -2971,11 +3120,13 @@ def check_all_command_guards(command: str, env_type: str,
             if not smart_denied_for_owner:
                 for key, _, is_tirith in warnings:
                     if choice == "session" or (choice == "always" and is_tirith):
-                        approve_session(session_key, key)
+                        approve_session(session_key, key, requester_id)
                     elif choice == "always":
-                        approve_session(session_key, key)
+                        approve_session(session_key, key, requester_id)
                         approve_permanent(key)
                         save_permanent_allowlist(_permanent_approved)
+                # choice == "once": no persistence — command allowed this
+                # single time only, matching the CLI's behavior.
 
             return {"approved": True, "message": None,
                     "user_approved": True, "description": combined_desc}
@@ -2992,6 +3143,7 @@ def check_all_command_guards(command: str, env_type: str,
             "pattern_key": primary_key,
             "pattern_keys": all_keys,
             "description": _disp_combined_desc,
+            "requester_id": requester_id,
         }
         if smart_denied_for_owner:
             pending_data.update(smart_denied=True, allow_permanent=False)
@@ -3063,10 +3215,10 @@ def check_all_command_guards(command: str, env_type: str,
         for key, _, is_tirith in warnings:
             if choice == "session" or (choice == "always" and is_tirith):
                 # tirith: session only (no permanent broad allowlisting)
-                approve_session(session_key, key)
+                approve_session(session_key, key, requester_id)
             elif choice == "always":
                 # dangerous patterns: permanent allowed
-                approve_session(session_key, key)
+                approve_session(session_key, key, requester_id)
                 approve_permanent(key)
                 save_permanent_allowlist(_permanent_approved)
 
@@ -3146,6 +3298,7 @@ def check_execute_code_guard(code: str, env_type: str,
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
+    requester_id = get_current_requester_id()
     # Built only now (past the early-return gates) so the common non-approval
     # paths don't pay to copy a potentially-large script into this string.
     command = f"execute_code <<'PY'\n{code}\nPY"
@@ -3153,7 +3306,7 @@ def check_execute_code_guard(code: str, env_type: str,
     # Check session/permanent approval — same gate as check_all_command_guards.
     # Without this, "Approve session" / "Always" choices are stored but never
     # consulted, so every execute_code call re-prompts the user (#39275).
-    if is_approved(session_key, pattern_key):
+    if is_approved(session_key, pattern_key, requester_id):
         return {"approved": True, "message": None}
 
     # Smart mode: ask the aux LLM about the whole script. An APPROVE here only
@@ -3215,6 +3368,7 @@ def check_execute_code_guard(code: str, env_type: str,
             "pattern_key": pattern_key,
             "pattern_keys": [pattern_key],
             "description": display_description,
+            "requester_id": requester_id,
         }
         if smart_denied_for_owner:
             pending_data.update(smart_denied=True, allow_permanent=False)
@@ -3241,6 +3395,7 @@ def check_execute_code_guard(code: str, env_type: str,
         "pattern_keys": [pattern_key],
         "description": display_description,
         "allow_permanent": not smart_denied_for_owner,
+        "requester_id": requester_id,
     }
     if smart_denied_for_owner:
         approval_data["smart_denied"] = True
@@ -3288,9 +3443,9 @@ def check_execute_code_guard(code: str, env_type: str,
     # decisions preserve their existing session/permanent behavior.
     if not smart_denied_for_owner:
         if choice == "session":
-            approve_session(session_key, pattern_key)
+            approve_session(session_key, pattern_key, requester_id)
         elif choice == "always":
-            approve_session(session_key, pattern_key)
+            approve_session(session_key, pattern_key, requester_id)
             approve_permanent(pattern_key)
             save_permanent_allowlist(_permanent_approved)
     # choice == "once": no persistence — approval lasts this single call only.

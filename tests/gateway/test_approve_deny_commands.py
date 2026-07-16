@@ -964,3 +964,206 @@ class TestCrossSessionApprovalIsolation:
             os.environ.pop("HERMES_EXEC_ASK", None)
             unregister_gateway_notify("sess-A")
             unregister_gateway_notify("sess-B")
+
+
+# ------------------------------------------------------------------
+# Requester binding — confused-deputy fix (W1)
+# ------------------------------------------------------------------
+
+
+class TestResolveRequesterBinding:
+    """resolve_gateway_approval binds resolution to the verified requester."""
+
+    def setup_method(self):
+        _clear_approval_state()
+
+    def _queue_entry(self, requester_id, session_key="sess"):
+        from tools.approval import _ApprovalEntry, _gateway_queues
+        entry = _ApprovalEntry({"command": "rm -rf /", "requester_id": requester_id})
+        _gateway_queues.setdefault(session_key, []).append(entry)
+        return entry
+
+    def test_rejects_clicker_not_requester(self):
+        from tools.approval import resolve_gateway_approval, REQUESTER_MISMATCH, _gateway_queues
+        entry = self._queue_entry("uA")
+        count = resolve_gateway_approval("sess", "once", clicker_id="uB")
+        assert count == REQUESTER_MISMATCH
+        assert not entry.event.is_set()
+        # Entry stays queued so the real requester can still resolve it.
+        assert len(_gateway_queues["sess"]) == 1
+
+    def test_accepts_clicker_equals_requester(self):
+        from tools.approval import resolve_gateway_approval
+        entry = self._queue_entry("uA")
+        count = resolve_gateway_approval("sess", "once", clicker_id="uA")
+        assert count == 1
+        assert entry.event.is_set()
+        assert entry.result == "once"
+
+    def test_ignores_empty_requester_legacy(self):
+        """A legacy/DM/CLI entry (empty requester) is a wildcard — no binding."""
+        from tools.approval import resolve_gateway_approval
+        entry = self._queue_entry("")
+        count = resolve_gateway_approval("sess", "once", clicker_id="uB")
+        assert count == 1
+        assert entry.event.is_set()
+
+    def test_ignores_when_clicker_id_none(self):
+        """Legacy callers that pass no clicker_id keep the old behaviour."""
+        from tools.approval import resolve_gateway_approval
+        entry = self._queue_entry("uA")
+        count = resolve_gateway_approval("sess", "once")
+        assert count == 1
+        assert entry.event.is_set()
+
+    def test_disabled_by_config(self, monkeypatch):
+        from tools import approval as mod
+        monkeypatch.setattr(mod, "_get_require_requester_match", lambda: False)
+        entry = self._queue_entry("uA")
+        count = mod.resolve_gateway_approval("sess", "once", clicker_id="uB")
+        assert count == 1
+        assert entry.event.is_set()
+
+    def test_resolve_all_skips_mismatched_entries(self):
+        from tools.approval import (
+            resolve_gateway_approval, _ApprovalEntry, _gateway_queues,
+        )
+        eA = _ApprovalEntry({"command": "a", "requester_id": "uA"})
+        eB = _ApprovalEntry({"command": "b", "requester_id": "uB"})
+        _gateway_queues["sess"] = [eA, eB]
+        count = resolve_gateway_approval(
+            "sess", "deny", resolve_all=True, clicker_id="uA",
+        )
+        assert count == 1
+        assert eA.event.is_set()
+        assert not eB.event.is_set()
+        # eB (bound to another requester) stays queued.
+        assert _gateway_queues["sess"] == [eB]
+
+    def test_resolve_all_all_mismatch_returns_sentinel(self):
+        from tools.approval import (
+            resolve_gateway_approval, REQUESTER_MISMATCH,
+            _ApprovalEntry, _gateway_queues,
+        )
+        eA = _ApprovalEntry({"command": "a", "requester_id": "uA"})
+        _gateway_queues["sess"] = [eA]
+        count = resolve_gateway_approval(
+            "sess", "deny", resolve_all=True, clicker_id="uB",
+        )
+        assert count == REQUESTER_MISMATCH
+        assert not eA.event.is_set()
+
+    def test_peek_helper_reports_block(self):
+        from tools.approval import gateway_approval_requester_blocks
+        self._queue_entry("uA")
+        assert gateway_approval_requester_blocks("sess", "uB") is True
+        assert gateway_approval_requester_blocks("sess", "uA") is False
+        # Empty queue → never blocks.
+        assert gateway_approval_requester_blocks("other", "uB") is False
+
+
+class TestSessionGrantScoping:
+    """approve_session grants are scoped by (session_key, requester_id)."""
+
+    def setup_method(self):
+        _clear_approval_state()
+
+    def test_grant_scoped_to_requester(self):
+        from tools.approval import approve_session, is_approved
+        approve_session("sess", "recursive delete", requester_id="uA")
+        assert is_approved("sess", "recursive delete", requester_id="uA") is True
+        # A grant approved by A does NOT cover B in the same shared session.
+        assert is_approved("sess", "recursive delete", requester_id="uB") is False
+
+    def test_wildcard_grant_covers_everyone(self):
+        from tools.approval import approve_session, is_approved
+        approve_session("sess", "recursive delete", requester_id="")
+        assert is_approved("sess", "recursive delete", requester_id="uA") is True
+        assert is_approved("sess", "recursive delete", requester_id="uB") is True
+        assert is_approved("sess", "recursive delete") is True
+
+    def test_dm_1to1_unchanged(self):
+        from tools.approval import approve_session, is_approved
+        # No requester on either side — legacy single-user behaviour.
+        approve_session("sess", "recursive delete")
+        assert is_approved("sess", "recursive delete") is True
+
+    def test_clear_session_drops_all_requester_scopes(self):
+        from tools.approval import approve_session, is_approved, clear_session
+        approve_session("sess", "recursive delete", requester_id="uA")
+        approve_session("sess", "recursive delete", requester_id="uB")
+        clear_session("sess")
+        assert is_approved("sess", "recursive delete", requester_id="uA") is False
+        assert is_approved("sess", "recursive delete", requester_id="uB") is False
+
+
+class TestApproveDenyByNonRequester:
+    """/approve and /deny in a shared thread are bound to the requester."""
+
+    def setup_method(self):
+        _clear_approval_state()
+
+    def _shared_source(self, user_id, name):
+        return SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id=user_id,
+            chat_id="c1",
+            user_name=name,
+            chat_type="group",
+        )
+
+    @pytest.mark.asyncio
+    async def test_approve_by_other_user_rejected_then_requester_resolves(self):
+        from tools.approval import (
+            _ApprovalEntry, _gateway_queues, register_gateway_notify,
+            unregister_gateway_notify,
+        )
+        runner = _make_runner()
+        # Both users map to the same shared-thread session key.
+        runner._session_key_for_source = lambda source: "shared-thread"
+        register_gateway_notify("shared-thread", lambda d: None)
+        entry = _ApprovalEntry({"command": "rm -rf /", "requester_id": "uA"})
+        _gateway_queues["shared-thread"] = [entry]
+        try:
+            # B (allowlisted, but not the requester) types /approve → refused.
+            event_b = MessageEvent(
+                text="/approve", source=self._shared_source("uB", "bob"),
+                message_id="m-b",
+            )
+            result_b = await runner._handle_approve_command(event_b)
+            assert "Only the user" in result_b
+            assert not entry.event.is_set()
+            assert len(_gateway_queues["shared-thread"]) == 1
+
+            # A (the requester) types /approve → resolves.
+            event_a = MessageEvent(
+                text="/approve", source=self._shared_source("uA", "alice"),
+                message_id="m-a",
+            )
+            await runner._handle_approve_command(event_a)
+            assert entry.event.is_set()
+            assert entry.result == "once"
+        finally:
+            unregister_gateway_notify("shared-thread")
+
+    @pytest.mark.asyncio
+    async def test_deny_by_other_user_rejected(self):
+        from tools.approval import (
+            _ApprovalEntry, _gateway_queues, register_gateway_notify,
+            unregister_gateway_notify,
+        )
+        runner = _make_runner()
+        runner._session_key_for_source = lambda source: "shared-thread"
+        register_gateway_notify("shared-thread", lambda d: None)
+        entry = _ApprovalEntry({"command": "rm -rf /", "requester_id": "uA"})
+        _gateway_queues["shared-thread"] = [entry]
+        try:
+            event_b = MessageEvent(
+                text="/deny", source=self._shared_source("uB", "bob"),
+                message_id="m-b",
+            )
+            result_b = await runner._handle_deny_command(event_b)
+            assert "Only the user" in result_b
+            assert not entry.event.is_set()
+        finally:
+            unregister_gateway_notify("shared-thread")

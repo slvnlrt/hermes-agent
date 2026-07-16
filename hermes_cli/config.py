@@ -2608,6 +2608,16 @@ DEFAULT_CONFIG = {
         #     - "git push --force*"
         #     - "*curl*|*sh*"
         "deny": [],
+        # When true (default), an approval may only be resolved by the verified
+        # user who triggered the dangerous command (button click OR /approve,
+        # /deny). This closes a confused-deputy gap in shared channels/threads
+        # where the session key omits the user id, so any allowlisted
+        # participant could otherwise approve another user's command. Requests
+        # that recorded no verified requester (DM 1:1, CLI) are never bound.
+        # Set to false to restore the legacy "any allowlisted user may resolve"
+        # behaviour. Note: "Always allow" grants remain installation-wide;
+        # "Allow session" grants are scoped to the requester.
+        "require_requester_match": True,
         # When true, /reload-mcp asks the user to confirm before rebuilding
         # the MCP tool set for the active session.  Reloading invalidates
         # the provider prompt cache (tool schemas are baked into the system
