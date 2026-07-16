@@ -100,6 +100,35 @@ class TestRequestToolApproval:
         assert res["status"] == "approval_required"
         assert submitted["pattern_key"] == "plugin_rule:ext-nav"
 
+    def test_gateway_callback_binds_resolution_to_requester(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setattr(approval, "get_current_requester_id", lambda: "requester")
+        resolutions = []
+
+        def notify(_data):
+            resolutions.append(
+                approval.resolve_gateway_approval(
+                    "test-session", "once", clicker_id="other-user"
+                )
+            )
+            resolutions.append(
+                approval.resolve_gateway_approval(
+                    "test-session", "once", clicker_id="requester"
+                )
+            )
+
+        approval.register_gateway_notify("test-session", notify)
+        try:
+            result = request_tool_approval(
+                "browser_navigate", "external URL", rule_key="ext-nav"
+            )
+        finally:
+            approval.unregister_gateway_notify("test-session")
+
+        assert resolutions == [approval.REQUESTER_MISMATCH, 1]
+        assert result["approved"] is True
+
     def test_cron_deny_mode_blocks(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
