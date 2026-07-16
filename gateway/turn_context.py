@@ -104,6 +104,11 @@ class TurnContext:
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None
+    # Resolved channel_overrides.memory_mode for this turn's source ("full",
+    # "off", or None when no override applies). Carried on the ctx because
+    # it is resolved in _run_agent_inner but consumed by TurnRunner, both to
+    # gate skip_memory on the agent and to bust the agent-config cache.
+    channel_memory_mode: Optional[str] = None
     log_mode_enabled: bool = False
     interim_assistant_messages_enabled: bool = False
     needs_progress_queue: bool = False
