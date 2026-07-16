@@ -5874,7 +5874,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to approve commands.")
                     return
 
-                session_key = self._approval_state.pop(approval_id, None)
+                # Peek (do NOT pop yet): binding the resolution to the verified
+                # requester must happen before we consume the approval token or
+                # edit the card, so a mismatched (but allowlisted) clicker can't
+                # lock out the real requester.
+                session_key = self._approval_state.get(approval_id)
                 if not session_key:
                     await query.answer(text="This approval has already been resolved.")
                     return
@@ -5889,6 +5893,32 @@ class TelegramAdapter(BasePlatformAdapter):
                 user_display = getattr(query.from_user, "first_name", "User")
                 label = label_map.get(choice, "Resolved")
 
+                # Resolve the approval — unblocks the agent thread. Bound to the
+                # verified clicker so only the requester may approve/deny.
+                try:
+                    from tools.approval import resolve_gateway_approval, REQUESTER_MISMATCH
+                    count = resolve_gateway_approval(session_key, choice, clicker_id=caller_id)
+                    logger.info(
+                        "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
+                        count, session_key, choice, user_display,
+                    )
+                except Exception as exc:
+                    logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
+                    count = 0
+                    REQUESTER_MISMATCH = -1  # local fallback if import failed
+
+                if count == REQUESTER_MISMATCH:
+                    await query.answer(
+                        text="⛔ Only the user who ran this command can approve or deny it."
+                    )
+                    return
+                if count <= 0:
+                    self._approval_state.pop(approval_id, None)
+                    await query.answer(text="This approval has already been resolved.")
+                    return
+
+                # Resolved: consume the token and update the card.
+                self._approval_state.pop(approval_id, None)
                 await query.answer(text=label)
 
                 # Edit message to show decision, remove buttons
@@ -5900,18 +5930,6 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                 except Exception:
                     pass  # non-fatal if edit fails
-
-                # Resolve the approval — unblocks the agent thread
-                try:
-                    from tools.approval import resolve_gateway_approval
-                    count = resolve_gateway_approval(session_key, choice)
-                    logger.info(
-                        "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                        count, session_key, choice, user_display,
-                    )
-                except Exception as exc:
-                    logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
-                    count = 0
 
                 # Resume the typing indicator — paused when the approval was
                 # sent (gateway/run.py).  The text /approve and /deny paths

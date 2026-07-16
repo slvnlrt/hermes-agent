@@ -306,7 +306,9 @@ class TestTelegramApprovalCallback:
             with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
                 await adapter._handle_callback_query(update, context)
 
-        mock_resolve.assert_called_once_with("agent:main:telegram:group:12345:99", "once")
+        mock_resolve.assert_called_once_with(
+            "agent:main:telegram:group:12345:99", "once", clicker_id="12345"
+        )
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
 
@@ -425,9 +427,50 @@ class TestTelegramApprovalCallback:
             with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
                 await adapter._handle_callback_query(update, context)
 
-        mock_resolve.assert_called_once_with("some-session", "deny")
+        mock_resolve.assert_called_once_with(
+            "some-session", "deny", clicker_id="12345"
+        )
         edit_kwargs = query.edit_message_text.call_args[1]
         assert "Denied" in edit_kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_wrong_requester_click_rejected(self):
+        """An allowlisted user who is not the requester cannot resolve, edit
+        the card, or drop the approval state."""
+        from tools.approval import REQUESTER_MISMATCH
+
+        adapter = _make_adapter()
+        adapter._approval_state[8] = "agent:main:telegram:group:12345:99"
+
+        query = AsyncMock()
+        query.data = "ea:once:8"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock()
+        query.from_user.first_name = "Mallory"
+        query.from_user.id = "99999"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch(
+                "tools.approval.resolve_gateway_approval",
+                return_value=REQUESTER_MISMATCH,
+            ) as mock_resolve:
+                await adapter._handle_callback_query(update, context)
+
+        mock_resolve.assert_called_once_with(
+            "agent:main:telegram:group:12345:99", "once", clicker_id="99999"
+        )
+        # Card untouched, state preserved for the real requester.
+        query.edit_message_text.assert_not_called()
+        assert adapter._approval_state[8] == "agent:main:telegram:group:12345:99"
+        # The clicker is told why nothing happened.
+        assert "only the user" in query.answer.call_args[1]["text"].lower()
 
     @pytest.mark.asyncio
     async def test_approval_callback_rejects_user_blocked_by_global_allowlist(self):

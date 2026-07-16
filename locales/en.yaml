@@ -74,6 +74,7 @@ gateway:
 
   approve:
     no_pending:            "No pending command to approve."
+    wrong_requester:       "⛔ Only the user who ran this command can approve it."
     once_singular:         "✅ Command approved. The agent is resuming..."
     once_plural:           "✅ Commands approved ({count} commands). The agent is resuming..."
     session_singular:      "✅ Command approved (pattern approved for this session). The agent is resuming..."
@@ -124,6 +125,7 @@ gateway:
   deny:
     stale:                 "❌ Command denied (approval was stale)."
     no_pending:            "No pending command to deny."
+    wrong_requester:       "⛔ Only the user who ran this command can deny it."
     denied_singular:       "❌ Command denied."
     denied_plural:         "❌ Commands denied ({count} commands)."
     denied_reason_singular: "❌ Command denied. Reason relayed to the agent: \"{reason}\""
