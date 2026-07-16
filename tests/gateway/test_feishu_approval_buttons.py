@@ -322,7 +322,9 @@ class TestResolveApproval:
         with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
             await adapter._resolve_approval(1, "once", "Norbert", open_id="ou_user1", chat_id="oc_12345")
 
-        mock_resolve.assert_called_once_with("agent:main:feishu:group:oc_12345", "once")
+        mock_resolve.assert_called_once_with(
+            "agent:main:feishu:group:oc_12345", "once", clicker_id="ou_user1"
+        )
         assert 1 not in adapter._approval_state
 
     @pytest.mark.asyncio
@@ -337,7 +339,9 @@ class TestResolveApproval:
         with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
             await adapter._resolve_approval(2, "deny", "Alice", open_id="ou_user1", chat_id="oc_12345")
 
-        mock_resolve.assert_called_once_with("some-session", "deny")
+        mock_resolve.assert_called_once_with(
+            "some-session", "deny", clicker_id="ou_user1"
+        )
 
     @pytest.mark.asyncio
     async def test_resolves_session(self):
@@ -351,7 +355,9 @@ class TestResolveApproval:
         with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
             await adapter._resolve_approval(3, "session", "Bob", open_id="ou_user1", chat_id="oc_99")
 
-        mock_resolve.assert_called_once_with("sess-3", "session")
+        mock_resolve.assert_called_once_with(
+            "sess-3", "session", clicker_id="ou_user1"
+        )
 
     @pytest.mark.asyncio
     async def test_resolves_always(self):
@@ -365,7 +371,36 @@ class TestResolveApproval:
         with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
             await adapter._resolve_approval(4, "always", "Carol", open_id="ou_user1", chat_id="oc_55")
 
-        mock_resolve.assert_called_once_with("sess-4", "always")
+        mock_resolve.assert_called_once_with(
+            "sess-4", "always", clicker_id="ou_user1"
+        )
+
+    @pytest.mark.asyncio
+    async def test_wrong_requester_does_not_resolve(self):
+        """When the core reports a requester mismatch, _resolve_approval must
+        keep the approval state so the real requester can still resolve."""
+        from tools.approval import REQUESTER_MISMATCH
+
+        adapter = _make_adapter()
+        adapter._approval_state[7] = {
+            "session_key": "sess-7",
+            "message_id": "msg_007",
+            "chat_id": "oc_77",
+        }
+
+        with patch(
+            "tools.approval.resolve_gateway_approval",
+            return_value=REQUESTER_MISMATCH,
+        ) as mock_resolve:
+            await adapter._resolve_approval(
+                7, "once", "Mallory",
+                open_id="ou_other", chat_id="oc_77", clicker_id="ou_other",
+            )
+
+        mock_resolve.assert_called_once_with(
+            "sess-7", "once", clicker_id="ou_other"
+        )
+        assert 7 in adapter._approval_state
 
     @pytest.mark.asyncio
     async def test_already_resolved_drops_silently(self):

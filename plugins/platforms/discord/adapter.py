@@ -7980,32 +7980,54 @@ def _define_discord_view_classes() -> None:
                 )
                 return
 
-            self.resolved = True
-
-            # Unblock the waiting agent thread FIRST, then render the outcome.
-            # A click that lands after the approval wait timed out (count == 0)
-            # must not claim "Approved" — the command was already denied.
+            # Bind the resolution to the verified clicker BEFORE marking this
+            # view resolved or editing the embed, so a mismatched (but
+            # allowlisted) clicker cannot lock out the real requester. The
+            # clicker id is in the same namespace as source.user_id
+            # (str(author.id)).
+            clicker_id = str(interaction.user.id)
+            from tools.approval import resolve_gateway_approval, REQUESTER_MISMATCH
             try:
-                from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice)
-                logger.info(
-                    "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
-                    count, self.session_key, choice, interaction.user.display_name,
+                count = resolve_gateway_approval(
+                    self.session_key, choice, clicker_id=clicker_id,
                 )
             except Exception as exc:
                 logger.error("Failed to resolve gateway approval from button: %s", exc)
-                count = 0
+                await interaction.response.send_message(
+                    "Something went wrong resolving this approval~", ephemeral=True
+                )
+                return
 
-            if not count:
-                color = discord.Color.dark_grey()
-                label = "⌛ Approval expired — command was not run (already timed out or resolved elsewhere)"
+            if count == REQUESTER_MISMATCH:
+                await interaction.response.send_message(
+                    "⛔ Only the user who ran this command can approve or deny it.",
+                    ephemeral=True,
+                )
+                return
+            if count <= 0:
+                await interaction.response.send_message(
+                    "This approval has already been resolved~", ephemeral=True
+                )
+                return
+
+            self.resolved = True
+            logger.info(
+                "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
+                count, self.session_key, choice, interaction.user.display_name,
+            )
+
+            # Upstream also moved resolution ahead of rendering so a click that
+            # lands after the wait timed out cannot claim "Approved"; it renders
+            # an "expired" footer for count == 0. That branch is unreachable
+            # here because the requester-bound path above already returns early
+            # (ephemerally) on REQUESTER_MISMATCH and on count <= 0, so the
+            # embed is never overwritten by a stale click.
 
             # Update the embed with the decision
             embed = interaction.message.embeds[0] if interaction.message.embeds else None
             if embed:
                 embed.color = color
-                footer = f"{label} by {interaction.user.display_name}" if count else label
-                embed.set_footer(text=footer)
+                embed.set_footer(text=f"{label} by {interaction.user.display_name}")
 
             # Disable all buttons
             for child in self.children:

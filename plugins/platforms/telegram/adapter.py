@@ -6248,22 +6248,22 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to approve commands.")
                     return
 
-                session_key = self._approval_state.pop(approval_id, None)
+                # Peek (do NOT pop yet): binding the resolution to the verified
+                # requester must happen before we consume the approval token or
+                # edit the card, so a mismatched (but allowlisted) clicker can't
+                # lock out the real requester.
+                session_key = self._approval_state.get(approval_id)
                 if not session_key:
                     await query.answer(text="This approval has already been resolved.")
                     return
 
                 user_display = getattr(query.from_user, "first_name", "User")
 
-                # Resolve the approval FIRST — unblocks the agent thread.
-                # Rendering happens after so the message reflects what
-                # actually occurred: a tap that lands after the approval
-                # wait timed out (count == 0) must NOT claim "Approved" —
-                # the command was already denied and will not run (#63501
-                # regression follow-up: 60s waits made stale taps common).
+                # Resolve the approval — unblocks the agent thread. Bound to the
+                # verified clicker so only the requester may approve/deny.
                 try:
-                    from tools.approval import resolve_gateway_approval
-                    count = resolve_gateway_approval(session_key, choice)
+                    from tools.approval import resolve_gateway_approval, REQUESTER_MISMATCH
+                    count = resolve_gateway_approval(session_key, choice, clicker_id=caller_id)
                     logger.info(
                         "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                         count, session_key, choice, user_display,
@@ -6271,30 +6271,54 @@ class TelegramAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
                     count = 0
+                    REQUESTER_MISMATCH = -1  # local fallback if import failed
 
-                if count:
-                    # Map choice to human-readable label
-                    label_map = {
-                        "once": "✅ Approved once",
-                        "session": "✅ Approved for session",
-                        "always": "✅ Approved permanently",
-                        "deny": "❌ Denied",
-                    }
-                    label = label_map.get(choice, "Resolved")
-                    edit_text = f"{label} by {user_display}"
-                else:
-                    label = "⌛ Approval expired"
-                    edit_text = (
-                        f"{label} — no command was waiting. "
-                        f"It already timed out (and was denied) or was resolved elsewhere."
+                if count == REQUESTER_MISMATCH:
+                    await query.answer(
+                        text="⛔ Only the user who ran this command can approve or deny it."
                     )
+                    return
+                if count <= 0:
+                    # Stale tap: the wait already timed out (fail-closed deny)
+                    # or another surface resolved it. Render the expired card
+                    # rather than a bare toast, so the message cannot keep
+                    # claiming a pending approval (#63501).
+                    self._approval_state.pop(approval_id, None)
+                    label = "⌛ Approval expired"
+                    await query.answer(text=label)
+                    try:
+                        await query.edit_message_text(
+                            text=self.format_message(
+                                f"{label} — no command was waiting. "
+                                f"It already timed out (and was denied) or "
+                                f"was resolved elsewhere."
+                            ),
+                            parse_mode=ParseMode.MARKDOWN_V2,
+                            reply_markup=None,
+                        )
+                    except Exception:
+                        pass  # non-fatal if edit fails
+                    return
+
+                # Resolved: consume the token and update the card.
+                self._approval_state.pop(approval_id, None)
+
+                # Map choice to human-readable label. Upstream moved this map
+                # into its own `if count:` branch; count > 0 is guaranteed here.
+                label_map = {
+                    "once": "✅ Approved once",
+                    "session": "✅ Approved for session",
+                    "always": "✅ Approved permanently",
+                    "deny": "❌ Denied",
+                }
+                label = label_map.get(choice, "Resolved")
 
                 await query.answer(text=label)
 
                 # Edit message to show decision, remove buttons
                 try:
                     await query.edit_message_text(
-                        text=self.format_message(edit_text),
+                        text=self.format_message(f"{label} by {user_display}"),
                         parse_mode=ParseMode.MARKDOWN_V2,
                         reply_markup=None,
                     )
