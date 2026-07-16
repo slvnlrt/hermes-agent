@@ -216,9 +216,38 @@ class TestResolveApproval:
         with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
             await adapter._resolve_approval(1, "once", "Norbert", open_id="ou_user1", chat_id="oc_12345")
 
-        mock_resolve.assert_called_once_with("agent:main:feishu:group:oc_12345", "once")
+        mock_resolve.assert_called_once_with(
+            "agent:main:feishu:group:oc_12345", "once", clicker_id="ou_user1"
+        )
         assert 1 not in adapter._approval_state
 
+
+    @pytest.mark.asyncio
+    async def test_wrong_requester_does_not_resolve(self):
+        """When the core reports a requester mismatch, _resolve_approval must
+        keep the approval state so the real requester can still resolve."""
+        from tools.approval import REQUESTER_MISMATCH
+
+        adapter = _make_adapter()
+        adapter._approval_state[7] = {
+            "session_key": "sess-7",
+            "message_id": "msg_007",
+            "chat_id": "oc_77",
+        }
+
+        with patch(
+            "tools.approval.resolve_gateway_approval",
+            return_value=REQUESTER_MISMATCH,
+        ) as mock_resolve:
+            await adapter._resolve_approval(
+                7, "once", "Mallory",
+                open_id="ou_other", chat_id="oc_77", clicker_id="ou_other",
+            )
+
+        mock_resolve.assert_called_once_with(
+            "sess-7", "once", clicker_id="ou_other"
+        )
+        assert 7 in adapter._approval_state
 
     @pytest.mark.asyncio
     async def test_unauthorized_click_does_not_resolve(self):
