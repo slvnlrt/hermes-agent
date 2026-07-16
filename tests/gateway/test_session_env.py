@@ -394,3 +394,55 @@ async def test_gateway_executor_refuses_resurrection_after_shutdown():
     finally:
         runner._shutdown_executor()
 
+
+
+# ------------------------------------------------------------------
+# get_verified_principal — W2 formalization of the current-speaker id
+# ------------------------------------------------------------------
+
+
+def test_get_verified_principal_reads_session_user_id():
+    """The accessor returns the verified HERMES_SESSION_USER_ID."""
+    from gateway.session_context import get_verified_principal
+
+    tokens = set_session_vars(user_id="aad-123", user_name="Alice")
+    try:
+        assert get_verified_principal() == "aad-123"
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_get_verified_principal_defaults_when_unset():
+    """Off the gateway path (var never set), the accessor returns the default."""
+    from gateway.session_context import get_verified_principal
+
+    # No set_session_vars in this context and no env var → default.
+    import os as _os
+    _os.environ.pop("HERMES_SESSION_USER_ID", None)
+    assert get_verified_principal() == ""
+    assert get_verified_principal("operator") == "operator"
+
+
+def test_get_verified_principal_tracks_current_speaker_in_shared_session():
+    """Regression: two speakers in the same session — the var reflects each in
+    turn (the property W1/W4 rely on). The display name is not the id."""
+    from gateway.session_context import get_verified_principal, get_session_env
+
+    tokens_a = set_session_vars(
+        user_id="aad-alice", user_name="Alice", session_key="shared"
+    )
+    try:
+        assert get_verified_principal() == "aad-alice"
+        # Display name must never be confused with the id.
+        assert get_session_env("HERMES_SESSION_USER_NAME") == "Alice"
+    finally:
+        clear_session_vars(tokens_a)
+
+    # Next turn: a different speaker in the SAME shared session.
+    tokens_b = set_session_vars(
+        user_id="aad-bob", user_name="Bob", session_key="shared"
+    )
+    try:
+        assert get_verified_principal() == "aad-bob"
+    finally:
+        clear_session_vars(tokens_b)
