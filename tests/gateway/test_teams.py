@@ -1,6 +1,7 @@
 """Tests for the Microsoft Teams platform adapter plugin."""
 
 import json
+import os
 import sys
 import types
 from types import SimpleNamespace
@@ -1457,14 +1458,15 @@ class TestTeamsStandaloneSend:
 
 
 class TestTeamsMediaAttachments:
-    """send_video / send_voice / send_document route through the same
-    Attachment mechanism as send_image so the gateway's media dispatch
-    (run.py) delivers native attachments instead of the base-class text
-    fallback (file path sent as plain text)."""
+    """Outbound media delivery matrix. Remote URLs attach by reference.
+    Local files depend on ``public_base_url``: without it, images fall back
+    to a base64 data URI while non-images get an explicit "couldn't deliver"
+    notice — Teams silently drops non-image Attachment payloads, so the old
+    data-URI path was a lie (`success=True`, nothing materialized)."""
 
-    def _make_adapter(self):
+    def _make_adapter(self, **extra):
         adapter = TeamsAdapter(_make_config(
-            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+            client_id="bot-id", client_secret="secret", tenant_id="tenant", **extra
         ))
         adapter._app = MagicMock()
         adapter._app.id = "bot-id"
@@ -1480,22 +1482,46 @@ class TestTeamsMediaAttachments:
         adapter._app.send.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_send_voice_local_file_base64(self, tmp_path):
+    async def test_send_voice_local_no_base_url_sends_honest_notice(self, tmp_path):
         adapter = self._make_adapter()
         audio = tmp_path / "reply.mp3"
         audio.write_bytes(b"ID3fakeaudio")
         result = await adapter.send_voice("19:abc@thread.v2", str(audio), caption="here you go")
         assert result.success
         adapter._app.send.assert_awaited_once()
+        sent_text = adapter._app.send.await_args.args[1]
+        assert "Couldn't deliver" in sent_text
+        assert "TEAMS_PUBLIC_BASE_URL" in sent_text
+        assert str(tmp_path) not in sent_text  # host directory never leaks
 
     @pytest.mark.asyncio
-    async def test_send_document_local_file_base64(self, tmp_path):
+    async def test_send_document_local_no_base_url_sends_honest_notice(self, tmp_path):
         adapter = self._make_adapter()
         doc = tmp_path / "report.pdf"
         doc.write_bytes(b"%PDF-1.4 fake")
         result = await adapter.send_document("19:abc@thread.v2", str(doc))
         assert result.success
-        adapter._app.send.assert_awaited_once()
+        sent_text = adapter._app.send.await_args.args[1]
+        assert "Couldn't deliver" in sent_text and "report.pdf" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_send_image_local_no_base_url_uses_data_uri(self, tmp_path, monkeypatch):
+        adapter = self._make_adapter()
+        img = tmp_path / "pic.png"
+        img.write_bytes(b"\x89PNG fake")
+        captured = {}
+
+        class _CapturingAttachment:
+            def __init__(self, content_type, content_url):
+                captured["content_type"] = content_type
+                captured["content_url"] = content_url
+
+        monkeypatch.setattr(
+            sys.modules["microsoft_teams.api"], "Attachment", _CapturingAttachment
+        )
+        result = await adapter.send_image_file("19:abc@thread.v2", str(img))
+        assert result.success
+        assert captured["content_url"].startswith("data:image/png;base64,")
 
     @pytest.mark.asyncio
     async def test_send_video_without_app_fails(self):
@@ -1511,3 +1537,132 @@ class TestTeamsMediaAttachments:
         result = await adapter.send_document("19:abc@thread.v2", "/no/such/file.pdf")
         assert not result.success
         adapter._app.send.assert_not_awaited()
+
+
+class TestTeamsMediaCapabilityUrls:
+    """With ``public_base_url`` configured, local media are served from
+    short-lived capability URLs: images attach by reference (inline render),
+    everything else becomes a markdown download link. The token in the URL
+    path IS the capability — unguessable, expiring, mapped only to paths the
+    gateway media filter already approved."""
+
+    BASE = "https://bot.example.com"
+
+    def _make_adapter(self):
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+            public_base_url=self.BASE,
+        ))
+        adapter._app = MagicMock()
+        adapter._app.id = "bot-id"
+        adapter._app.send = AsyncMock(return_value=MagicMock(id="msg-001"))
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_send_voice_local_sends_download_link(self, tmp_path):
+        adapter = self._make_adapter()
+        audio = tmp_path / "reply.mp3"
+        audio.write_bytes(b"ID3fakeaudio")
+        result = await adapter.send_voice("19:abc@thread.v2", str(audio), caption="voice reply")
+        assert result.success
+        sent_text = adapter._app.send.await_args.args[1]
+        assert f"{self.BASE}/media/" in sent_text
+        assert "reply.mp3" in sent_text
+        assert str(tmp_path) not in sent_text  # capability URL replaces the host path
+        token = sent_text.split("/media/", 1)[1].split("/", 1)[0]
+        assert adapter._media_urls.resolve(token) == os.path.realpath(str(audio))
+
+    @pytest.mark.asyncio
+    async def test_send_document_local_sends_download_link(self, tmp_path):
+        adapter = self._make_adapter()
+        doc = tmp_path / "report.pdf"
+        doc.write_bytes(b"%PDF-1.4 fake")
+        result = await adapter.send_document("19:abc@thread.v2", str(doc))
+        assert result.success
+        sent_text = adapter._app.send.await_args.args[1]
+        assert f"{self.BASE}/media/" in sent_text and "report.pdf" in sent_text
+
+    @pytest.mark.asyncio
+    async def test_send_image_local_attaches_by_capability_url(self, tmp_path, monkeypatch):
+        adapter = self._make_adapter()
+        img = tmp_path / "pic.png"
+        img.write_bytes(b"\x89PNG fake")
+        captured = {}
+
+        class _CapturingAttachment:
+            def __init__(self, content_type, content_url):
+                captured["content_type"] = content_type
+                captured["content_url"] = content_url
+
+        monkeypatch.setattr(
+            sys.modules["microsoft_teams.api"], "Attachment", _CapturingAttachment
+        )
+        result = await adapter.send_image_file("19:abc@thread.v2", str(img))
+        assert result.success
+        assert captured["content_url"].startswith(f"{self.BASE}/media/")
+        assert not captured["content_url"].startswith("data:")
+
+    def test_registry_resolves_then_expires(self, monkeypatch):
+        base = _teams_mod.time.monotonic()
+        reg = _teams_mod._MediaUrlRegistry(ttl_seconds=100)
+        token = reg.register("/tmp/some-file.bin")
+        assert reg.resolve(token) == os.path.realpath("/tmp/some-file.bin")
+        monkeypatch.setattr(_teams_mod.time, "monotonic", lambda: base + 200)
+        assert reg.resolve(token) is None
+
+    def test_registry_cap_evicts_oldest(self):
+        reg = _teams_mod._MediaUrlRegistry(ttl_seconds=100, max_entries=2)
+        t1 = reg.register("/a")
+        t2 = reg.register("/b")
+        t3 = reg.register("/c")
+        assert reg.resolve(t1) is None  # FIFO-evicted
+        assert reg.resolve(t2) == os.path.realpath("/b")
+        assert reg.resolve(t3) == os.path.realpath("/c")
+
+    def test_registry_tokens_are_unguessable_length(self):
+        reg = _teams_mod._MediaUrlRegistry()
+        token = reg.register("/tmp/x")
+        assert len(token) >= 40  # 32 random bytes urlsafe-encoded
+
+    @pytest.mark.asyncio
+    async def test_serve_media_unknown_token_404(self):
+        adapter = self._make_adapter()
+        request = MagicMock()
+        request.match_info = {"token": "definitely-not-registered"}
+        resp = await adapter._serve_media(request)
+        assert resp.status == 404
+
+    @pytest.mark.asyncio
+    async def test_serve_media_valid_token_serves_file(self, tmp_path):
+        from aiohttp import web as aio_web
+
+        adapter = self._make_adapter()
+        doc = tmp_path / "doc.pdf"
+        doc.write_bytes(b"%PDF fake")
+        token = adapter._media_urls.register(str(doc))
+        request = MagicMock()
+        request.match_info = {"token": token, "filename": "doc.pdf"}
+        resp = await adapter._serve_media(request)
+        assert isinstance(resp, aio_web.FileResponse)
+        assert str(resp._path) == os.path.realpath(str(doc))
+        assert resp.headers["Cache-Control"] == "private, no-store"
+
+    @pytest.mark.asyncio
+    async def test_serve_media_vanished_file_404(self, tmp_path):
+        adapter = self._make_adapter()
+        doc = tmp_path / "gone.pdf"
+        doc.write_bytes(b"%PDF fake")
+        token = adapter._media_urls.register(str(doc))
+        doc.unlink()
+        request = MagicMock()
+        request.match_info = {"token": token}
+        resp = await adapter._serve_media(request)
+        assert resp.status == 404
+
+    def test_bad_base_url_scheme_is_ignored(self):
+        adapter = TeamsAdapter(_make_config(
+            client_id="bot-id", client_secret="secret", tenant_id="tenant",
+            public_base_url="ftp://nope.example.com",
+        ))
+        assert adapter._public_base_url == ""
+        assert adapter._build_public_media_url("/tmp/x") is None

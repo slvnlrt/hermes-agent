@@ -46,3 +46,15 @@ optional_env:
     description: "Display name for the Teams home channel"
     prompt: "Home channel display name"
     password: false
+  - name: TEAMS_PUBLIC_BASE_URL
+    description: >-
+      Public https origin of the webhook server (e.g. the tunnel hostname).
+      Enables outbound file delivery: local media are served from short-lived
+      /media/ capability URLs instead of base64 data URIs, which Teams
+      silently drops for non-image content.
+    prompt: "Public base URL (or empty)"
+    password: false
+  - name: TEAMS_MEDIA_URL_TTL
+    description: "Lifetime in seconds of outbound media capability URLs (default: 900)"
+    prompt: "Media URL TTL seconds"
+    password: false
