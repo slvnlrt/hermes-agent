@@ -165,6 +165,39 @@ class TestElicitationHandlerFailureModes:
         assert handler.metrics["errors"] == 1
 
 
+class TestElicitationConsentRequesterBinding:
+    def test_gateway_resolution_is_bound_to_requester(self, monkeypatch):
+        from tools import approval
+
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setattr(
+            approval, "get_current_session_key", lambda default="default": "elicitation-session"
+        )
+        monkeypatch.setattr(approval, "get_current_requester_id", lambda: "requester")
+        resolutions = []
+
+        def notify(_data):
+            resolutions.append(
+                approval.resolve_gateway_approval(
+                    "elicitation-session", "once", clicker_id="other-user"
+                )
+            )
+            resolutions.append(
+                approval.resolve_gateway_approval(
+                    "elicitation-session", "once", clicker_id="requester"
+                )
+            )
+
+        approval.register_gateway_notify("elicitation-session", notify)
+        try:
+            result = approval.request_elicitation_consent("confirm", "MCP request")
+        finally:
+            approval.unregister_gateway_notify("elicitation-session")
+
+        assert resolutions == [approval.REQUESTER_MISMATCH, 1]
+        assert result == "accept"
+
+
 class TestElicitationHandlerWiring:
     def test_session_kwargs_returns_callback(self):
         handler = ElicitationHandler("pay", {})
