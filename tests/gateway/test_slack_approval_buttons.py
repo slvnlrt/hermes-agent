@@ -180,6 +180,47 @@ class TestSlackApprovalAction:
         assert len(section_text) <= 3000
 
     @pytest.mark.asyncio
+    async def test_wrong_requester_click_rejected(self):
+        """An allowlisted user who is not the requester cannot resolve or
+        update the card, and gets an ephemeral rejection."""
+        from tools.approval import REQUESTER_MISMATCH
+
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._approval_resolved["1234.5678"] = False
+
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "1234.5678", "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": "cmd"}},
+            ]},
+            "channel": {"id": "C1"},
+            "user": {"name": "mallory", "id": "U_OTHER"},
+        }
+        action = {
+            "action_id": "hermes_approve_once",
+            "value": "agent:main:slack:group:C1:1111",
+        }
+
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+        mock_client.chat_postEphemeral = AsyncMock()
+
+        with patch(
+            "tools.approval.resolve_gateway_approval", return_value=REQUESTER_MISMATCH
+        ) as mock_resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        mock_resolve.assert_called_once_with(
+            "agent:main:slack:group:C1:1111", "once", clicker_id="U_OTHER"
+        )
+        # No card update, and the double-click token is untouched so the real
+        # requester can still resolve.
+        mock_client.chat_update.assert_not_called()
+        assert adapter._approval_resolved.get("1234.5678") is False
+        mock_client.chat_postEphemeral.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_global_allowlist_blocks_unauthorized_click(self, monkeypatch):
         adapter = _make_adapter()
         adapter._approval_resolved["1234.5678"] = False
