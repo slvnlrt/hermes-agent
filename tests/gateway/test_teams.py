@@ -942,6 +942,21 @@ def _patch_httpx(monkeypatch, *, get_response=None, post_response=None, get_resp
     return calls
 
 
+def _patch_httpx_transport(monkeypatch, handler):
+    """Drive a REAL httpx.AsyncClient through a MockTransport.
+
+    Unlike ``_patch_httpx`` (which stubs ``.get``), this lets the adapter's
+    ``client.stream(...)`` + the shared bounded reader + httpx's redirect/auth
+    semantics all run for real. ``handler(request) -> httpx.Response``.
+    """
+    real = httpx.AsyncClient
+
+    def _mk(**kw):
+        return real(**kw, transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(httpx, "AsyncClient", _mk)
+
+
 _PNG_BYTES = b"\x89PNG\r\n\x1a\nfake-image-payload"
 
 
@@ -1064,15 +1079,20 @@ class TestTeamsInboundImageAuth:
         adapter = self._make_adapter()
         monkeypatch.setattr(_teams_mod, "_mint_bot_connector_token", AsyncMock(return_value=("tok", 3600)))
         monkeypatch.setattr("tools.url_safety.is_safe_url", lambda u: True)
-        calls = _patch_httpx(monkeypatch, get_response=_httpx_response(200, content=_PNG_BYTES))
+        seen = []
+
+        def handler(request):
+            seen.append(request)
+            return httpx.Response(200, content=_PNG_BYTES)
+
+        _patch_httpx_transport(monkeypatch, handler)
 
         data = await adapter._fetch_teams_image_bytes(
             "https://smba.trafficmanager.net/fr/v3/attachments/abc/views/original"
         )
 
         assert data == _PNG_BYTES
-        _, kw = calls["get"][0]
-        assert kw["headers"]["Authorization"] == "Bearer tok"
+        assert seen[0].headers.get("Authorization") == "Bearer tok"
 
     @pytest.mark.anyio
     async def test_fetch_image_no_bearer_for_foreign_host(self, monkeypatch):
@@ -1080,13 +1100,18 @@ class TestTeamsInboundImageAuth:
         mint = AsyncMock(return_value=("tok", 3600))
         monkeypatch.setattr(_teams_mod, "_mint_bot_connector_token", mint)
         monkeypatch.setattr("tools.url_safety.is_safe_url", lambda u: True)
-        calls = _patch_httpx(monkeypatch, get_response=_httpx_response(200, content=_PNG_BYTES))
+        seen = []
+
+        def handler(request):
+            seen.append(request)
+            return httpx.Response(200, content=_PNG_BYTES)
+
+        _patch_httpx_transport(monkeypatch, handler)
 
         data = await adapter._fetch_teams_image_bytes("https://evil.example.com/img.png")
 
         assert data == _PNG_BYTES
-        _, kw = calls["get"][0]
-        assert "Authorization" not in kw["headers"]
+        assert seen[0].headers.get("Authorization") is None
         mint.assert_not_awaited()  # token never minted for a non-Bot-Framework host
 
     @pytest.mark.anyio
@@ -1157,16 +1182,24 @@ class TestTeamsInboundImageAuth:
         monkeypatch.setattr(_teams_mod, "_IMAGE_FETCH_RETRY_DELAYS", (0.0, 0.0, 0.0))
         monkeypatch.setattr(_teams_mod, "_mint_bot_connector_token", AsyncMock(return_value=("tok", 3600)))
         monkeypatch.setattr("tools.url_safety.is_safe_url", lambda u: True)
-        calls = _patch_httpx(monkeypatch, get_responses=[
-            _httpx_response(403, json_data={"message": "Authorization has been denied for this request."}),
-            _httpx_response(200, content=_PNG_BYTES),
-        ])
+        seq = [
+            httpx.Response(403, json={"message": "Authorization has been denied for this request."}),
+            httpx.Response(200, content=_PNG_BYTES),
+        ]
+        n = {"i": 0}
+
+        def handler(request):
+            r = seq[min(n["i"], len(seq) - 1)]
+            n["i"] += 1
+            return r
+
+        _patch_httpx_transport(monkeypatch, handler)
 
         data = await adapter._fetch_teams_image_bytes(
             "https://smba.trafficmanager.net/fr/v3/attachments/abc/views/original"
         )
         assert data == _PNG_BYTES
-        assert len(calls["get"]) == 2  # one transient 403, then success
+        assert n["i"] == 2  # one transient 403, then success
 
     @pytest.mark.anyio
     async def test_fetch_image_exhausts_retries_and_raises(self, monkeypatch):
@@ -1174,17 +1207,19 @@ class TestTeamsInboundImageAuth:
         monkeypatch.setattr(_teams_mod, "_IMAGE_FETCH_RETRY_DELAYS", (0.0, 0.0, 0.0))
         monkeypatch.setattr(_teams_mod, "_mint_bot_connector_token", AsyncMock(return_value=("tok", 3600)))
         monkeypatch.setattr("tools.url_safety.is_safe_url", lambda u: True)
-        calls = _patch_httpx(monkeypatch, get_responses=[
-            _httpx_response(403, json_data={"message": "denied"}),
-            _httpx_response(403, json_data={"message": "denied"}),
-            _httpx_response(403, json_data={"message": "denied"}),
-        ])
+        n = {"i": 0}
+
+        def handler(request):
+            n["i"] += 1
+            return httpx.Response(403, json={"message": "denied"})
+
+        _patch_httpx_transport(monkeypatch, handler)
 
         with pytest.raises(httpx.HTTPStatusError):
             await adapter._fetch_teams_image_bytes(
                 "https://smba.trafficmanager.net/fr/v3/attachments/abc/views/original"
             )
-        assert len(calls["get"]) == 3  # all attempts consumed, then raised
+        assert n["i"] == 3  # all attempts consumed, then raised
 
     @pytest.mark.anyio
     async def test_fetch_image_permanent_404_not_retried(self, monkeypatch):
@@ -1192,16 +1227,19 @@ class TestTeamsInboundImageAuth:
         monkeypatch.setattr(_teams_mod, "_IMAGE_FETCH_RETRY_DELAYS", (0.0, 0.0, 0.0))
         monkeypatch.setattr(_teams_mod, "_mint_bot_connector_token", AsyncMock(return_value=("tok", 3600)))
         monkeypatch.setattr("tools.url_safety.is_safe_url", lambda u: True)
-        calls = _patch_httpx(monkeypatch, get_responses=[
-            _httpx_response(404, json_data={"message": "not found"}),
-            _httpx_response(200, content=_PNG_BYTES),  # must never be reached
-        ])
+        n = {"i": 0}
+
+        def handler(request):
+            n["i"] += 1
+            return httpx.Response(404, json={"message": "not found"})
+
+        _patch_httpx_transport(monkeypatch, handler)
 
         with pytest.raises(httpx.HTTPStatusError):
             await adapter._fetch_teams_image_bytes(
                 "https://smba.trafficmanager.net/fr/v3/attachments/abc/views/original"
             )
-        assert len(calls["get"]) == 1  # 404 is permanent — no retry
+        assert n["i"] == 1  # 404 is permanent — no retry
 
     @pytest.mark.anyio
     async def test_fetch_image_403_not_retried_when_unauthenticated(self, monkeypatch):
@@ -1210,14 +1248,54 @@ class TestTeamsInboundImageAuth:
         adapter = self._make_adapter()
         monkeypatch.setattr(_teams_mod, "_IMAGE_FETCH_RETRY_DELAYS", (0.0, 0.0, 0.0))
         monkeypatch.setattr("tools.url_safety.is_safe_url", lambda u: True)
-        calls = _patch_httpx(monkeypatch, get_responses=[
-            _httpx_response(403, json_data={"message": "forbidden"}),
-            _httpx_response(200, content=_PNG_BYTES),
-        ])
+        n = {"i": 0}
+
+        def handler(request):
+            n["i"] += 1
+            return httpx.Response(403, json={"message": "forbidden"})
+
+        _patch_httpx_transport(monkeypatch, handler)
 
         with pytest.raises(httpx.HTTPStatusError):
             await adapter._fetch_teams_image_bytes("https://evil.example.com/img.png")
-        assert len(calls["get"]) == 1  # unauthenticated 403 → no retry
+        assert n["i"] == 1  # unauthenticated 403 → no retry
+
+    @pytest.mark.anyio
+    async def test_fetch_image_oversized_rejected_via_streaming_reader(self, monkeypatch):
+        # The bounded streaming reader must reject an oversized body mid-stream:
+        # no Content-Length → the pre-check is skipped, so only the per-chunk
+        # running-total guard can catch it (proving we stream, not buffer
+        # .content). Spy confirms the bounded reader was actually invoked.
+        import gateway.platforms.base as _base
+
+        adapter = self._make_adapter()
+        monkeypatch.setattr(_teams_mod, "_mint_bot_connector_token", AsyncMock(return_value=("tok", 3600)))
+        monkeypatch.setattr("tools.url_safety.is_safe_url", lambda u: True)
+        monkeypatch.setattr(_base, "get_inbound_media_max_bytes", lambda: 16)
+
+        seen = {"n": 0}
+        _orig = _base._read_httpx_body_with_limit
+
+        async def _spy(response, **kw):
+            seen["n"] += 1
+            return await _orig(response, **kw)
+
+        monkeypatch.setattr(_base, "_read_httpx_body_with_limit", _spy)
+
+        async def _chunks():
+            yield b"\x89PNG\r\n\x1a\n" + b"\x00" * 40
+            yield b"\x00" * 40
+
+        def handler(request):
+            return httpx.Response(200, content=_chunks())
+
+        _patch_httpx_transport(monkeypatch, handler)
+
+        with pytest.raises(ValueError):
+            await adapter._fetch_teams_image_bytes(
+                "https://smba.trafficmanager.net/fr/v3/attachments/abc/views/original"
+            )
+        assert seen["n"] >= 1  # the bounded streaming reader was on the path
 
     # -- end-to-end image branch in _on_message -------------------------
 
