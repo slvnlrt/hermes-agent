@@ -576,6 +576,10 @@ async def _mint_bot_connector_token(
     """
     if not (tenant_id and client_id and client_secret):
         raise RuntimeError("missing Teams client credentials")
+    # A malformed tenant must never be interpolated into the STS URL (mirrors
+    # the guard _standalone_send applies), so both mint paths stay in lock-step.
+    if not _TEAMS_CONV_ID_RE.match(tenant_id):
+        raise RuntimeError("Teams tenant_id has unexpected characters")
     token_url = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
     import httpx
 
@@ -834,6 +838,7 @@ class TeamsAdapter(BasePlatformAdapter):
         # fetch token-gated inbound image attachments. Refreshed before expiry.
         self._bot_token: Optional[str] = None
         self._bot_token_expiry: float = 0.0
+        self._bot_token_lock = asyncio.Lock()
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         # Lazy-install the Teams SDK on demand (parity with Slack/Discord/etc.),
@@ -945,19 +950,27 @@ class TeamsAdapter(BasePlatformAdapter):
             return self._bot_token
         if not (self._client_id and self._client_secret and self._tenant_id):
             return None
-        try:
-            token, expires_in = await _mint_bot_connector_token(
-                tenant_id=self._tenant_id,
-                client_id=self._client_id,
-                client_secret=self._client_secret,
-            )
-        except Exception as e:
-            logger.warning("[teams] Failed to acquire Bot Connector token: %s", e)
-            return None
-        # Refresh a minute early to avoid racing the expiry on a slow fetch.
-        self._bot_token = token
-        self._bot_token_expiry = now + max(0.0, expires_in - 60)
-        return token
+        async with self._bot_token_lock:
+            # Re-check under the lock: a concurrent caller may have minted so a
+            # burst of pasted images shares a single STS round-trip.
+            now = time.monotonic()
+            if self._bot_token and now < self._bot_token_expiry:
+                return self._bot_token
+            try:
+                token, expires_in = await _mint_bot_connector_token(
+                    tenant_id=self._tenant_id,
+                    client_id=self._client_id,
+                    client_secret=self._client_secret,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[teams] Failed to acquire Bot Connector token: %s", e
+                )
+                return None
+            # Refresh a minute early to avoid racing the expiry on a slow fetch.
+            self._bot_token = token
+            self._bot_token_expiry = now + max(0.0, expires_in - 60)
+            return token
 
     async def _fetch_teams_image_bytes(self, url: str, timeout: float = 30.0) -> bytes:
         """Fetch inline-image bytes, authenticating to the Bot Connector.
@@ -984,7 +997,10 @@ class TeamsAdapter(BasePlatformAdapter):
                 raise ValueError(f"invalid data: image URI: {e}")
 
         from tools.url_safety import is_safe_url
-        from gateway.platforms.base import _ssrf_redirect_guard
+        from gateway.platforms.base import (
+            _read_httpx_body_with_limit,
+            _ssrf_redirect_guard,
+        )
 
         if not is_safe_url(url):
             raise ValueError("Blocked unsafe image URL (SSRF protection)")
@@ -1015,23 +1031,28 @@ class TeamsAdapter(BasePlatformAdapter):
             for attempt, delay in enumerate(delays):
                 if delay:
                     await asyncio.sleep(delay)
-                response = await client.get(url, headers=headers)
-                if response.status_code < 400:
-                    return response.content
-                # Transient auth window on a freshly-pasted attachment (401/403
-                # only worth retrying when we actually authenticated), plus the
-                # usual rate-limit / server-error retryables.
-                retryable = (
-                    (bearer_attached and response.status_code in (401, 403))
-                    or response.status_code in (408, 429)
-                    or response.status_code >= 500
-                )
-                if not retryable or attempt == len(delays) - 1:
-                    response.raise_for_status()
-                logger.info(
-                    "[teams] image fetch got HTTP %s (attempt %d/%d), retrying",
-                    response.status_code, attempt + 1, len(delays),
-                )
+                async with client.stream("GET", url, headers=headers) as response:
+                    if response.status_code < 400:
+                        # Bounded streaming read: an oversized body is rejected
+                        # mid-stream instead of buffered whole via .content.
+                        return await _read_httpx_body_with_limit(
+                            response, media_type="image"
+                        )
+                    # Transient auth window on a freshly-pasted attachment
+                    # (401/403 only worth retrying when we actually
+                    # authenticated), plus the usual rate-limit / server-error
+                    # retryables.
+                    retryable = (
+                        (bearer_attached and response.status_code in (401, 403))
+                        or response.status_code in (408, 429)
+                        or response.status_code >= 500
+                    )
+                    if not retryable or attempt == len(delays) - 1:
+                        response.raise_for_status()
+                    logger.info(
+                        "[teams] image fetch got HTTP %s (attempt %d/%d), retrying",
+                        response.status_code, attempt + 1, len(delays),
+                    )
         # The loop always returns bytes or raises; this is unreachable.
         raise RuntimeError("image fetch retry loop exited without result")
 
