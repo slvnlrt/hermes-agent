@@ -36,6 +36,14 @@ _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Z
 _YUANBAO_TARGET_RE = re.compile(r"^\s*((?:group|direct):[^:]+)\s*$")
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
 _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
+# Teams (Bot Framework) conversation IDs are opaque blobs with a fixed prefix:
+# "a:<blob>" for 1:1 chats, "19:<blob>@thread.<suffix>" for group chats and
+# channels, "19:<user>_<bot>@unq.gbl.spaces" for some personal-scope chats. A
+# channel reply carries a ";messageid=<id>" suffix that addresses the thread, so
+# the whole string is kept verbatim rather than split. Without this the ID
+# matches no pattern, is not explicit, and a resolved target silently falls back
+# to the home channel.
+_TEAMS_TARGET_RE = re.compile(r"^\s*((?:a|19):\S+)\s*$")
 # Platforms that address recipients by phone number and accept E.164 format
 # (with a leading '+'). Without this, "+15551234567" fails the isdigit() check
 # below and falls through to channel-name resolution, which has no way to
@@ -557,6 +565,10 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         match = _NUMERIC_TOPIC_RE.fullmatch(target_ref)
         if match:
             return match.group(1), match.group(2), True
+    if platform_name == "teams":
+        match = _TEAMS_TARGET_RE.fullmatch(target_ref)
+        if match:
+            return match.group(1), None, True
     if platform_name == "slack":
         match = _SLACK_THREAD_TARGET_RE.fullmatch(target_ref)
         if match:
