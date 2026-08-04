@@ -101,18 +101,30 @@ _MEMORY_ENABLING_CONFIG = {
 }
 
 
+def _force_config(monkeypatch, config):
+    """Make agent_init see *config*, whichever loader it reaches for.
+
+    ``agent/`` read-only call sites use ``load_config_readonly`` (the
+    deepcopy-free fast path); other paths still use ``load_config``. Patching
+    only one leaves the real on-disk config leaking into the assertions — a
+    test that then passes or fails for reasons unrelated to ``skip_memory``.
+    """
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
+
+
 class TestSkipMemoryCutsBuiltinStore:
     """Layer 1a: the built-in MEMORY.md/USER.md store."""
 
     def test_skip_memory_true_leaves_store_unset_even_when_config_enables_it(self, monkeypatch):
-        monkeypatch.setattr("hermes_cli.config.load_config", lambda: _MEMORY_ENABLING_CONFIG)
+        _force_config(monkeypatch, _MEMORY_ENABLING_CONFIG)
         agent = _make_agent(skip_memory=True)
         assert agent._memory_store is None
         assert agent._memory_enabled is False
         assert agent._user_profile_enabled is False
 
     def test_skip_memory_false_builds_store_when_config_enables_it(self, monkeypatch):
-        monkeypatch.setattr("hermes_cli.config.load_config", lambda: _MEMORY_ENABLING_CONFIG)
+        _force_config(monkeypatch, _MEMORY_ENABLING_CONFIG)
         agent = _make_agent(skip_memory=False)
         # Proves the previous test's None is caused by skip_memory, not by
         # some other missing precondition — the same config DOES take
@@ -130,12 +142,12 @@ class TestSkipMemoryCutsExternalManager:
     """
 
     def test_skip_memory_true_leaves_manager_unset_even_with_provider_configured(self, monkeypatch):
-        monkeypatch.setattr("hermes_cli.config.load_config", lambda: _MEMORY_ENABLING_CONFIG)
+        _force_config(monkeypatch, _MEMORY_ENABLING_CONFIG)
         agent = _make_agent(skip_memory=True)
         assert agent._memory_manager is None
 
     def test_skip_memory_false_constructs_manager_when_provider_configured(self, monkeypatch):
-        monkeypatch.setattr("hermes_cli.config.load_config", lambda: _MEMORY_ENABLING_CONFIG)
+        _force_config(monkeypatch, _MEMORY_ENABLING_CONFIG)
         monkeypatch.setattr(
             "plugins.memory.load_memory_provider",
             lambda name: _FakeAvailableProvider(),
