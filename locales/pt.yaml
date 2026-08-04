@@ -60,6 +60,7 @@ gateway:
 
   approve:
     no_pending:            "Não há nenhum comando pendente para aprovar."
+    wrong_requester:       "⛔ Apenas o utilizador que executou este comando o pode aprovar."
     once_singular:         "✅ Comando aprovado. O agente está a retomar..."
     once_plural:           "✅ Comandos aprovados ({count} comandos). O agente está a retomar..."
     session_singular:      "✅ Comando aprovado (padrão aprovado para esta sessão). O agente está a retomar..."
@@ -110,6 +111,7 @@ gateway:
   deny:
     stale:                 "❌ Comando negado (a aprovação tinha expirado)."
     no_pending:            "Não há nenhum comando pendente para negar."
+    wrong_requester:       "⛔ Apenas o utilizador que executou este comando o pode recusar."
     denied_singular:       "❌ Comando negado."
     denied_plural:         "❌ Comandos negados ({count} comandos)."
     denied_reason_singular: "❌ Comando negado. Motivo repassado ao agente: \"{reason}\""

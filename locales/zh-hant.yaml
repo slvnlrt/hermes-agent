@@ -60,6 +60,7 @@ gateway:
 
   approve:
     no_pending:            "沒有待批准的指令。"
+    wrong_requester:       "⛔ 只有執行該指令的使用者才能批准它。"
     once_singular:         "✅ 指令已批准。代理正在恢復…"
     once_plural:           "✅ 指令已批准（{count} 條指令）。代理正在恢復…"
     session_singular:      "✅ 指令已批准（本次工作階段內允許該模式）。代理正在恢復…"
@@ -110,6 +111,7 @@ gateway:
   deny:
     stale:                 "❌ 指令已拒絕（批准已過期）。"
     no_pending:            "沒有待拒絕的指令。"
+    wrong_requester:       "⛔ 只有執行該指令的使用者才能拒絕它。"
     denied_singular:       "❌ 指令已拒絕。"
     denied_plural:         "❌ 指令已拒絕（{count} 條指令）。"
     denied_reason_singular: "❌ 指令已拒絕。 已將原因轉達給代理: \"{reason}\""
