@@ -60,6 +60,7 @@ gateway:
 
   approve:
     no_pending:            "Geen hangende opdrag om goed te keur nie."
+    wrong_requester:       "⛔ Slegs die gebruiker wat hierdie opdrag uitgevoer het, kan dit goedkeur."
     once_singular:         "✅ Opdrag goedgekeur. Die agent gaan voort..."
     once_plural:           "✅ Opdragte goedgekeur ({count} opdragte). Die agent gaan voort..."
     session_singular:      "✅ Opdrag goedgekeur (patroon goedgekeur vir hierdie sessie). Die agent gaan voort..."
@@ -110,6 +111,7 @@ gateway:
   deny:
     stale:                 "❌ Opdrag geweier (goedkeuring was verouderd)."
     no_pending:            "Geen hangende opdrag om te weier nie."
+    wrong_requester:       "⛔ Slegs die gebruiker wat hierdie opdrag uitgevoer het, kan dit weier."
     denied_singular:       "❌ Opdrag geweier."
     denied_plural:         "❌ Opdragte geweier ({count} opdragte)."
     denied_reason_singular: "❌ Opdrag geweier. Rede aan die agent oorgedra: \"{reason}\""
