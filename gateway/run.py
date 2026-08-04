@@ -4531,7 +4531,13 @@ class TurnRunner:
         # Check agent cache — reuse the AIAgent from the previous message
         # in this session to preserve the frozen system prompt and tool
         # schemas for prompt cache hits.
-        _cache_keys = self._runner._extract_cache_busting_config(ctx.user_config)
+        # Copy into a fresh dict rather than mutating what the extractor
+        # returned: the signature contract is "a flat dict" (it only ever
+        # calls .items()), but callers legitimately hand back any falsy
+        # placeholder — the compression-failure tests stub it with (). A
+        # normalising copy also keeps us from writing into a structure a
+        # future extractor might cache and share.
+        _cache_keys = dict(self._runner._extract_cache_busting_config(ctx.user_config) or {})
         # Include the resolved channel_memory_mode so an operator flipping a
         # channel between "full" and "off" invalidates any already-cached
         # agent for that session on the very next turn, the same way an
