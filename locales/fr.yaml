@@ -60,6 +60,7 @@ gateway:
 
   approve:
     no_pending:            "Aucune commande en attente d'approbation."
+    wrong_requester:       "⛔ Seul l'utilisateur qui a lancé cette commande peut l'approuver."
     once_singular:         "✅ Commande approuvée. L'agent reprend..."
     once_plural:           "✅ Commandes approuvées ({count} commandes). L'agent reprend..."
     session_singular:      "✅ Commande approuvée (modèle approuvé pour cette session). L'agent reprend..."
@@ -119,6 +120,7 @@ gateway:
   deny:
     stale:                 "❌ Commande refusée (l'approbation était périmée)."
     no_pending:            "Aucune commande en attente de refus."
+    wrong_requester:       "⛔ Seul l'utilisateur qui a lancé cette commande peut la refuser."
     denied_singular:       "❌ Commande refusée."
     denied_plural:         "❌ Commandes refusées ({count} commandes)."
     denied_reason_singular: "❌ Commande refusée. Raison transmise à l'agent: \"{reason}\""

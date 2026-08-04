@@ -64,6 +64,7 @@ gateway:
 
   approve:
     no_pending:            "Níl aon ordú ag fanacht le ceadú."
+    wrong_requester:       "⛔ Ní féidir ach leis an úsáideoir a rith an t-ordú seo é a cheadú."
     once_singular:         "✅ Ordú ceadaithe. Tá an gníomhaire ag atosú..."
     once_plural:           "✅ Orduithe ceadaithe ({count} ordú). Tá an gníomhaire ag atosú..."
     session_singular:      "✅ Ordú ceadaithe (patrún ceadaithe don seisiún seo). Tá an gníomhaire ag atosú..."
@@ -123,6 +124,7 @@ gateway:
   deny:
     stale:                 "❌ Ordú diúltaithe (bhí an cead imithe i léig)."
     no_pending:            "Níl aon ordú ag fanacht le diúltú."
+    wrong_requester:       "⛔ Ní féidir ach leis an úsáideoir a rith an t-ordú seo é a dhiúltú."
     denied_singular:       "❌ Ordú diúltaithe."
     denied_plural:         "❌ Orduithe diúltaithe ({count} ordú)."
     denied_reason_singular: "❌ Ordú diúltaithe. Cúis curtha ar aghaidh chuig an ngníomhaire: \"{reason}\""

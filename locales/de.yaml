@@ -60,6 +60,7 @@ gateway:
 
   approve:
     no_pending:            "Kein ausstehender Befehl zum Genehmigen."
+    wrong_requester:       "⛔ Nur der Benutzer, der diesen Befehl ausgeführt hat, kann ihn genehmigen."
     once_singular:         "✅ Befehl genehmigt. Der Agent wird fortgesetzt..."
     once_plural:           "✅ Befehle genehmigt ({count} Befehle). Der Agent wird fortgesetzt..."
     session_singular:      "✅ Befehl genehmigt (Muster für diese Sitzung genehmigt). Der Agent wird fortgesetzt..."
@@ -119,6 +120,7 @@ gateway:
   deny:
     stale:                 "❌ Befehl abgelehnt (Genehmigung war veraltet)."
     no_pending:            "Kein ausstehender Befehl zum Ablehnen."
+    wrong_requester:       "⛔ Nur der Benutzer, der diesen Befehl ausgeführt hat, kann ihn ablehnen."
     denied_singular:       "❌ Befehl abgelehnt."
     denied_plural:         "❌ Befehle abgelehnt ({count} Befehle)."
     denied_reason_singular: "❌ Befehl abgelehnt. Grund an den Agenten weitergeleitet: \"{reason}\""
