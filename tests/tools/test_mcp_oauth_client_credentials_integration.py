@@ -321,12 +321,14 @@ async def test_client_secret_post_sends_both_credentials_in_the_body(
     """``client_secret_post`` puts BOTH credentials in the form body.
 
     RFC 6749 §2.3.1: a client authenticating this way must send ``client_id``
-    *and* ``client_secret`` in the request body. The pinned SDK sends only the
+    *and* ``client_secret`` in the request body. The 1.x SDK sent only the
     secret, leaving the authorization server unable to identify the caller
-    (modelcontextprotocol/python-sdk#2128, fixed on 2.x by #2185 but never
-    backported to the 1.x line). ``_HermesClientCredentialsProvider`` re-adds
-    it. The fake rejects a body without ``client_id``, so this fails loudly
-    rather than merely observing a missing field.
+    (modelcontextprotocol/python-sdk#2128); 2.x fixes it in
+    ``prepare_token_auth`` (#2185), which is why Hermes no longer carries a
+    repair of its own. This is the guard on that removal: the fake rejects a
+    body without ``client_id``, so an SDK that regressed here would fail the
+    test loudly instead of reaching an authorization server as
+    ``invalid_client``.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
@@ -351,15 +353,15 @@ async def test_client_secret_post_sends_both_credentials_in_the_body(
 
 
 @pytest.mark.asyncio
-async def test_reserved_characters_survive_the_body_rewrite(tmp_path, monkeypatch):
-    """Re-encoding the form body must not corrupt the credentials.
+async def test_reserved_characters_survive_the_form_encoding(tmp_path, monkeypatch):
+    """Form-encoding the token body must not corrupt the credentials.
 
-    The ``client_secret_post`` fix parses and re-encodes the request body, so a
-    secret containing characters that are meaningful in a form-encoded payload
-    (``&``, ``=``, ``+``, ``%``, spaces, non-ASCII) is where a naive rewrite
-    would break. The fake server compares the decoded values byte for byte and
+    A secret containing characters that are meaningful in a form-encoded
+    payload (``&``, ``=``, ``+``, ``%``, spaces, non-ASCII) is where encoding
+    goes wrong. The fake server compares the decoded values byte for byte and
     answers ``invalid_client`` on any mismatch, so corruption fails the test
-    rather than going unnoticed.
+    rather than going unnoticed. Hermes reads real secrets from ``${VAR}``, so
+    an operator can perfectly well hold one of these.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     nasty = "a+b=c%20d&e f/g?h#ié中~_-.*"
@@ -382,47 +384,6 @@ async def test_reserved_characters_survive_the_body_rewrite(tmp_path, monkeypatc
         assert body["client_secret"] == nasty
         assert body["client_id"] == CLIENT_ID
         assert body["grant_type"] == "client_credentials"
-
-
-@pytest.mark.asyncio
-async def test_client_id_is_not_duplicated_once_the_sdk_emits_it(
-    tmp_path, monkeypatch
-):
-    """The override is a no-op when the SDK already supplies ``client_id``.
-
-    Simulates the fixed SDK (2.x, PR #2185) so the idempotence guard is
-    actually exercised: without it the body would carry ``client_id`` twice
-    after an SDK upgrade, which some authorization servers reject.
-    """
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    from mcp.client.auth.oauth2 import OAuthContext
-
-    original = OAuthContext.prepare_token_auth
-
-    def _fixed(self, data, headers=None):
-        data, headers = original(self, data, headers)
-        if (
-            self.client_info
-            and self.client_info.token_endpoint_auth_method == "client_secret_post"
-        ):
-            data["client_id"] = self.client_info.client_id
-        return data, headers
-
-    monkeypatch.setattr(OAuthContext, "prepare_token_auth", _fixed)
-
-    with _auth_server() as state:
-        auth = _provider(
-            state, monkeypatch, token_endpoint_auth_method="client_secret_post"
-        )
-
-        async with httpx.AsyncClient(auth=auth, timeout=10.0) as client:
-            response = await client.get(f"{state.base}/mcp")
-
-        assert response.status_code == 200
-        assert state.token_bodies[0]["client_id"] == CLIENT_ID
-        # Count on the RAW body: parse_qs collapses a repeated key, so a
-        # duplicate would be invisible in the parsed form.
-        assert state.token_raw_bodies[0].count("client_id=") == 1
 
 
 @pytest.mark.asyncio

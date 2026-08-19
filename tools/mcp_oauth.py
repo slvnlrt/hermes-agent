@@ -63,7 +63,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse
+from urllib.parse import parse_qs, urlparse
 from hermes_constants import secure_parent_dir
 
 logger = logging.getLogger(__name__)
@@ -1987,37 +1987,31 @@ def _require_client_id(cfg: dict, grant: str) -> str:
 if _M2M_AVAILABLE:
 
     class _HermesClientCredentialsProvider(ClientCredentialsOAuthProvider):
-        """SDK provider with the ``client_secret_post`` body made compliant.
+        """SDK provider that keeps the operator's configured scope authoritative.
 
-        The SDK's ``prepare_token_auth()`` appends only ``client_secret`` for
-        ``client_secret_post``, so a client_credentials token request carries a
-        secret but no client identifier and the authorization server cannot
-        tell which client is calling — RFC 6749 §2.3.1 requires both, and
-        strict servers answer ``invalid_client``.
+        The SDK's auth flow runs a scope-selection strategy before *every*
+        authorization — ``WWW-Authenticate`` scope, else the protected-resource
+        metadata's ``scopes_supported``, else the authorization server's — and
+        assigns the result over ``client_metadata.scope``
+        (``mcp.client.auth.oauth2``, "Step 3"). ``get_client_metadata_scopes``
+        never consults the scope the client was constructed with, so a scope
+        set from ``oauth.scope`` would never reach the token request.
 
-        Fixed upstream in modelcontextprotocol/python-sdk#2185 (issue #2128)
-        on the 2.x line, which Hermes now pins (``mcp==2.0.0``): its
-        ``prepare_token_auth`` emits ``client_id`` itself, so the rewrite below
-        no-ops on the shipped SDK and only still fires for an install pinned
-        back to the 1.x maintenance branch, which never got the backport
-        (1.26.0 and 1.28.1 are both affected). Note that upstream deliberately fixed the shared
-        ``prepare_token_auth`` rather than this exchange method (PRs #2140 and
-        #2213, which patched the method, were rejected) — but that helper hangs
-        off ``OAuthContext``, not off the provider, so overriding the exchange
-        is the only seam available downstream.
+        For a machine-to-machine client that is the wrong precedence: the
+        operator picked a scope deliberately, and a scope the server advertises
+        must not silently widen it. Re-applying it in the exchange is the only
+        seam available downstream — the selection assigns onto ``OAuthContext``,
+        not onto the provider, so there is nothing else to override.
 
-        Deliberately written to no-op: once the SDK emits ``client_id`` itself,
-        the field is already present and the request is returned untouched.
-        ``client_secret_basic`` is never affected — there the credentials ride
-        in the Authorization header, which the SDK gets right.
-
-        It also re-applies the configured ``oauth.scope``. The SDK's auth flow
-        runs its scope-selection strategy (``WWW-Authenticate`` scope, else the
-        metadata's ``scopes_supported``, else nothing) and assigns the result
-        over ``client_metadata.scope`` *before* every authorization, so a scope
-        set at construction never reaches the token request. For a
-        machine-to-machine client the operator's configured scope is
-        authoritative — a server-advertised scope must not silently widen it.
+        Previously this class also repaired the ``client_secret_post`` token
+        body, which the SDK sent with a ``client_secret`` and no ``client_id``
+        (RFC 6749 §2.3.1 requires both; strict servers answered
+        ``invalid_client``). That is fixed upstream in
+        modelcontextprotocol/python-sdk#2185 (issue #2128) and shipped in the
+        2.x line Hermes pins, whose ``prepare_token_auth`` emits ``client_id``
+        itself — so the repair was dropped rather than carried as dead code.
+        ``client_secret_basic`` was never affected either way: there the
+        credentials ride in the Authorization header, which the SDK gets right.
         """
 
         def __init__(self, *args, scope: str | None = None, **kwargs) -> None:
@@ -2030,42 +2024,7 @@ if _M2M_AVAILABLE:
             if self._configured_scope:
                 # Undo the flow's scope selection: explicit config wins.
                 self.context.client_metadata.scope = self._configured_scope
-
-            request = await super()._exchange_token_client_credentials()
-
-            client_info = self.context.client_info
-            if (
-                client_info is None
-                or client_info.token_endpoint_auth_method != "client_secret_post"
-            ):
-                return request
-
-            content_type = request.headers.get("content-type", "")
-            if not content_type.startswith("application/x-www-form-urlencoded"):
-                return request  # Not a form body — nothing safe to rewrite.
-
-            fields = parse_qsl(request.content.decode(), keep_blank_values=True)
-            if any(key == "client_id" for key, _ in fields):
-                return request  # SDK fixed upstream — nothing to do.
-
-            fields.append(("client_id", client_info.client_id))
-            # Drop Content-Length: httpx recomputes it for the new body.
-            headers = {
-                key: value
-                for key, value in request.headers.items()
-                if key.lower() != "content-length"
-            }
-            # Build with the SDK's own httpx distribution, not Hermes': mcp 2.0
-            # moved its HTTP stack to ``httpx2`` and only that flavour's client
-            # can send this request. See ``tools.mcp_tool.sdk_httpx``.
-            from tools.mcp_tool import sdk_httpx
-
-            sdk = sdk_httpx()
-            if sdk is None:  # pragma: no cover — SDK import would have failed
-                return request
-            return sdk.Request(
-                "POST", request.url, content=urlencode(fields), headers=headers
-            )
+            return await super()._exchange_token_client_credentials()
 
 
 def build_client_credentials_provider(
