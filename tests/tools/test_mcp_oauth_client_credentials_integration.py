@@ -3,8 +3,9 @@
 The unit tests in ``test_mcp_oauth_client_credentials.py`` cover construction
 and dispatch. This module covers the runtime path: the **real** MCP SDK
 provider built by ``tools.mcp_oauth.build_oauth_auth``, driven by a **real**
-``httpx.AsyncClient``, against a **real** HTTP server on loopback. Nothing is
-mocked — no ``MockTransport``, no patched SDK internals.
+``AsyncClient`` from the SDK's own HTTP stack, against a **real** HTTP server
+on loopback. Nothing is mocked — no ``MockTransport``, no patched SDK
+internals.
 
 The sequence exercised is the one the feature promises:
 
@@ -35,10 +36,18 @@ import threading
 from contextlib import contextmanager
 from urllib.parse import parse_qs, urlparse
 
-import httpx
 import pytest
 
 from tools import mcp_oauth as mo
+from tools.mcp_tool import sdk_httpx
+
+# The provider is an ``httpx.Auth`` subclass built by the MCP SDK, and mcp 2.0
+# moved that stack from ``httpx`` to ``httpx2``. A client from the other
+# distribution rejects it outright ("Invalid \"auth\" argument"), so this
+# harness has to drive it with the same flavour the SDK hands its own
+# transports — which is exactly what tools/mcp_tool.py does at runtime.
+# Resolving it here keeps the test honest on either SDK generation.
+httpx = sdk_httpx()
 
 CLIENT_ID = "test-client"
 CLIENT_SECRET = "s3cr3t"

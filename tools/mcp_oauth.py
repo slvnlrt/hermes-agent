@@ -47,6 +47,7 @@ Configuration in config.yaml::
 
 import asyncio
 import contextvars
+import inspect
 import json
 import logging
 import os
@@ -155,6 +156,28 @@ except ImportError:
     logger.debug(
         "MCP client_credentials extension not available -- M2M MCP auth disabled"
     )
+
+
+def _client_credentials_scope_kwarg(scope: "str | None") -> dict:
+    """The scope keyword ``ClientCredentialsOAuthProvider`` accepts, per SDK.
+
+    mcp 2.0 renamed the constructor keyword from ``scopes`` to ``scope`` — the
+    field it feeds, ``OAuthClientMetadata.scope``, was singular all along. The
+    wrong spelling is a ``TypeError`` at construction, and on a headless
+    deployment that means every machine-to-machine MCP server fails to
+    authenticate at startup rather than degrading. Read the signature instead
+    of inferring it from a version number, matching the posture of
+    ``tools.mcp_tool.sdk_httpx`` for the same 1.x/2.x split.
+    """
+    if not _M2M_AVAILABLE:
+        return {}
+    try:
+        params = inspect.signature(
+            ClientCredentialsOAuthProvider.__init__
+        ).parameters
+    except (TypeError, ValueError):  # pragma: no cover — defensive
+        return {"scope": scope}
+    return {"scopes" if "scopes" in params else "scope": scope}
 
 
 # ---------------------------------------------------------------------------
@@ -1962,7 +1985,6 @@ def _require_client_id(cfg: dict, grant: str) -> str:
 
 
 if _M2M_AVAILABLE:
-    import httpx
 
     class _HermesClientCredentialsProvider(ClientCredentialsOAuthProvider):
         """SDK provider with the ``client_secret_post`` body made compliant.
@@ -1973,10 +1995,12 @@ if _M2M_AVAILABLE:
         tell which client is calling — RFC 6749 §2.3.1 requires both, and
         strict servers answer ``invalid_client``.
 
-        Fixed upstream in modelcontextprotocol/python-sdk#2185 (issue #2128),
-        but only on ``main`` (the 2.x line): the 1.x maintenance branch this
-        project pins was never backported, so 1.26.0 *and* the current 1.28.1
-        are both affected. Note that upstream deliberately fixed the shared
+        Fixed upstream in modelcontextprotocol/python-sdk#2185 (issue #2128)
+        on the 2.x line, which Hermes now pins (``mcp==2.0.0``): its
+        ``prepare_token_auth`` emits ``client_id`` itself, so the rewrite below
+        no-ops on the shipped SDK and only still fires for an install pinned
+        back to the 1.x maintenance branch, which never got the backport
+        (1.26.0 and 1.28.1 are both affected). Note that upstream deliberately fixed the shared
         ``prepare_token_auth`` rather than this exchange method (PRs #2140 and
         #2213, which patched the method, were rejected) — but that helper hangs
         off ``OAuthContext``, not off the provider, so overriding the exchange
@@ -1996,11 +2020,13 @@ if _M2M_AVAILABLE:
         authoritative — a server-advertised scope must not silently widen it.
         """
 
-        def __init__(self, *args, scopes: str | None = None, **kwargs) -> None:
-            super().__init__(*args, scopes=scopes, **kwargs)
-            self._configured_scope = scopes
+        def __init__(self, *args, scope: str | None = None, **kwargs) -> None:
+            super().__init__(
+                *args, **_client_credentials_scope_kwarg(scope), **kwargs
+            )
+            self._configured_scope = scope
 
-        async def _exchange_token_client_credentials(self) -> "httpx.Request":
+        async def _exchange_token_client_credentials(self):
             if self._configured_scope:
                 # Undo the flow's scope selection: explicit config wins.
                 self.context.client_metadata.scope = self._configured_scope
@@ -2029,7 +2055,15 @@ if _M2M_AVAILABLE:
                 for key, value in request.headers.items()
                 if key.lower() != "content-length"
             }
-            return httpx.Request(
+            # Build with the SDK's own httpx distribution, not Hermes': mcp 2.0
+            # moved its HTTP stack to ``httpx2`` and only that flavour's client
+            # can send this request. See ``tools.mcp_tool.sdk_httpx``.
+            from tools.mcp_tool import sdk_httpx
+
+            sdk = sdk_httpx()
+            if sdk is None:  # pragma: no cover — SDK import would have failed
+                return request
+            return sdk.Request(
                 "POST", request.url, content=urlencode(fields), headers=headers
             )
 
@@ -2088,7 +2122,7 @@ def build_client_credentials_provider(
         client_id=client_id,
         client_secret=client_secret,
         token_endpoint_auth_method=auth_method,
-        scopes=cfg.get("scope"),
+        scope=cfg.get("scope"),
     )
 
 
