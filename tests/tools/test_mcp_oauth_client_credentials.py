@@ -75,6 +75,52 @@ class TestIsM2MGrant:
 
 
 # ---------------------------------------------------------------------------
+# SDK generation compatibility
+# ---------------------------------------------------------------------------
+
+
+class TestScopeKwargCompat:
+    """The scope keyword changed name between the two SDK generations.
+
+    mcp 1.x took ``scopes=``; mcp 2.0 renamed it to ``scope=``. Passing the
+    wrong spelling is a TypeError at construction, so on a headless
+    deployment every M2M server would fail to authenticate at startup. These
+    pins are what makes an SDK bump a visible test failure instead of a live
+    outage.
+    """
+
+    def test_kwarg_follows_the_installed_sdk_signature(self):
+        import inspect
+
+        params = inspect.signature(
+            ClientCredentialsOAuthProvider.__init__
+        ).parameters
+        expected = "scopes" if "scopes" in params else "scope"
+
+        kwargs = mo._client_credentials_scope_kwarg("profile")
+
+        assert kwargs == {expected: "profile"}
+        # Whatever the spelling, it must be one the SDK actually accepts.
+        assert expected in params
+
+    def test_none_scope_is_still_passed_through(self):
+        kwargs = mo._client_credentials_scope_kwarg(None)
+        assert list(kwargs.values()) == [None]
+
+    def test_configured_scope_reaches_the_client_metadata(self, monkeypatch, tmp_path):
+        """End-to-end pin: the config scope must survive the kwarg translation."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg = _cfg()
+        cfg["scope"] = "gateway.read gateway.write"
+
+        p = mo.build_client_credentials_provider("gw", "https://gw/mcp", cfg)
+
+        assert p.context.client_metadata.scope == "gateway.read gateway.write"
+        assert p._fixed_client_info.scope == "gateway.read gateway.write"
+        assert p._configured_scope == "gateway.read gateway.write"
+
+
+# ---------------------------------------------------------------------------
 # Provider construction
 # ---------------------------------------------------------------------------
 
