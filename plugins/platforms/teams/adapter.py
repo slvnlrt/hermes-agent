@@ -649,6 +649,14 @@ _ALLOWED_TEAMS_SERVICE_HOSTS = frozenset({
     "smba.infra.gov.teams.microsoft.us",
 })
 
+# Right after a paste, the Bot Framework connector can answer 401/403 for a
+# few seconds while the attachment becomes readable with the bot's token
+# (eventual consistency on the Microsoft side). Retried only when a bearer
+# was actually attached: an unauthenticated 403 is final, and retrying it
+# would just delay the failure. First delay is 0 so the common case pays
+# nothing.
+_BF_ATTACHMENT_RETRY_DELAYS = (0.0, 1.0, 2.0, 4.0, 8.0)
+
 
 def _is_botframework_attachment_url(url: str) -> bool:
     """True if ``url`` points at a Bot Framework connector attachment host.
@@ -1121,6 +1129,11 @@ class TeamsAdapter(BasePlatformAdapter):
             tenant_id = self._tenant_id
             if not (client_id and client_secret and tenant_id):
                 raise ValueError("Missing TEAMS_CLIENT_ID/SECRET/TENANT_ID for attachment auth")
+            # The tenant is interpolated into the STS URL: reject anything
+            # outside the expected character set before it can reshape the
+            # path (same guard as the standalone send path).
+            if not _TEAMS_CONV_ID_RE.match(tenant_id):
+                raise ValueError("TEAMS_TENANT_ID contains characters outside the expected set")
 
             async with httpx.AsyncClient(timeout=15.0) as client:
                 resp = await client.post(
@@ -1139,7 +1152,9 @@ class TeamsAdapter(BasePlatformAdapter):
             self._bf_token_cache = (token, time.monotonic() + expires_in)
             return token
 
-    async def _fetch_attachment_bytes(self, url: str, timeout: float = 30.0) -> bytes:
+    async def _fetch_attachment_bytes(
+        self, url: str, timeout: float = 30.0, *, retry_transient: bool = False
+    ) -> bytes:
         """Download attachment bytes with SSRF protection.
 
         Teams file attachments carry pre-authenticated SharePoint download
@@ -1150,6 +1165,11 @@ class TeamsAdapter(BasePlatformAdapter):
         body through the shared inbound media cap, and follows redirects
         through the shared redirect guard, matching the cache_*_from_url
         helpers in gateway.platforms.base.
+
+        ``retry_transient`` opts into the post-paste retry window: a 401/403
+        received *with* the bearer attached is retried over
+        ``_BF_ATTACHMENT_RETRY_DELAYS``. Off by default so file downloads and
+        anonymous fetches keep their single-shot latency.
         """
         from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
         from gateway.platforms.base import _ssrf_redirect_guard, _read_httpx_body_with_limit
@@ -1158,23 +1178,38 @@ class TeamsAdapter(BasePlatformAdapter):
             raise ValueError("Blocked unsafe attachment URL (SSRF protection)")
 
         headers = {"User-Agent": "Mozilla/5.0 (compatible; HermesAgent/1.0)"}
+        bearer_attached = False
         if _is_botframework_attachment_url(url):
             try:
                 headers["Authorization"] = f"Bearer {await self._get_botframework_token()}"
+                bearer_attached = True
             except Exception as e:
                 logger.warning("[teams] Could not acquire Bot Framework token for attachment: %s", e)
+
+        delays = _BF_ATTACHMENT_RETRY_DELAYS if (retry_transient and bearer_attached) else (0.0,)
+        last_attempt = len(delays) - 1
 
         async with create_ssrf_safe_async_client(
             timeout=timeout,
             follow_redirects=True,
             event_hooks={"response": [_ssrf_redirect_guard]},
         ) as client:
-            async with client.stream("GET", url, headers=headers) as response:
-                response.raise_for_status()
-                # Stream through the shared inbound media cap (matches
-                # cache_image_from_url) instead of buffering .content — a
-                # lying Content-Length must not OOM the gateway.
-                return await _read_httpx_body_with_limit(response, media_type="attachment")
+            for attempt, delay in enumerate(delays):
+                if delay:
+                    await asyncio.sleep(delay)
+                async with client.stream("GET", url, headers=headers) as response:
+                    if attempt < last_attempt and response.status_code in (401, 403):
+                        logger.debug(
+                            "[teams] Bot Framework attachment answered %s, retrying (%d/%d)",
+                            response.status_code, attempt + 1, last_attempt,
+                        )
+                        continue
+                    response.raise_for_status()
+                    # Stream through the shared inbound media cap (matches
+                    # cache_image_from_url) instead of buffering .content — a
+                    # lying Content-Length must not OOM the gateway.
+                    return await _read_httpx_body_with_limit(response, media_type="attachment")
+        raise RuntimeError("unreachable: attachment fetch loop exited without a response")
 
     async def _on_message(self, ctx: ActivityContext[MessageActivity]) -> None:
         """Process an incoming Teams message and dispatch to the gateway."""
@@ -1316,7 +1351,9 @@ class TeamsAdapter(BasePlatformAdapter):
                     if _is_botframework_attachment_url(content_url):
                         # Bot Framework connector URL: needs the bot's own
                         # bearer token; the generic cache helper sends none.
-                        data = await self._fetch_attachment_bytes(content_url)
+                        # A just-pasted image can 401/403 for a few seconds:
+                        # this is the one caller that opts into the retry.
+                        data = await self._fetch_attachment_bytes(content_url, retry_transient=True)
                         ext = content_type.split("/")[-1].split(";")[0] or "png"
                         cached_m = cache_media_bytes(
                             data,
