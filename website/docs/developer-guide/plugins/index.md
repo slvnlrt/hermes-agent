@@ -1281,6 +1281,17 @@ def register(ctx):
 
 This is the public way for plugins to participate in Slack interactivity. Older plugins may patch `SlackAdapter.connect`; prefer this API instead. For the full slack_bolt surface (events, shortcuts, commands — not just Block Kit actions), use the generic `register_platform_handler("slack", ...)` below.
 
+### Inject an external event into an existing conversation
+
+`ctx.inject_message(content, *, session_key=..., on_complete=None, request_id=None, expires_at=None)` uses the existing gateway session, normal tools/history and normal reply delivery. It does not echo the injected event to the messaging platform. Intentional `[SILENT]` / `NO_REPLY` responses retain history without sending a notification.
+
+The operator must grant `plugins.entries.<plugin_id>.allow_gateway_injection: true`. The target must already have a persisted routing entry; current user authorization is rechecked. Injections are internal events with gateway-control commands disabled, not user approvals. Frame external content as machine data.
+
+- The returned boolean acknowledges scheduling only.
+- Optional synchronous `on_complete(outcome)` receives `success`, `failure` or `cancelled` at most once. Successful native processing includes intentional silence; when a normal reply is produced, the receipt follows native delivery handling. Callbacks are in-process and are not recovered after restart: a durable plugin inbox must reconcile unfinished receipts itself.
+- `request_id` preserves per-event identity while queued. `expires_at` is a finite Unix deadline: expired queued events do not start, but it does not interrupt an already running turn or undo tools. Do not use it as an action authorization.
+- Use `plugins.plugin_storage` for plugin state. Do not create a second agent process or send replies back into a webhook merely to reach the same gateway.
+
 ### Register native platform handlers (any platform)
 
 Plugins that need to receive platform events the core adapter doesn't route — extra update types, native button callbacks, reaction/member events, webhook routes — can register a handler factory that the platform's adapter invokes at connect time. This works on **every** gateway platform.
@@ -1314,12 +1325,12 @@ def register(ctx):
 | `teams` | Teams `App` | `on_message` / `on_card_action` decorators |
 | `dingtalk` | `DingTalkStreamClient` | `register_callback_handler` for other stream topics |
 | `feishu` | lark_oapi client | API calls; event routing |
-| `line`, `api_server`, `msgraph_webhook` | aiohttp `web.Application` | `router.add_get/post` — custom routes (wired before the router freezes) |
+| `line`, `api_server`, `msgraph_webhook`, `webhook` | aiohttp `web.Application` | `router.add_get/post` — custom routes (wired before the router freezes) |
 | everything else (whatsapp, signal, irc, email, sms, ntfy, wecom, weixin, bluebubbles, yuanbao, ...) | `None` | connect-time hook; work through the `adapter` handle |
 
 **Runtime behavior:**
 
-- Factories are queued at plugin-load time and invoked when the platform connects — for platforms where dispatch order matters (Telegram, Slack, Teams, aiohttp routers) they run **before** the core handlers register, so scoped plugin handlers take precedence and everything else falls through.
+- Factories are queued at plugin-load time and invoked at the platform's connect-time extension point. The native `webhook` adapter passes its app after registering built-in routes but before startup/router freeze; use a distinct scoped path. Other adapters may wire factories before their core handlers.
 - **Always scope handlers you add to first-match dispatch tables.** On Telegram, use `CallbackQueryHandler(..., pattern=r"^myplugin:")` — an unscoped handler would swallow the core button flows (exec approvals, model picker, clarify prompts).
 - Each factory is isolated: if it raises, the error is logged and the platform still connects.
 - Import platform SDKs inside the factory body, not at module level — `register()` must work when the SDK isn't installed.

@@ -10914,6 +10914,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         security_metadata_keys = (
             "hermes_plugin_id",
             "hermes_plugin_injection",
+            "hermes_plugin_request_id",
             "gateway_session_key",
             "gateway_session_id",
             "gateway_session_strict",
@@ -10949,6 +10950,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
+            if event.processing_callback is not None:
+                callback, event.processing_callback = event.processing_callback, None
+                callback("failure")
             return
 
         self._enqueue_fifo(session_key, event, adapter)
@@ -20413,17 +20417,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         content: str,
         plugin_id: str,
+        on_complete=None,
+        request_id: str | None = None,
+        expires_at: float | None = None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop."""
         loop = getattr(self, "_gateway_loop", None)
         if not getattr(self, "_running", False) or loop is None or loop.is_closed():
             return False
 
-        coro = self._dispatch_plugin_message_injection(
-            session_key=session_key,
-            content=content,
-            plugin_id=plugin_id,
-        )
+        kwargs: dict[str, Any] = dict(session_key=session_key, content=content, plugin_id=plugin_id)
+        if on_complete is not None:
+            kwargs["on_complete"] = on_complete
+        if request_id is not None:
+            kwargs["request_id"] = request_id
+        if expires_at is not None:
+            kwargs["expires_at"] = expires_at
+        coro = self._dispatch_plugin_message_injection(**kwargs)
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -20456,8 +20466,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 accepted = completed.result()
             except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                if on_complete is not None:
+                    on_complete("cancelled")
                 return
             except Exception:
+                if on_complete is not None:
+                    on_complete("failure")
                 logger.warning(
                     "Plugin message injection failed: plugin=%s session=%s",
                     plugin_id,
@@ -20466,6 +20480,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
             if not accepted:
+                if on_complete is not None:
+                    on_complete("failure")
                 logger.warning(
                     "Plugin message injection was not routed: plugin=%s session=%s",
                     plugin_id,
@@ -20481,9 +20497,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         content: str,
         plugin_id: str,
+        on_complete=None,
+        request_id: str | None = None,
+        expires_at: float | None = None,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         if not getattr(self, "_running", False) or getattr(self, "_draining", False):
+            return False
+        if expires_at is not None and expires_at <= time.time():
             return False
 
         entry = await self.async_session_store.lookup_by_session_key(session_key)
@@ -20525,6 +20546,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source=source,
             internal=True,
             allow_gateway_control=False,
+            processing_callback=on_complete,
             metadata={
                 "hermes_plugin_id": plugin_id,
                 "hermes_plugin_injection": True,
@@ -20533,6 +20555,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "gateway_session_strict": True,
             },
         )
+        if request_id is not None:
+            event.metadata["hermes_plugin_request_id"] = request_id
+        if expires_at is not None:
+            event.metadata["hermes_plugin_expires_at"] = expires_at
         await adapter.handle_message(event)
         logger.info(
             "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",

@@ -2507,6 +2507,11 @@ class MessageEvent:
     # particular key existing.
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    # In-process receipt for an admitted plugin injection; never model input.
+    processing_callback: Optional[Callable[[str], None]] = field(
+        default=None, repr=False, compare=False, kw_only=True
+    )
+
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
 
@@ -5653,12 +5658,27 @@ class BasePlatformAdapter(ABC):
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
         hook = getattr(self, hook_name, None)
-        if not callable(hook):
-            return
-        try:
-            await hook(*args, **kwargs)
-        except Exception as e:
-            logger.warning("[%s] %s hook failed: %s", self.name, hook_name, e)
+        if callable(hook):
+            try:
+                await hook(*args, **kwargs)
+            except Exception as e:
+                logger.warning("[%s] %s hook failed: %s", self.name, hook_name, e)
+        if hook_name == "on_processing_complete" and len(args) >= 2:
+            event, outcome = args[:2]
+            callback = getattr(event, "processing_callback", None)
+            if callback is not None:
+                event.processing_callback = None
+                try:
+                    callback(outcome.value)
+                except Exception as exc:
+                    logger.warning("[%s] processing receipt failed (%s)", self.name, type(exc).__name__)
+
+    @staticmethod
+    def _plugin_injection_expired(event: MessageEvent) -> bool:
+        if not event.internal or not event.metadata.get("hermes_plugin_injection"):
+            return False
+        deadline = event.metadata.get("hermes_plugin_expires_at")
+        return deadline is not None and deadline <= time.time()
 
     @staticmethod
     def _is_retryable_error(error: Optional[str]) -> bool:
@@ -6251,6 +6271,11 @@ class BasePlatformAdapter(ABC):
         enabling interruption support.
         """
         if not self._message_handler:
+            if event.processing_callback is not None:
+                await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
+            return
+        if self._plugin_injection_expired(event):
+            await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.CANCELLED)
             return
 
         if event.allow_gateway_control:
@@ -6535,6 +6560,11 @@ class BasePlatformAdapter(ABC):
             )
         
         try:
+            if self._plugin_injection_expired(event):
+                await self._run_processing_hook(
+                    "on_processing_complete", event, ProcessingOutcome.CANCELLED
+                )
+                return
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)

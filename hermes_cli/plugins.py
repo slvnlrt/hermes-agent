@@ -2049,6 +2049,9 @@ class PluginContext:
         role: str = "user",
         *,
         session_key: str | None = None,
+        on_complete: Callable[[str], None] | None = None,
+        request_id: str | None = None,
+        expires_at: float | None = None,
     ) -> bool:
         """Inject a message into a CLI or gateway conversation.
 
@@ -2062,13 +2065,58 @@ class PluginContext:
         ``plugins.entries.<plugin_id>.allow_gateway_injection`` config grant.
         A ``True`` return means the live gateway accepted the request for
         asynchronous dispatch, not that platform delivery has completed.
+        ``on_complete`` is a synchronous, once-only receipt callback receiving
+        ``success``, ``failure`` or ``cancelled`` after native processing and
+        delivery (intentional silence is success). It is gateway-only.
+        ``expires_at`` prevents an expired queued event from starting; it does
+        not interrupt an already running conversation or undo tool effects.
 
         Returns True if the message was queued successfully.
         """
+        notify = None
+        if on_complete is not None:
+            import inspect
+            import threading
+
+            if not callable(on_complete) or inspect.iscoroutinefunction(on_complete):
+                raise TypeError("on_complete must be a synchronous callable")
+            completed = False
+            completion_lock = threading.Lock()
+
+            def notify(outcome: str) -> None:
+                nonlocal completed
+                with completion_lock:
+                    if completed:
+                        return
+                    completed = True
+                try:
+                    on_complete(outcome)
+                except Exception as exc:
+                    logger.warning("Plugin completion callback failed (%s)", type(exc).__name__)
+
+        def reject() -> bool:
+            if notify is not None:
+                notify("failure")
+            return False
+
+        if request_id is not None and (
+            not isinstance(request_id, str) or not request_id
+            or len(request_id) > 128 or "\n" in request_id or "\r" in request_id
+        ):
+            return reject()
+        if expires_at is not None:
+            import math
+            import time
+
+            if (isinstance(expires_at, bool) or not isinstance(expires_at, (int, float))
+                    or not math.isfinite(expires_at) or expires_at <= time.time()):
+                return reject()
         cli = self._manager._cli_ref
         msg = content if role == "user" else f"[{role}] {content}"
 
         if cli is not None:
+            if notify is not None or request_id is not None or expires_at is not None:
+                return reject()
             if getattr(cli, "_agent_running", False):
                 # Agent is mid-turn - interrupt with the message
                 cli._interrupt_queue.put(msg)
@@ -2081,7 +2129,7 @@ class PluginContext:
             logger.warning(
                 "inject_message: gateway mode requires an existing session_key"
             )
-            return False
+            return reject()
         if not self._gateway_injection_allowed():
             plugin_id = self.manifest.key or self.manifest.name
             logger.warning(
@@ -2090,28 +2138,30 @@ class PluginContext:
                 plugin_id,
                 plugin_id,
             )
-            return False
+            return reject()
 
         if not self._manager.has_gateway_message_injector:
             logger.warning("inject_message: no live gateway is available")
-            return False
+            return reject()
 
         plugin_id = self.manifest.key or self.manifest.name
         try:
-            return bool(
-                self._manager.inject_gateway_message(
-                    session_key=session_key,
-                    content=msg,
-                    plugin_id=plugin_id,
-                )
-            )
+            kwargs: dict[str, Any] = dict(session_key=session_key, content=msg, plugin_id=plugin_id)
+            if notify is not None:
+                kwargs["on_complete"] = notify
+            if request_id is not None:
+                kwargs["request_id"] = request_id
+            if expires_at is not None:
+                kwargs["expires_at"] = expires_at
+            accepted = bool(self._manager.inject_gateway_message(**kwargs))
+            return accepted or reject()
         except Exception:
             logger.warning(
                 "inject_message: gateway scheduling failed for plugin %s",
                 plugin_id,
                 exc_info=True,
             )
-            return False
+            return reject()
 
     def _gateway_injection_allowed(self) -> bool:
         """Return whether this plugin may trigger gateway session turns."""
@@ -3114,6 +3164,7 @@ class PluginContext:
         teams          Microsoft Teams ``App`` (on_message / on_card_action)
         dingtalk       ``DingTalkStreamClient`` (register_callback_handler)
         line           aiohttp ``web.Application`` (router)
+        webhook        aiohttp ``web.Application`` (router, before startup)
         others         ``None`` — connect-time hook with the adapter handle
         =============  ======================================================
 
