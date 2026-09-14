@@ -2113,6 +2113,10 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Opt-in owner identity for single-user CLI/TUI/Desktop/Web sessions.
+        # Reuse a messaging user id to share that provider scope. Never applied
+        # to gateway identities or tool/cron/kanban/subagent session sources.
+        "local_user_id": "",
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

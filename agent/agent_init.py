@@ -1936,11 +1936,17 @@ def init_agent(
                             _unavailable_reason = ""
                         _warn_memory_provider_unavailable(_mem_provider_name, _unavailable_reason)
                 if agent._memory_manager.providers:
+                    _memory_source = _ra()._session_source_for_agent(platform)
                     _init_kwargs = {
                         "session_id": agent.session_id,
                         "platform": platform or "cli",
                         "hermes_home": str(get_hermes_home()),
-                        "agent_context": "primary",
+                        "session_source": _memory_source,
+                        "agent_context": (
+                            _memory_source
+                            if _memory_source in {"tool", "cron", "kanban", "subagent"}
+                            else "primary"
+                        ),
                     }
                     if _init_kwargs["platform"] == "cli":
                         _init_kwargs["warning_callback"] = agent._emit_warning
@@ -1959,6 +1965,19 @@ def init_agent(
                         _init_kwargs["user_id"] = agent._user_id
                     if agent._user_id_alt:
                         _init_kwargs["user_id_alt"] = agent._user_id_alt
+                    # Single-owner local surfaces have no messaging identity.
+                    # Opt in explicitly; never replace a verified gateway id or
+                    # attribute an automation/agent-coordination turn to the owner.
+                    _local_surfaces = {"cli", "tui", "desktop", "web"}
+                    if (
+                        not agent._user_id
+                        and not agent._user_id_alt
+                        and _init_kwargs["platform"] in _local_surfaces
+                        and _memory_source in _local_surfaces
+                    ):
+                        _local_user_id = mem_config.get("local_user_id", "")
+                        if isinstance(_local_user_id, str) and _local_user_id.strip():
+                            _init_kwargs["user_id"] = _local_user_id.strip()
                     if agent._user_name:
                         _init_kwargs["user_name"] = agent._user_name
                     if agent._chat_id:

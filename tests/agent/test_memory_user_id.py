@@ -1,104 +1,150 @@
-"""Tests for per-user memory scoping via user_id threading.
-
-Verifies that gateway user_id flows from AIAgent -> MemoryManager -> plugins,
-so each gateway user gets their own memory bucket instead of sharing a static one.
-"""
+"""Identity-scoped memory across local surfaces and messaging channels."""
 
 import json
-import os
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.memory_provider import MemoryProvider
-from agent.memory_manager import MemoryManager
 
 
-# ---------------------------------------------------------------------------
-# Concrete test provider that records init kwargs
-# ---------------------------------------------------------------------------
+class ScopedMemory(MemoryProvider):
+    """In-memory backend enforcing the external provider's identity contract."""
 
-
-class RecordingProvider(MemoryProvider):
-    """Minimal provider that records what initialize() receives."""
-
-    def __init__(self, name="recording"):
-        self._name = name
-        self._init_kwargs = {}
-        self._init_session_id = None
+    def __init__(self, records):
+        self.records = records
+        self.owner = None
+        self.writable = False
 
     @property
-    def name(self) -> str:
-        return self._name
+    def name(self):
+        return "scoped"
 
-    def is_available(self) -> bool:
+    def is_available(self):
         return True
 
-    def initialize(self, session_id: str, **kwargs) -> None:
-        self._init_session_id = session_id
-        self._init_kwargs = dict(kwargs)
+    def initialize(self, session_id, **kwargs):
+        self.owner = kwargs.get("user_id_alt") or kwargs.get("user_id")
+        self.writable = bool(self.owner) and kwargs.get("agent_context") == "primary"
 
-    def system_prompt_block(self) -> str:
+    def system_prompt_block(self):
         return ""
-
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
-        return ""
-
-    def sync_turn(self, user_content, assistant_content, *, session_id=""):
-        pass
 
     def get_tool_schemas(self):
         return []
 
     def handle_tool_call(self, tool_name, args, **kwargs):
-        return json.dumps({})
+        return json.dumps({"ok": False})
 
-    def shutdown(self):
-        pass
+    def sync_turn(self, user_content, assistant_content, *, session_id="", messages=None):
+        if self.writable:
+            self.records.setdefault(self.owner, []).append(user_content)
 
-
-# ---------------------------------------------------------------------------
-# MemoryManager user_id threading tests
-# ---------------------------------------------------------------------------
-
-
-class TestMemoryManagerUserIdThreading:
-    """Verify user_id reaches providers via initialize_all."""
-
-
-
-    def test_no_user_id_when_cli(self):
-        """CLI sessions should not have user_id in kwargs."""
-        mgr = MemoryManager()
-        p = RecordingProvider()
-        mgr.add_provider(p)
-
-        mgr.initialize_all(
-            session_id="sess-456",
-            platform="cli",
+    def prefetch(self, query, *, session_id=""):
+        return "\n".join(
+            text for text in self.records.get(self.owner, []) if query in text
         )
 
-        assert "user_id" not in p._init_kwargs
-        assert p._init_kwargs.get("platform") == "cli"
 
+@pytest.fixture
+def memory_agents(monkeypatch):
+    from run_agent import AIAgent
 
-    def test_multiple_providers_all_receive_user_id(self):
-        mgr = MemoryManager()
-        # Use one provider named "builtin" (always accepted) and one external
-        p1 = RecordingProvider("builtin")
-        p2 = RecordingProvider("external")
-        mgr.add_provider(p1)
-        mgr.add_provider(p2)
+    records = {}
+    managers = []
+    config = {
+        "memory": {
+            "memory_enabled": False,
+            "user_profile_enabled": False,
+            "provider": "scoped",
+            "local_user_id": "owner",
+        }
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
+    monkeypatch.setattr(
+        "plugins.memory.load_memory_provider", lambda name: ScopedMemory(records)
+    )
 
-        mgr.initialize_all(
-            session_id="sess-multi",
-            platform="slack",
-            user_id="slack_U12345",
+    def build(platform, *, source=None, **kwargs):
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", source or platform)
+        agent = AIAgent(
+            model="gpt-5.5",
+            provider="openai-codex",
+            api_key="sk-dummy",
+            base_url="https://chatgpt.com/backend-api/codex",
+            quiet_mode=True,
+            skip_context_files=True,
+            platform=platform,
+            enabled_toolsets=["memory"],
+            **kwargs,
         )
+        manager = agent._memory_manager
+        assert manager is not None
+        managers.append(manager)
+        return manager
 
-        assert p1._init_kwargs.get("user_id") == "slack_U12345"
-        assert p1._init_kwargs.get("platform") == "slack"
-        assert p2._init_kwargs.get("user_id") == "slack_U12345"
-        assert p2._init_kwargs.get("platform") == "slack"
+    yield build, config
+    for manager in managers:
+        manager.shutdown_all()
 
+
+def _remember(manager, text):
+    manager.sync_all(text, "Noted.")
+    assert manager.flush_pending(timeout=5)
+
+
+def test_local_memory_survives_new_sessions_and_matches_gateway_owner(memory_agents):
+    build, _ = memory_agents
+    _remember(build("tui"), "The maintenance marker is cobalt-orbit.")
+    for surface in ("cli", "tui", "desktop", "web"):
+        assert "cobalt-orbit" in build(surface).prefetch_all("cobalt-orbit")
+    telegram = build("telegram", user_id="owner", chat_type="private")
+    assert "cobalt-orbit" in telegram.prefetch_all("cobalt-orbit")
+    _remember(telegram, "The return marker is copper-moon.")
+    assert "copper-moon" in build("tui").prefetch_all("copper-moon")
+
+
+def test_configured_local_identity_never_overrides_gateway_identity(memory_agents):
+    build, _ = memory_agents
+    _remember(build("cli"), "private-owner-marker")
+    other = build("telegram", user_id="other", chat_type="private")
+    assert not other.prefetch_all("private-owner-marker")
+    _remember(other, "private-other-marker")
+    assert not build("cli").prefetch_all("private-other-marker")
+    alternate = build("telegram", user_id="transient", user_id_alt="owner")
+    assert "private-owner-marker" in alternate.prefetch_all("private-owner-marker")
+
+
+@pytest.mark.parametrize("source", ["tool", "cron", "kanban", "subagent"])
+def test_automated_local_sessions_do_not_read_or_write_owner_memory(memory_agents, source):
+    build, _ = memory_agents
+    _remember(build("cli"), "personal-only-marker")
+    automation = build("cli", source=source)
+    assert not automation.prefetch_all("personal-only-marker")
+    _remember(automation, "automation-only-marker")
+    assert not build("cli").prefetch_all("automation-only-marker")
+
+
+def test_unidentified_remote_session_cannot_borrow_local_owner(memory_agents):
+    build, _ = memory_agents
+    _remember(build("tui"), "owner-only-marker")
+    for surface in ("telegram", "webhook", "api_server"):
+        unidentified = build(surface)
+        assert not unidentified.prefetch_all("owner-only-marker")
+        _remember(unidentified, "unidentified-marker")
+    assert not build("cli").prefetch_all("unidentified-marker")
+
+
+@pytest.mark.parametrize("configured", ["", "   ", None, 123])
+def test_local_identity_requires_an_explicit_nonempty_string(memory_agents, configured):
+    build, config = memory_agents
+    _remember(build("telegram", user_id="owner"), "existing-owner-marker")
+    config["memory"]["local_user_id"] = configured
+    local = build("cli")
+    assert not local.prefetch_all("existing-owner-marker")
+    _remember(local, "unattributed-marker")
+    assert not build("telegram", user_id="owner").prefetch_all("unattributed-marker")
 
 # ---------------------------------------------------------------------------
 # Mem0 provider user_id tests
@@ -253,29 +299,4 @@ class TestHonchoUserIdScoping:
         # peer_name should not have been overridden
         assert mock_cfg.peer_name == "my-custom-peer"
 
-
-# ---------------------------------------------------------------------------
-# AIAgent user_id propagation test
-# ---------------------------------------------------------------------------
-
-
-class TestAIAgentUserIdPropagation:
-    """Verify AIAgent stores user_id and passes it to memory init kwargs."""
-
-    def test_user_id_stored_on_agent(self):
-        """AIAgent should store user_id as instance attribute."""
-        with patch.dict(os.environ, {"HERMES_HOME": "/tmp/test_hermes"}):
-            from run_agent import AIAgent
-            agent = object.__new__(AIAgent)
-            # Manually set the attribute as __init__ does
-            agent._user_id = "test_user_42"
-            assert agent._user_id == "test_user_42"
-
-    def test_user_id_none_by_default(self):
-        """AIAgent should have None user_id when not provided (CLI mode)."""
-        with patch.dict(os.environ, {"HERMES_HOME": "/tmp/test_hermes"}):
-            from run_agent import AIAgent
-            agent = object.__new__(AIAgent)
-            agent._user_id = None
-            assert agent._user_id is None
 
