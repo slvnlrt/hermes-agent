@@ -24,6 +24,9 @@ def _isolate(monkeypatch):
                         approval_context._ctx("test_session_key"))
     monkeypatch.setattr(approval_context, "_approval_requester_id",
                         approval_context._ctx("test_requester_id"))
+    monkeypatch.setattr(
+        approval_context, "_approval_session_owner",
+        approval_context.contextvars.ContextVar("test_session_owner", default=False))
     with approval._lock:
         approval._pending.clear()
         approval._session_approved.clear()
@@ -35,8 +38,11 @@ def _isolate(monkeypatch):
     yield
 
 
-def _enqueue(session_key: str, requester_id: str = "", *, requester_required: bool = True) -> None:
-    """Enqueue one gateway approval with its verified requester policy."""
+def _enqueue(
+    session_key: str, requester_id: str = "", *, requester_required: bool = True,
+    session_owner_required: bool = False,
+) -> None:
+    """Enqueue one gateway approval with its verified authority policy."""
     from tools.approval_gateway_wait import _ApprovalEntry
     entry = _ApprovalEntry({
         "command": "rm -rf /",
@@ -44,6 +50,7 @@ def _enqueue(session_key: str, requester_id: str = "", *, requester_required: bo
         "description": "test",
         "requester_id": requester_id,
         "requester_required": requester_required,
+        "session_owner_required": session_owner_required,
     })
     with approval._lock:
         approval._gateway_queues.setdefault(session_key, []).append(entry)
@@ -111,6 +118,16 @@ class TestRequesterMismatch:
         _enqueue("sess-1", requester_id="alice")
         count = approval.resolve_gateway_approval("sess-1", "once", clicker_id="bob")
         assert count == 1
+
+    def test_native_entry_requires_verified_session_owner_even_when_requester_matching_is_disabled(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(approval_context, "_get_require_requester_match", lambda: False)
+        _enqueue(
+            "native", requester_required=False, session_owner_required=True)
+        assert approval.resolve_gateway_approval("native", "once") == approval.REQUESTER_MISMATCH
+        assert approval.resolve_gateway_approval(
+            "native", "once", session_owner=True) == 1
 
 
 class TestRequesterBlocksPeek:
@@ -230,6 +247,44 @@ class TestGatewayGateRequesterBinding:
         assert resolutions == [approval.REQUESTER_MISMATCH, 1]
         assert result["approved"] is True
 
+    def test_remote_native_owner_does_not_inherit_or_create_local_grants(self, monkeypatch):
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.setattr(approval_context, "_get_require_requester_match", lambda: True)
+        session_token = approval_context.set_current_session_key("remote-native")
+        owner_token = approval_context.set_current_approval_session_owner("user:oidc:alice")
+        approval.approve_session("remote-native", "plugin_rule:remote-native")
+        local_permanent = approval._permanent_set()
+        local_permanent.add("plugin_rule:remote-native")
+        seen = []
+
+        def notify(data):
+            seen.append(data)
+            assert data["allow_session"] is False
+            assert data["allow_permanent"] is False
+            approval.resolve_gateway_approval(
+                "remote-native", "always", session_owner=True)
+
+        approval.register_gateway_notify("remote-native", notify)
+        try:
+            assert not approval.is_approved(
+                "remote-native", "plugin_rule:remote-native")
+            assert approval.permanent_patterns_for_requester() == set()
+            approval._session_approved.pop(("remote-native", ""), None)
+            local_permanent.discard("plugin_rule:remote-native")
+            result = approval.request_tool_approval(
+                "synthetic_mutation", "Mutate synthetic fixture",
+                rule_key="remote-native")
+        finally:
+            approval.unregister_gateway_notify("remote-native")
+            local_permanent.discard("plugin_rule:remote-native")
+            approval_context.reset_current_approval_session_owner(owner_token)
+            approval_context.reset_current_session_key(session_token)
+
+        assert len(seen) == 1
+        assert result["approved"] is True
+        assert not approval._session_approved.get(("remote-native", ""))
+        assert "plugin_rule:remote-native" not in local_permanent
+
 
 # ---------------------------------------------------------------------------
 # require_human: strict per-operation human confirmation
@@ -347,6 +402,57 @@ class TestRequireHuman:
         )
         assert result["approved"] is False
         assert "blocked" in result["message"].lower()
+
+    def test_native_session_owner_without_messaging_id_gets_fresh_once_prompt(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setattr(approval_context, "_get_require_requester_match", lambda: True)
+        session_token = approval_context.set_current_session_key("native-session")
+        owner_token = approval_context.set_current_approval_session_owner(True)
+        attempts = []
+
+        def notify(data):
+            assert data["requester_id"] == ""
+            assert data["requester_required"] is False
+            assert data["session_owner_required"] is True
+            assert data["allow_session"] is False
+            assert data["allow_permanent"] is False
+            attempts.append(approval.resolve_gateway_approval("native-session", "once"))
+            attempts.append(approval.resolve_gateway_approval(
+                "native-session", "always", session_owner=True))
+
+        approval.register_gateway_notify("native-session", notify)
+        try:
+            result = approval.request_tool_approval(
+                "synthetic_mutation", "Mutate synthetic fixture",
+                rule_key="native-owner", require_human=True)
+        finally:
+            approval.unregister_gateway_notify("native-session")
+            approval_context.reset_current_approval_session_owner(owner_token)
+            approval_context.reset_current_session_key(session_token)
+
+        assert attempts == [approval.REQUESTER_MISMATCH, 1]
+        assert result["approved"] is True
+        assert ("native-session", "") not in approval._session_approved
+
+    def test_messaging_gateway_without_verified_actor_denies_before_notification(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setattr(approval_context, "_get_require_requester_match", lambda: True)
+        session_token = approval_context.set_current_session_key("messaging-session")
+        notified = []
+        approval.register_gateway_notify("messaging-session", notified.append)
+        try:
+            result = approval.request_tool_approval(
+                "synthetic_mutation", "Mutate synthetic fixture",
+                rule_key="missing-actor", require_human=True)
+        finally:
+            approval.unregister_gateway_notify("messaging-session")
+            approval_context.reset_current_session_key(session_token)
+
+        assert result["approved"] is False
+        assert "no verified requester identity" in result["message"]
+        assert notified == []
 
     def test_gateway_resolves_require_human_once_only(self, monkeypatch):
         """Strict gateway approval cannot create a reusable session or permanent grant."""

@@ -25,7 +25,8 @@ from tools.approval_context import (
     _get_session_platform, _is_cron_approval_context,
     _is_gateway_approval_context, _is_interactive_cli, _is_single_query_approval_context,
     _is_unattended_platform_approval_context, _resolve_cli_approval_callback, _should_fall_through_to_cli_approval,
-    _tirith_fail_open, get_current_requester_id, get_current_session_key,
+    _tirith_fail_open, current_approval_session_owner, current_approval_session_owner_is_local,
+    get_current_requester_id, get_current_session_key,
 )
 from tools.approval_detection import (
     _approval_key_aliases, _check_sudo_stdin_guard, detect_dangerous_command, detect_hardline_command,
@@ -151,20 +152,20 @@ def unregister_gateway_notify(session_key: str) -> None:
         entry.event.set()
 
 
-def _requester_blocks(entry, clicker_id) -> bool:
-    """Return whether *clicker_id* may resolve *entry* under requester binding.
+def _requester_blocks(entry, clicker_id, *, session_owner: bool = False) -> bool:
+    """Return whether this verified actor/transport may resolve *entry*.
 
-    With ``approvals.require_requester_match`` (the default), every gateway
-    decision requires the exact verified principal that created it. A missing
-    callback identity is not an escape hatch, and a gateway turn lacking a
-    verified requester cannot be resolved at all. Empty requester ids remain
-    valid only for explicitly local, non-gateway approval surfaces.
+    Messaging entries remain bound to the exact adapter-authenticated requester.
+    Native TUI/Desktop entries carry no messaging id; they instead require the
+    server-verified transport that owns their live session.
     """
-    from tools.approval_context import _get_require_requester_match
+    data = entry.data or {}
+    if data.get("session_owner_required"):
+        return not session_owner
 
+    from tools.approval_context import _get_require_requester_match
     if not _get_require_requester_match():
         return False
-    data = entry.data or {}
     requester_id = str(data.get("requester_id") or "")
     if data.get("requester_required"):
         return not requester_id or not clicker_id or requester_id != str(clicker_id)
@@ -175,19 +176,17 @@ def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
                              reason: Optional[str] = None,
                              request_id: Optional[str] = None,
-                             clicker_id=None) -> int:
+                             clicker_id=None, *, session_owner: bool = False) -> int:
     """Unblock waiting agent thread(s) from the gateway's /approve or /deny handler.
 
     *resolve_all* resolves every pending approval (``/approve all``); otherwise the oldest
     (FIFO) or the one matching *request_id*. *reason* is the ``/deny <reason>`` free text,
     relayed to the agent in the BLOCKED message.
 
-    *clicker_id* is the verified platform identity of the user acting on the
-    approval (button click or ``/approve`` / ``/deny``). With requester
-    binding enabled it MUST exactly match the principal recorded on a gateway
-    entry; a missing identity is rejected rather than preserving a legacy
-    bypass. Local entries that were not created by a gateway remain
-    intentionally unbound.
+    Messaging adapters pass *clicker_id*, derived from their authenticated inbound event.
+    Native TUI/Desktop callbacks pass ``session_owner=True`` only after the RPC transport
+    is proven to own the live session. Neither authority is interchangeable with the
+    other, and a client-supplied platform/source string grants neither.
 
     Returns the number of approvals resolved (0 means nothing was pending),
     or :data:`REQUESTER_MISMATCH` when no selected entry can be resolved by
@@ -204,11 +203,13 @@ def resolve_gateway_approval(session_key: str, choice: str,
             # The requester binding covers this surface too: resolving one
             # approval by id is the same act as resolving the oldest, so a
             # non-requester must be refused here as well.
-            if any(_requester_blocks(entry, clicker_id) for entry in targets):
+            if any(_requester_blocks(
+                    entry, clicker_id, session_owner=session_owner) for entry in targets):
                 return REQUESTER_MISMATCH
             queue[:] = [entry for entry in queue if entry not in targets]
         elif resolve_all:
-            targets = [e for e in queue if not _requester_blocks(e, clicker_id)]
+            targets = [e for e in queue if not _requester_blocks(
+                e, clicker_id, session_owner=session_owner)]
             blocked_any = len(targets) != len(queue)
             for entry in targets:
                 queue.remove(entry)
@@ -218,7 +219,7 @@ def resolve_gateway_approval(session_key: str, choice: str,
                 return REQUESTER_MISMATCH
         else:
             oldest = queue[0]
-            if _requester_blocks(oldest, clicker_id):
+            if _requester_blocks(oldest, clicker_id, session_owner=session_owner):
                 return REQUESTER_MISMATCH
             targets = [queue.pop(0)]
             if not queue:
@@ -425,7 +426,8 @@ def is_approved(session_key: str, pattern_key: str, requester_id: str = "") -> b
     requester_id = str(requester_id or "")
     aliases = _approval_key_aliases(pattern_key)
     from tools.approval_context import _get_require_requester_match, _is_gateway_approval_context
-    if not requester_id and _is_gateway_approval_context() and _get_require_requester_match():
+    if (not requester_id and _is_gateway_approval_context() and _get_require_requester_match()
+            and not current_approval_session_owner_is_local()):
         return False
     with _lock:
         permanent = _requester_permanent_set(requester_id) if requester_id else _permanent_set()
@@ -442,7 +444,8 @@ def permanent_patterns_for_requester(requester_id: str = "") -> set:
     """
     requester_id = str(requester_id or "")
     from tools.approval_context import _get_require_requester_match, _is_gateway_approval_context
-    if not requester_id and _is_gateway_approval_context() and _get_require_requester_match():
+    if (not requester_id and _is_gateway_approval_context() and _get_require_requester_match()
+            and not current_approval_session_owner_is_local()):
         return set()
     with _lock:
         return set(_requester_permanent_set(requester_id) if requester_id else _permanent_set())
@@ -975,7 +978,10 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     only once a human is actually asked, so a smart APPROVE never pays for redacting a large script.
     """
     from agent.redact import redact_sensitive_text
-    if is_gateway and not requester_id and approval_context._get_require_requester_match():
+    session_owner = current_approval_session_owner()
+    session_owner_local = current_approval_session_owner_is_local()
+    if (is_gateway and not requester_id and not session_owner
+            and approval_context._get_require_requester_match()):
         return _blocked(
             f"BLOCKED: approval required ({description}) but this gateway request has no verified requester identity.",
             pattern_key=pattern_key, description=description,
@@ -988,9 +994,12 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         if result is not None:
             return result
     pending_body = pending_body() if pending_body else None
-    allow_session = not smart_denied and not one_operation
+    allow_session = (
+        not smart_denied and not one_operation
+        and (not session_owner or session_owner_local))
     allow_permanent = (
         permanent_capable and not smart_denied and not one_operation
+        and (not session_owner or session_owner_local)
         and (not requester_id or bool(_requester_permanent_key(requester_id)))
     )
 
@@ -1043,7 +1052,9 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                 "allow_permanent": allow_permanent,
                 "allow_session": allow_session,
                 "requester_id": requester_id,
-                "requester_required": approval_context._get_require_requester_match(),
+                "requester_required": (
+                    approval_context._get_require_requester_match() and not session_owner),
+                "session_owner_required": session_owner,
             }
             if smart_denied:
                 data["smart_denied"] = True

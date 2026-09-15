@@ -144,6 +144,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
             and list(e.data.get("pattern_keys") or []) == keys
             and e.data.get("requester_id", "") == approval_data["requester_id"]
             and bool(e.data.get("requester_required")) == bool(approval_data["requester_required"])
+            and bool(e.data.get("session_owner_required")) == bool(
+                approval_data.get("session_owner_required"))
             and (e.data.get("allow_session") is not False) == (approval_data.get("allow_session") is not False)
             and (e.data.get("allow_permanent") is not False) == (approval_data.get("allow_permanent") is not False)
         ), None)

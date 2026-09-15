@@ -141,6 +141,7 @@ class _TurnScopes:
     """Reset tokens for the thread/context scopes a turn binds (filled incrementally)."""
 
     approval: Any = None
+    approval_owner: Any = None
     session_tokens: list = dataclasses.field(default_factory=list)
     home: Any = None  # per-turn HERMES_HOME override for a resumed remote profile
     secret: Any = None
@@ -430,6 +431,7 @@ class _TurnRun:
     prompt_text: str = ""
     marker_key: str = ""
     receipt_attempted: bool = False
+    approval_session_owner: str = ""
 
 
 def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images: list[str]):
@@ -440,9 +442,13 @@ def _prepare_turn_input(sid: str, session: dict, st: _TurnRun, text: Any, images
     fail-closed refusal scope).  The config-model sync is skipped under a /model --once
     override (not pinned as model_override, the sync would clobber it); a model picked
     mid-turn is applied first so the explicit pick wins over a config change."""
-    from tools.approval_context import set_current_session_key
+    from tools.approval_context import set_current_approval_session_owner, set_current_session_key
     scopes = st.scopes
     scopes.approval = set_current_session_key(session["session_key"])
+    # This boolean was minted from the exact admitted transport (local provenance
+    # or matching authenticated WS principal), never the session source string.
+    scopes.approval_owner = set_current_approval_session_owner(
+        st.approval_session_owner)
     scopes.session_tokens = _set_session_context(session["session_key"], ui_session_id=sid)
     profile_home = session.get("profile_home")
     if profile_home:
@@ -749,6 +755,10 @@ def _finish_turn(sid: str, session: dict, st: _TurnRun) -> None:
             logger.debug("TUI one-turn model restore failed", exc_info=True)
     scopes = st.scopes
     with contextlib.suppress(Exception):
+        if scopes.approval_owner is not None:
+            from tools.approval_context import reset_current_approval_session_owner
+            reset_current_approval_session_owner(scopes.approval_owner)
+    with contextlib.suppress(Exception):
         if scopes.approval is not None:
             from tools.approval_context import reset_current_session_key
             reset_current_session_key(scopes.approval)
@@ -798,7 +808,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None, image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
-    turn_author: dict | None = None) -> bool:
+    turn_author: dict | None = None, approval_session_owner: "str | bool | None" = None) -> bool:
     admitted = _admit_prompt_turn(sid, session, text, image_paths, queued_prompt_generation)
     if admitted is None:
         return False
@@ -824,9 +834,17 @@ def _run_prompt_submit(
         # before any tool can commission a child (delegate_task captures it as authority).
         transport_token = bind_transport(session.get("transport"))
         runtime_session_token = _current_runtime_session_record.set(session)
+        if approval_session_owner is None:
+            native_owner = _native_approval_owner_scope(
+                session, session.get("transport"))
+        else:
+            native_owner = (
+                "local" if approval_session_owner is True
+                else str(approval_session_owner or ""))
         st = _TurnRun(
             session["agent"], session.pop("one_turn_model_restore", None), terminal_callback,
-            receipt_committed=terminal_callback is None)
+            receipt_committed=terminal_callback is None,
+            approval_session_owner=native_owner)
         st.marker_key = _record_turn_marker(session, text, auto_continue=terminal_callback is None)
         goal_followup = None
         try:

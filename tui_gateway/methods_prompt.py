@@ -471,7 +471,10 @@ def _persist_session_row_for_submit(rid, session):
     return error
 
 
-def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author=None):
+def _run_after_agent_ready(
+    rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author=None,
+    approval_session_owner: str = "",
+):
     """Turn thread body: patient wait for a deferred build (a slow build must not eat the
     accepted in-flight message), then run."""
     # The wait delivers the prompt when the still-running build completes, honors a cancel promptly, notices
@@ -501,7 +504,8 @@ def _run_after_agent_ready(rid, sid, session, text, display_kind, hosted_termina
             return
     _run_prompt_submit(
         rid, sid, session, text, display_kind=display_kind,
-        terminal_callback=hosted_terminal_callback, turn_author=turn_author)
+        terminal_callback=hosted_terminal_callback, turn_author=turn_author,
+        approval_session_owner=approval_session_owner)
 
 
 _TRUNCATION_PARAMS = (
@@ -607,6 +611,8 @@ def _(rid, params: dict) -> dict:
         if (t := current_transport()) is not None:
             _attach_session_transport(session, t)
             _cancel_ws_orphan_reap(sid)
+    approval_session_owner = _native_approval_owner_scope(
+        session, t or session.get("transport"))
     # Claim the turn against a possibly-running session (busy/queued reply, else fall
     # through once ``running`` is observed False).  The provider interrupt happens after
     # history_lock is released (a non-interruptible tool may hold it); if the old turn
@@ -636,7 +642,8 @@ def _(rid, params: dict) -> dict:
             logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",
                          turn_author.get("id"))
         isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind)
+            rid, sid, session, text, display_kind=display_kind,
+            approval_session_owner=approval_session_owner)
         if not isolated_response.get("error"):
             # The truncation already happened inline above (memory + DB).
             isolated_response["result"].update(survivor_fields)
@@ -659,7 +666,8 @@ def _(rid, params: dict) -> dict:
         _start_agent_build(sid, session)
     run_thread = threading.Thread(
         target=lambda: _run_after_agent_ready(
-            rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author),
+            rid, sid, session, text, display_kind, hosted_terminal_callback, turn_author,
+            approval_session_owner),
         daemon=True)
     # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
     session["_run_thread"] = run_thread
@@ -1125,6 +1133,17 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, {"status": "ok", "remaining": remaining})
 
 
+def _native_approval_response_refusal(rid, request_id: str) -> dict | None:
+    """Reject a native approval answer unless this RPC transport owns its session."""
+    from tui_gateway import server_requests
+    owner_sid = (
+        server_requests.approval_owner_session(request_id)
+        or _compute_host_approval_owner_session(request_id))
+    if owner_sid and _current_native_approval_authority(owner_sid)[0] is None:
+        return _err(rid, 4001, "approval request is not owned by this client")
+    return None
+
+
 @method("request.answer")
 def _(rid, params: dict) -> dict:
     """Answer an open server→client request from a client that did not receive it (a Bot Mode room
@@ -1134,6 +1153,8 @@ def _(rid, params: dict) -> dict:
     result = params.get("result")
     if not request_id or not isinstance(result, dict):
         return _err(rid, 4002, "id and an object result required")
+    if (refusal := _native_approval_response_refusal(rid, request_id)) is not None:
+        return refusal
     from tui_gateway import server_requests
     frame = {"jsonrpc": "2.0", "id": request_id, "result": result}
     if server_requests.resolve_response(frame) or _relay_compute_host_response(frame):
@@ -1175,7 +1196,8 @@ def _(rid, params: dict) -> dict:
 def _approval_respond_session_fallback(params: dict):
     """Durable-identity fallback for a stale live sid (re-minted after a reconnect while
     the prompt stayed on screen): (1) the ``request_id`` against every live session's
-    pending approvals, then (2) ``session_id`` as a STORED id.  Live session or None.
+    pending approvals, then (2) ``session_id`` as a STORED id. Returns ``(sid, session)``
+    so the responder can still be bound to the exact live owner.
 
     See #91684.
     """
@@ -1190,13 +1212,13 @@ def _approval_respond_session_fallback(params: dict):
                 if key and any(
                     str(pending.get("request_id") or "") == request_id
                     for pending in list_gateway_approvals(key)):
-                    return session
+                    return sid, session
         except Exception:
             logger.debug("approval.respond request_id fallback failed", exc_info=True)
     if target := str(params.get("session_id") or ""):
         try:
             if (live := _find_live_session_by_key(target)) is not None:
-                return live[1]
+                return live
         except Exception:
             logger.debug("approval.respond stored-id fallback failed", exc_info=True)
     return None
@@ -1204,19 +1226,24 @@ def _approval_respond_session_fallback(params: dict):
 
 @method("approval.respond")
 def _(rid, params: dict) -> dict:
+    runtime_sid = str(params.get("session_id") or "")
     session, err = _sess(params, rid)
     if err:
         # Session-not-found (4001) only: resolve by durable identity before failing.
         if (err.get("error") or {}).get("code") != 4001:
             return err
-        session = _approval_respond_session_fallback(params)
-        if session is None:
+        fallback = _approval_respond_session_fallback(params)
+        if fallback is None:
             return err
+        runtime_sid, session = fallback
+    if _current_native_approval_authority(runtime_sid)[1] is not session:
+        return _err(rid, 4001, "approval session is not owned by this client")
     return _approval_reply(
         rid, "resolved",
         lambda a: a.resolve_gateway_approval(
             session["session_key"], params.get("choice", "deny"),
-            resolve_all=params.get("all", False), request_id=params.get("request_id")))
+            resolve_all=params.get("all", False), request_id=params.get("request_id"),
+            session_owner=True))
 
 
 def register(server) -> None:

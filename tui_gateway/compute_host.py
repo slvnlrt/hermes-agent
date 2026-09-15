@@ -242,7 +242,8 @@ class ComputeHost:
             with contextlib.suppress(Exception):
                 server._persist_branch_seed(session)
             server._run_prompt_submit(
-                request_id, sid, session, text, display_kind=frame.get("display_kind") or None)
+                request_id, sid, session, text, display_kind=frame.get("display_kind") or None,
+                approval_session_owner=str(frame.get("approval_session_owner") or ""))
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):
                 while run_thread.is_alive():
@@ -326,7 +327,8 @@ class ComputeHost:
                 platform_override=frame.get("source"),
                 context_cwd_is_launch_artifact=bool(
                     frame.get("context_cwd_is_launch_artifact", False)),
-                session_db=session_db, auth_user_id=frame.get("auth_user_id"))
+                session_db=session_db, auth_user_id=frame.get("auth_user_id"),
+                _local_owner_provenance=bool(frame.get("local_owner_provenance")))
             if server._transfer_db_to_agent(agent, session_db):
                 owns_db = False
         finally:
@@ -364,7 +366,8 @@ class ComputeHost:
                 "tool_progress_mode": server._load_tool_progress_mode(), "edit_snapshots": {},
                 "tool_started_at": {}, "model_override": frame.get("model_override"),
                 "source": server._sanitize_client_source(frame.get("source")),
-                "transport": self._transport}
+                "transport": self._transport,
+                "_local_owner_provenance": bool(frame.get("local_owner_provenance"))}
         session = server._sessions[sid]
         session["transport"] = self._transport
         # The host pipe names no login; the record carries the one the gateway stamped at creation.

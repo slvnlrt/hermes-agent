@@ -4691,14 +4691,17 @@ def test_stdio_tee_preserves_local_owner_admission(monkeypatch):
     assert server._transport_has_local_owner_provenance(wrapped)
     assert not server._transport_has_local_owner_provenance(FanoutTransport(wrapped, _LoginSocket()))
 
-def test_compute_host_turn_frame_carries_the_session_login(monkeypatch):
+def test_compute_host_turn_frame_carries_authenticated_native_approval_authority(monkeypatch):
     record = _login_session(monkeypatch, "sid-host", "host-key", _LoginSocket(), history=[],
                             history_lock=threading.Lock(), cwd="/tmp", cols=80)
     monkeypatch.setattr(server, "_session_cwd", lambda session: "/tmp")
 
-    frame = server._compute_host_turn_frame("rid", "sid-host", record, "hello")
+    frame = server._compute_host_turn_frame(
+        "rid", "sid-host", record, "hello",
+        approval_session_owner="user:basic:alice")
 
     assert frame["auth_user_id"] == "basic:alice"
+    assert frame["approval_session_owner"] == "user:basic:alice"
 
 
 def test_attaching_a_different_login_keeps_the_creator_and_warns_once(monkeypatch, caplog):
@@ -4715,6 +4718,8 @@ def test_attaching_a_different_login_keeps_the_creator_and_warns_once(monkeypatc
     assert len(warnings) == 1
     assert "basic:alice" in warnings[0] and "shared-key" in warnings[0]
     assert server._session_auth_user_id(record) == "basic:alice"
+    assert server._transport_owns_native_approval(record, creator)
+    assert not server._transport_owns_native_approval(record, other)
 
 
 def test_attaching_the_same_login_again_does_not_warn(monkeypatch, caplog):
@@ -7611,6 +7616,84 @@ class _RecordingAgent:
     def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
         self._turns.append(prompt)
         return {"final_response": "", "messages": []}
+
+
+def test_authenticated_remote_native_approval_round_trip_binds_worker_and_response_to_session_owner(
+    monkeypatch, tmp_path
+):
+    """An OIDC-authenticated nonlocal Desktop turn may prompt without a messaging
+    id, but only its exact session principal can answer the queue-backed request."""
+    from tools import approval, approval_context
+    from tools.thread_context import propagate_context_to_thread
+
+    class _Transport:
+        def __init__(self, user_id):
+            self.auth_identity = {"provider": "oidc", "user_id": user_id}
+            self.frames = []
+            self.approval_ready = threading.Event()
+
+        def write(self, obj):
+            self.frames.append(obj)
+            if obj.get("method") == "approval":
+                self.approval_ready.set()
+            return True
+
+        def close(self):
+            return None
+
+    decision = {}
+
+    class _ApprovalAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **kwargs):
+            from concurrent.futures import ThreadPoolExecutor
+
+            def request():
+                return approval.request_tool_approval(
+                    "synthetic_mutation", "Mutate synthetic fixture",
+                    rule_key="native-boundary", require_human=True)
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                decision["result"] = executor.submit(
+                    propagate_context_to_thread(request)).result()
+            return super().run_conversation(prompt, **kwargs)
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+    monkeypatch.setattr(approval_context, "_get_require_requester_match", lambda: True)
+    owner, stranger = _Transport("local"), _Transport("bob")
+    sid, key = "native-approval-ui", "native-approval-stored"
+    session = _session(
+        session_key=key, agent=_ApprovalAgent([]), running=True,
+        transport=owner, auth_user_id="oidc:local", _local_owner_provenance=False)
+    server._sessions[sid] = session
+    owner_scope = server._native_approval_owner_scope(session, owner)
+    assert owner_scope == "user:oidc:local"
+    approval.register_gateway_notify(
+        key, lambda data: server._emit_approval_request(sid, data))
+    try:
+        assert server._run_prompt_submit(
+            "native-approval-turn", sid, session, "go",
+            approval_session_owner=owner_scope)
+        assert owner.approval_ready.wait(timeout=2)
+        request = next(frame for frame in owner.frames if frame.get("method") == "approval")
+        assert request["params"]["choices"] == ["once", "deny"]
+        assert request["params"]["session_owner_required"] is True
+        assert request["params"]["requester_id"] == ""
+
+        response = {
+            "jsonrpc": "2.0", "id": request["id"], "result": {"choice": "once"}}
+        assert server.dispatch(response, transport=stranger) is None
+        assert approval.has_blocking_approval(key)
+        assert session["_run_thread"].is_alive()
+
+        assert server.dispatch(response, transport=owner) is None
+        session["_run_thread"].join(timeout=5)
+        assert not session["_run_thread"].is_alive()
+        assert decision["result"]["approved"] is True
+        assert (key, "") not in approval._session_approved
+    finally:
+        approval.unregister_gateway_notify(key)
+        server._sessions.pop(sid, None)
 
 
 def test_run_prompt_submit_rejects_worker_when_close_wins_publication(

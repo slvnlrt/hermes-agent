@@ -49,7 +49,8 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
 
 def _compute_host_turn_frame(
     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
-    queued_prompt_generation: int | None = None, display_kind: str | None = None) -> dict:
+    queued_prompt_generation: int | None = None, display_kind: str | None = None,
+    approval_session_owner: str = "") -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
         history_version = int(session.get("history_version", 0))
@@ -67,6 +68,9 @@ def _compute_host_turn_frame(
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session), "attached_images": attached_images,
         "auth_user_id": _session_auth_user_id(session),
+        # Server-admission fact, never reconstructed from the client-supplied source.
+        "local_owner_provenance": _session_is_local_provenance(session),
+        "approval_session_owner": str(approval_session_owner or ""),
         "queued_prompt_generation": queued_prompt_generation}
 
 
@@ -138,13 +142,35 @@ def _compute_host_request_session(request_id: str) -> tuple[str, dict] | None:
     return None
 
 
+def _compute_host_approval_owner_session(request_id: str) -> str:
+    """Owning parent runtime session for a host-mirrored native approval."""
+    located = _compute_host_request_session(request_id)
+    if located is None:
+        return ""
+    sid, session = located
+    with _history_lock(session):
+        mirrored = session.get("_compute_host_open_request")
+        if (not isinstance(mirrored, dict) or mirrored.get("method") != "approval"
+                or not isinstance(mirrored.get("params"), dict)
+                or not mirrored["params"].get("session_owner_required")):
+            return ""
+    return sid
+
+
 def _relay_compute_host_response(frame: dict) -> bool:
     """Forward a client's response frame to the compute-host child that owns the request. False when no
     child owns that id."""
-    located = _compute_host_request_session(str(frame.get("id") or ""))
+    request_id = str(frame.get("id") or "")
+    located = _compute_host_request_session(request_id)
     if located is None or not _session_uses_compute_host(located[1]):
         return False
     sid, session = located
+    if (_compute_host_approval_owner_session(request_id)
+            and _current_native_approval_authority(sid)[0] is None):
+        logger.warning(
+            "dropping compute-host approval response from transport that does not own session %s",
+            sid)
+        return False
     with _history_lock(session):
         session.pop("_compute_host_open_request", None)
     try:
@@ -220,11 +246,13 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
 
 def _submit_prompt_to_compute_host(
     rid: str, sid: str, session: dict, text: Any, image_paths: list[str] | None = None,
-    queued_prompt_generation: int | None = None, display_kind: str | None = None) -> dict:
+    queued_prompt_generation: int | None = None, display_kind: str | None = None,
+    approval_session_owner: str = "") -> dict:
     cfg = _load_dashboard_process_isolation_config()
-    frame = _compute_host_turn_frame(rid, sid, session, text, image_paths=image_paths,
-                                     queued_prompt_generation=queued_prompt_generation,
-                                     display_kind=display_kind)
+    frame = _compute_host_turn_frame(
+        rid, sid, session, text, image_paths=image_paths,
+        queued_prompt_generation=queued_prompt_generation, display_kind=display_kind,
+        approval_session_owner=approval_session_owner)
     # Caller JSON-RPC ids may repeat across sockets and turns. Use an opaque
     # dispatch lifetime token, installed before a fast child can send activity.
     turn_id = frame["turn_id"] = frame["request_id"] = uuid.uuid4().hex
