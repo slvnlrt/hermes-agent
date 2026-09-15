@@ -21,6 +21,8 @@ _HIGH_CONCURRENCY_WARNED = False
 MAX_DEPTH = 1  # flat by default: parent (0) -> child (1); deeper needs max_spawn_depth
 _MIN_SPAWN_DEPTH = 1  # floor for the configurable cap; MAX_DEPTH stays the default
 _LEGACY_MAX_ASYNC_WARNED = False
+_TASK_PIN_MISSING = object()
+
 # No default wall-clock cap on children: legitimate heavy work (deep reviews, research fan-outs, slow reasoning
 # models) was being killed mid-task. Stuck-child detection is the heartbeat staleness monitor;
 # delegation.child_timeout_seconds opts back in.
@@ -271,6 +273,46 @@ def _merge_request_overrides(runtime_overrides, explicit_overrides):
 # always take the runtime-provider path (a configured base_url still flows through it, e.g. a Bedrock region).
 _NATIVE_SDK_PROVIDERS = frozenset({"bedrock", "vertex", "google", "google-genai"})
 _EXPLICIT_API_MODES = frozenset({"chat_completions", "codex_responses", "anthropic_messages"})
+_NON_HTTP_AUTH_TYPES = frozenset({"aws_sdk", "external_process", "vertex"})
+
+
+def _provider_declares_keyless_or_native_auth(provider: Any, command: Optional[str] = None) -> bool:
+    """Whether a pinned route may construct without an HTTP key/endpoint pair."""
+    if command:
+        return True
+    try:
+        from hermes_cli.providers import HERMES_OVERLAYS, normalize_provider
+
+        normalized = normalize_provider(str(provider or ""))
+        overlay = HERMES_OVERLAYS.get(normalized)
+        if normalized in _NATIVE_SDK_PROVIDERS or bool(getattr(overlay, "keyless", False)):
+            return True
+        if getattr(overlay, "auth_type", "") in _NON_HTTP_AUTH_TYPES:
+            return True
+    except Exception:
+        normalized = str(provider or "").strip().lower()
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(normalized)
+        return bool(profile and getattr(profile, "auth_type", "") in _NON_HTTP_AUTH_TYPES)
+    except Exception:
+        return False
+
+
+def _require_pinned_transport_credentials(
+    provider: Any, base_url: Any, api_key: Any, command: Optional[str] = None,
+) -> None:
+    """Reject incomplete HTTP pins before ``AIAgent`` can enter ambient routing."""
+    if _provider_declares_keyless_or_native_auth(provider, command):
+        return
+    has_base_url = isinstance(base_url, str) and bool(base_url.strip())
+    has_api_key = bool(api_key.strip()) if isinstance(api_key, str) else api_key is not None
+    if not (has_base_url and has_api_key):
+        raise ValueError(
+            f"Pinned delegation provider '{provider}' resolved without both an API key and base URL. "
+            "Configure the provider route before delegating."
+        )
 
 def _require_pinned_command(command: Optional[str], message: str) -> None:
     """A pinned ACP transport command must exist on PATH — refuse loudly rather
@@ -341,11 +383,6 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
         ) from exc
 
     api_key = runtime.get("api_key", "")
-    if not api_key:
-        raise ValueError(
-            f"Delegation provider '{configured_provider}' resolved but has no API key. "
-            f"Set the appropriate environment variable or run 'hermes auth'."
-        )
     # A pinned ACP transport command must exist — refuse the spawn loudly rather than letting the child
     # silently fall back to another transport (#80450).
     pinned_command = runtime.get("command")
@@ -354,9 +391,20 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
         f"'{pinned_command}' command, which was not found on PATH. "
         f"Install it or choose a different delegation provider.",
     )
+    resolved_provider = (
+        configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider")
+    )
+    if not api_key and not _provider_declares_keyless_or_native_auth(resolved_provider, pinned_command):
+        raise ValueError(
+            f"Delegation provider '{configured_provider}' resolved but has no API key. "
+            f"Set the appropriate environment variable or run 'hermes auth'."
+        )
+    _require_pinned_transport_credentials(
+        resolved_provider, runtime.get("base_url"), api_key, pinned_command,
+    )
     return _credential_bundle(
         v["model"] or runtime.get("model") or None,
-        configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
+        resolved_provider,
         runtime.get("base_url"), api_key, runtime.get("api_mode"),
         _merge_request_overrides(runtime.get("request_overrides"), explicit_request_overrides) or {},
         command=pinned_command, args=list(runtime.get("args") or []),
@@ -382,6 +430,99 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             _merge_request_overrides(getattr(parent_agent, "request_overrides", None), explicit_request_overrides),
         )
     return _runtime_provider_credentials(values, explicit_request_overrides)
+
+
+def _validate_task_pin(name: str, value: Any) -> Optional[str]:
+    """Validate and normalize a per-task pin.
+
+    An absent field inherits. A present field must be a string: blank strings
+    inherit, while JSON ``null`` and every other non-string value fail closed.
+    """
+    if value is _TASK_PIN_MISSING:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            f"tasks[].{name} must be a string when present, got {type(value).__name__}"
+        )
+    stripped = value.strip()
+    return stripped or None
+
+
+def _task_route_pins(task: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    """Validated provider/model task intent, preserving absent-vs-null semantics."""
+    return (
+        _validate_task_pin("provider", task.get("provider", _TASK_PIN_MISSING)),
+        _validate_task_pin("model", task.get("model", _TASK_PIN_MISSING)),
+    )
+
+
+def _model_pin_transport_policy(
+    creds: Dict[str, Any], model: str, routing_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    model_creds = dict(creds)
+    model_creds["model"] = model
+    provider = str(model_creds.get("provider") or "").strip()
+    if provider.lower() in _NOUS_PROVIDERS:
+        from hermes_cli.providers import nous_api_mode
+        model_creds["api_mode"] = nous_api_mode(model)
+    else:
+        from hermes_cli.models import opencode_model_api_mode, opencode_provider_family
+        family = opencode_provider_family(provider)
+        if family is not None:
+            model_creds["api_mode"] = opencode_model_api_mode(family, model)
+
+    # Named custom providers own their request personality in config. Re-read
+    # that pure policy for the target model without entering runtime resolution,
+    # which could rotate a pool credential or refresh OAuth. Explicit
+    # delegation overrides remain authoritative, as on the initial resolution.
+    from hermes_cli.runtime_provider_custom import (
+        _custom_provider_request_overrides,
+        _get_named_custom_provider,
+    )
+    custom_provider = _get_named_custom_provider(provider)
+    if custom_provider is not None:
+        explicit = routing_cfg.get("request_overrides") if isinstance(routing_cfg, dict) else None
+        model_creds["request_overrides"] = _merge_request_overrides(
+            _custom_provider_request_overrides(custom_provider), explicit,
+        )
+    return model_creds
+
+
+def _child_credential_overrides(
+    creds_i: Dict[str, Any], routing_cfg: Dict[str, Any], *, task_pinned: bool,
+) -> Dict[str, Any]:
+    """Extract child overrides while retaining the task's raw route intent."""
+    return {
+        "override_provider": creds_i["provider"], "override_base_url": creds_i["base_url"],
+        "override_api_key": creds_i["api_key"], "override_api_mode": creds_i["api_mode"],
+        "override_request_overrides": creds_i.get("request_overrides"),
+        "override_acp_command": creds_i.get("command"),
+        "override_acp_args": creds_i.get("args"),
+        "routing_cfg": routing_cfg,
+        "task_pinned": task_pinned,
+    }
+
+
+def _resolve_task_credentials(
+    task: Dict[str, Any], creds: Dict[str, Any], routing_cfg: Dict[str, Any], parent_agent,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Resolve a task route, preserving an already-resolved batch identity for model-only pins."""
+    pin_provider, pin_model = _task_route_pins(task)
+    if not pin_provider and not pin_model:
+        return creds, routing_cfg
+    overlay = dict(routing_cfg)
+    if pin_provider:
+        overlay["provider"] = pin_provider
+        # A provider pin must never pair the target credentials with the batch endpoint.
+        overlay["base_url"] = ""
+        if pin_model:
+            overlay["model"] = pin_model
+        return _resolve_delegation_credentials(overlay, parent_agent), overlay
+
+    # Do not re-enter pool/OAuth resolution: retain the exact account, key,
+    # endpoint, command, and arguments selected for the batch route.
+    overlay["model"] = pin_model
+    return _model_pin_transport_policy(creds, pin_model, routing_cfg), overlay
 
 def _load_config() -> dict:
     """The ``delegation`` config section (read-only — do NOT mutate). Prefers the shared ``load_config_readonly()``
@@ -438,16 +579,19 @@ def _resolve_child_runtime(
     parent_agent, delegation_cfg: dict, parent_api_key: Any, *, model: Optional[str], override_provider: Optional[str],
     override_base_url: Optional[str], override_api_key: Optional[str], override_api_mode: Optional[str],
     override_acp_command: Optional[str], override_acp_args: Optional[List[str]],
-    routing_cfg: Optional[Dict[str, Any]] = None,
+    routing_cfg: Optional[Dict[str, Any]] = None, task_pinned: bool = False,
 ) -> Dict[str, Any]:
-    """Child credentials, transport and routing (config override > parent inherit) as ``AIAgent`` kwargs. Rules that
-    are easy to break: api_mode is re-derived (not inherited) when the child's provider differs from the parent's
-    or is Nous Portal (dual-wire); a pinned ``delegation.command`` must exist on PATH or the spawn fails loudly;
-    ``override_provider`` clears the parent's ACP transport, fallback chain and OpenRouter routing filters so the
-    pinned provider is actually honoured."""
+    """Child credentials, transport, and routing as ``AIAgent`` kwargs.
+
+    ``task_pinned`` records raw task intent rather than inferring a pin from
+    a nonempty resolved global delegation route.
+    """
     effective_model = model or parent_agent.model
     effective_provider = override_provider or getattr(parent_agent, "provider", None)
-    effective_base_url = override_base_url or _inherit_parent_base_url(parent_agent, parent_agent.base_url)
+    effective_base_url = (
+        override_base_url if override_provider
+        else override_base_url or _inherit_parent_base_url(parent_agent, parent_agent.base_url)
+    )
     # api_mode: each provider has its own wire, so a different provider re-derives (None) instead of inheriting (404s
     # otherwise). Nous Portal is dual-wire within one provider (anthropic/* → Messages, else chat_completions), so
     # same-provider inheritance would pin the child on the wrong wire — re-derive.
@@ -506,8 +650,13 @@ def _resolve_child_runtime(
     except Exception as exc:
         logger.debug("Could not load delegation reasoning_effort: %s", exc)
 
+    effective_api_key = override_api_key if override_provider else override_api_key or parent_api_key
+    if override_provider:
+        _require_pinned_transport_credentials(
+            effective_provider, effective_base_url, effective_api_key, effective_acp_command,
+        )
     kwargs: Dict[str, Any] = {
-        "base_url": effective_base_url, "api_key": override_api_key or parent_api_key, "model": effective_model,
+        "base_url": effective_base_url, "api_key": effective_api_key, "model": effective_model,
         "provider": effective_provider,
         "capabilities": _inherit_parent_capabilities(parent_agent, override_provider, override_base_url),
         "api_mode": effective_api_mode, "acp_command": effective_acp_command, "acp_args": effective_acp_args,
@@ -523,7 +672,10 @@ def _resolve_child_runtime(
     }
     if not override_provider:
         kwargs["provider_data_collection"] = kwargs["provider_data_collection"] or ""
-    child_max_tokens = getattr(parent_agent, "max_tokens", None)
-    if isinstance(child_max_tokens, int):
-        kwargs["max_tokens"] = child_max_tokens
+    # Parent caps follow only an entirely inherited route. Any global provider
+    # or endpoint override lets its resolved target transport select the cap.
+    if not task_pinned and not (override_provider or override_base_url):
+        child_max_tokens = getattr(parent_agent, "max_tokens", None)
+        if isinstance(child_max_tokens, int):
+            kwargs["max_tokens"] = child_max_tokens
     return kwargs
