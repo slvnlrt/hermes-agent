@@ -524,25 +524,51 @@ class GatewayAgentCacheMixin:
                 await adapter.interrupt_session_activity(session_key, source.chat_id, metadata=metadata)
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
+        from gateway.platforms.event import event_receipts, terminalize_event_receipts
+
+        def _cancel_waiting_injection(event: Any) -> None:
+            if event is None:
+                return
+            cancel_deadline = getattr(adapter, "_cancel_injection_deadline", None)
+            if callable(cancel_deadline):
+                cancel_deadline(event)
+            else:
+                handle = getattr(event, "_injection_deadline_handle", None)
+                if handle is not None:
+                    handle.cancel()
+            terminalize_event_receipts(event, "cancelled")
+
+        def _is_internal_wake(event: Any) -> bool:
+            return bool(
+                getattr(event, "internal", False)
+                and not (getattr(event, "metadata", None) or {}).get("hermes_plugin_injection")
+                and not getattr(event, "_injection_lifecycle_managed", False)
+                and not event_receipts(event)
+            )
+
         if adapter and hasattr(adapter, "get_pending_message"):
-            # Discard a stale human follow-up (the slot held only user text when /stop started doing
-            # this, 59575d6a917) — but an internal wake (async-delegation completion, notify+wake)
-            # shares the slot now and was claim-settled on admission, so dropping it loses it for
-            # good and the session idles until the next user message (#114456). Leave it parked for
+            # Discard stale human/plugin follow-ups, but preserve an internal wake (async-delegation
+            # completion, notify+wake). It was claim-settled on admission, so dropping it loses it
+            # for good and the session idles until the next user message (#114456). Leave it parked for
             # the adapter's post-command drain; a wake queued behind a discarded human head is
             # promoted out of the overflow FIFO for the same reason. Whether a wake may still run
             # against a session /new just closed is decided where it is processed
             # (_resolve_async_delegation_session fails closed), not here.
             parked = adapter.get_pending_message(session_key)
-            wake = parked if getattr(parked, "internal", False) else None
+            wake = parked if _is_internal_wake(parked) else None
             if wake is None:
+                _cancel_waiting_injection(parked)
                 overflow = self._overflow_queue(session_key) or []
-                wake = next((e for e in overflow if getattr(e, "internal", False)), None)
+                wake = next((e for e in overflow if _is_internal_wake(e)), None)
                 if wake is not None:
                     overflow.remove(wake)
             if wake is not None:
                 adapter._pending_messages[session_key] = wake
         if state is not None:
+            overflow = state.conversation.queued_events
+            for queued_event in overflow:
+                _cancel_waiting_injection(queued_event)
+            overflow.clear()
             state.persistent.pending_command_text = None
         if release_running_state:
             # Guarded release: a message that arrived during the awaits above may already run as
