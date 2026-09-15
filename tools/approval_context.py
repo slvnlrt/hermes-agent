@@ -38,6 +38,33 @@ _approval_requester_id: contextvars.ContextVar[str] = _ctx("approval_requester_i
 # it onto the non-interactive auto-approve path so a dangerous command runs without the approval callback firing
 # (GHSA-96vc-wcxf-jjff). None = unset → env fallback.
 _hermes_interactive_ctx: contextvars.ContextVar[str | None] = _ctx("hermes_interactive", None)
+# Server-authenticated native-session authority. Unlike ``HERMES_SESSION_PLATFORM`` or a
+# persisted session ``source``, this scope is minted only from TUI/Desktop transport
+# admission: ``"local"`` for stdio/loopback, otherwise the authenticated WS principal.
+_approval_session_owner: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_session_owner", default="")
+
+
+def set_current_approval_session_owner(owner_scope: "str | bool") -> contextvars.Token[str]:
+    """Bind the server-verified native owner scope for the current turn."""
+    scope = "local" if owner_scope is True else str(owner_scope or "")
+    return _approval_session_owner.set(scope)
+
+
+def reset_current_approval_session_owner(token: contextvars.Token[str]) -> None:
+    """Restore the prior native-session approval authority."""
+    _approval_session_owner.reset(token)
+
+
+def current_approval_session_owner() -> bool:
+    """Whether this turn has a server-verified native session owner."""
+    return bool(_approval_session_owner.get())
+
+
+def current_approval_session_owner_is_local() -> bool:
+    """Whether native approval authority came from local stdio/loopback admission."""
+    return _approval_session_owner.get() == "local"
+
 
 
 def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:
@@ -91,10 +118,10 @@ def reset_current_session_key(token: contextvars.Token[str]) -> None:
 def set_current_requester_id(requester_id: str) -> contextvars.Token[str]:
     """Bind the verified requester id for the current context.
 
-    Symmetric to :func:`set_current_session_key`.  The gateway sets this from
-    the message ``source`` so an approval created during this turn records the
-    verified principal that requested it.  Pass ``""`` when there is no verified
-    requester (DM 1:1, CLI) — no binding is then enforced at resolution.
+    Symmetric to :func:`set_current_session_key`. The messaging gateway sets
+    this from its adapter-verified message source. Empty means there is no
+    messaging principal; only a separately server-admitted native session
+    owner may then receive and resolve a gateway-style prompt.
     """
     return _approval_requester_id.set(requester_id or "")
 
@@ -105,10 +132,10 @@ def reset_current_requester_id(token: contextvars.Token[str]) -> None:
 
 
 def get_current_requester_id() -> str:
-    """Return the verified requester id bound to the current context.
+    """Return the verified messaging requester id bound to the current context.
 
-    Empty string when unset (CLI, cron, DM 1:1, legacy callers) — callers treat
-    this as "no requester binding" and skip the clicker==requester check.
+    Empty string when unset. It is never a wildcard: gateway callers either
+    carry native session-owner authority or fail closed.
     """
     return _approval_requester_id.get()
 

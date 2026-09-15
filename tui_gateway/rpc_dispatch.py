@@ -52,6 +52,16 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
     try:
         from tui_gateway import server_requests
         if server_requests.is_response_frame(req):
+            # Native approvals require both the request capability and the exact
+            # answering transport's ownership of the live session.
+            owner_sid = (
+                server_requests.approval_owner_session(str(req.get("id") or ""))
+                or _compute_host_approval_owner_session(str(req.get("id") or "")))
+            if owner_sid and _current_native_approval_authority(owner_sid)[0] is None:
+                logger.warning(
+                    "dropping approval response from transport that does not own session %s",
+                    owner_sid)
+                return None
             # The renderer answering one of OUR requests (clarify, approval, …): no response frame goes back.
             if not server_requests.resolve_response(req) and not _relay_compute_host_response(req):
                 logger.debug("dropping response for unknown server request id=%r", req.get("id"))

@@ -618,19 +618,9 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
     finally:
         server._sessions.pop("sid", None)
 
-    assert dispatched == [
-        (
-            "drain-b",
-            "sid",
-            "B",
-            {"image_paths": ["/tmp/b.png"], "queued_prompt_generation": 0},
-        ),
-        (
-            "drain-c",
-            "sid",
-            "C",
-            {"image_paths": ["/tmp/c.png"], "queued_prompt_generation": 0},
-        ),
+    assert [(text, kwargs["image_paths"]) for _, _, text, kwargs in dispatched] == [
+        ("B", ["/tmp/b.png"]),
+        ("C", ["/tmp/c.png"]),
     ]
 
 

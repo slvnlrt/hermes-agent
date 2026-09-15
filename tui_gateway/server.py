@@ -788,8 +788,11 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
                                                     "(update the Hermes app)")
             return
         choice = str(result.get("choice") or "deny")
-        _approval.resolve_gateway_approval(session_key, choice, resolve_all=bool(result.get("all")),
-                                           request_id=request_id or None)
+        _approval.resolve_gateway_approval(
+            session_key, choice, resolve_all=bool(result.get("all")),
+            request_id=request_id or None,
+            session_owner=bool(payload.get("session_owner_required")),
+        )
 
     settle = server_requests.send_async("approval", sid, payload, on_result)
     # The wait can end between the frame going out and the hook attaching (the client answered by RPC, another
@@ -1021,6 +1024,34 @@ def _session_is_local_provenance(session: dict | None) -> bool:
     """Return the local admission fact unless an anonymous remote joined first."""
     return bool((session or {}).get("_local_owner_provenance", False)) and not bool(
         (session or {}).get("_local_owner_mixed", False))
+
+
+def _native_approval_owner_scope(session: dict | None, transport) -> str:
+    """Server-minted native owner scope for an attached transport, else ``""``.
+
+    Local Desktop/TUI uses ``"local"``. Remote dashboards use the authenticated WS
+    principal stamped on both transport and session; another attached login is
+    not interchangeable with that creator.
+    """
+    if not _session_transport_contains(session, transport):
+        return ""
+    if _session_is_local_provenance(session):
+        return "local" if _transport_has_local_owner_provenance(transport) else ""
+    expected = _session_auth_user_id(session)
+    actual = _transport_auth_user_id(transport)
+    return f"user:{expected}" if expected and actual == expected else ""
+
+
+def _transport_owns_native_approval(session: dict | None, transport) -> bool:
+    """Whether an attached native transport is the session's admitted human owner."""
+    return bool(_native_approval_owner_scope(session, transport))
+
+
+def _current_native_approval_authority(session_id: str) -> tuple[Transport | None, dict | None]:
+    """Current RPC transport + session when it owns native human approval authority."""
+    transport, session = _current_session_steer_authority(session_id)
+    return ((transport, session) if _transport_owns_native_approval(session, transport)
+            else (None, None))
 
 
 def _wire_session_agent(sid: str, key: str, agent) -> bool:
@@ -2565,7 +2596,9 @@ def _init_session(
             # Async events go to the transport that created the session (stdio for Ink, WS for the dashboard).
             "transport": current_transport() or _stdio_transport,
             "auth_user_id": _transport_auth_user_id(current_transport()),
-            "_local_owner_provenance": bool(getattr(agent, "_local_owner_provenance", False)),
+            "_local_owner_provenance": (
+                bool(getattr(agent, "_local_owner_provenance", False))
+                or _transport_has_local_owner_provenance(current_transport() or _stdio_transport)),
         }
         _session_todo_state(_sessions[sid])
     _hydrate_session_cwd(sid, key, session_db, profile_home)

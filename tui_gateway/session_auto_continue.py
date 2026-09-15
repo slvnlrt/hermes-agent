@@ -321,7 +321,13 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             _ac_set_queue(session, [queued, *([advanced] if advanced else []), *(session.get("queued_prompts") or [])])
             session["running"] = False
             return True
-    kwargs: dict = {"queued_prompt_generation": queue_generation}
+    kwargs: dict = {
+        "queued_prompt_generation": queue_generation,
+        "approval_session_owner": (
+            _native_approval_owner_scope(session, queued_transport)
+            if queued_transport is not None and not _transport_is_dead(queued_transport) else ""
+        ),
+    }
     if queued.get("image_paths"):
         kwargs["image_paths"] = queued["image_paths"]
     # The compute-host frame has no author field, so only the inline runner receives it.
