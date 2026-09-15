@@ -5381,8 +5381,12 @@ class SlackAdapter(BasePlatformAdapter):
         # Resolve FIRST (unblocks the agent); render after so a click past the
         # timeout (count == 0) shows "expired", not "approved".
         try:
-            from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(session_key, choice)
+            from tools.approval import resolve_gateway_approval, REQUESTER_MISMATCH
+            count = resolve_gateway_approval(session_key, choice, clicker_id=user_id)
+            if count == REQUESTER_MISMATCH:
+                logger.info("Slack approval requester mismatch for session %s (clicker=%s)", session_key, user_id)
+                self._approval_resolved[approval_key] = False  # restore so the real requester can click
+                return
             logger.info(
                 "Slack button resolved %d approval(s) for session %s (choice=%s, user=%s)", count,
                 session_key, choice, user_name)

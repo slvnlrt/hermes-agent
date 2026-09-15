@@ -113,11 +113,17 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     when the notify callback raised. Persisting the choice and building the
     tool-facing result stay with the caller.
 
-    Identical concurrent approvals (same command text + pattern-key set) are
-    coalesced: parallel tool calls would otherwise fire N identical prompts
-    the user must /approve N times while the agent sits wedged. Followers adopt
-    the leader's ``session``/``always``/``deny``/timeout; a ``once`` covers only
-    the leader, so the follower falls through to a fresh prompt."""
+    Identical concurrent approvals (same command text, pattern-key set,
+    verified requester, and offered scope policy) are coalesced: parallel tool
+    calls would otherwise fire N identical prompts. Followers adopt only a
+    same-principal leader's ``session``/``always``/``deny``/timeout; a ``once``
+    covers only the leader, so the follower falls through to a fresh prompt."""
+    requester_id = _ctx.get_current_requester_id()
+    approval_data.setdefault("requester_id", requester_id)
+    approval_data.setdefault(
+        "requester_required",
+        surface == "gateway" and _ctx._get_require_requester_match(),
+    )
     from tools import approval as _approval
 
     primary_key = approval_data.get("pattern_key", "")
@@ -126,21 +132,35 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         "description": approval_data.get("description", ""),
         "pattern_key": primary_key,
         "pattern_keys": list(approval_data.get("pattern_keys", [primary_key])),
-        "session_key": session_key, "surface": surface,
+        "requester_id": approval_data["requester_id"],
+        "session_key": session_key,
+        "surface": surface,
     }
     keys = list(approval_data.get("pattern_keys") or [])
     with _approval._lock:
-        leader = next((e for e in _approval._gateway_queues.get(session_key, [])
-                       if e.data.get("command") == approval_data.get("command")
-                       and list(e.data.get("pattern_keys") or []) == keys), None)
+        leader = next((
+            e for e in _approval._gateway_queues.get(session_key, [])
+            if e.data.get("command") == approval_data.get("command")
+            and list(e.data.get("pattern_keys") or []) == keys
+            and e.data.get("requester_id", "") == approval_data["requester_id"]
+            and bool(e.data.get("requester_required")) == bool(approval_data["requester_required"])
+            and (e.data.get("allow_session") is not False) == (approval_data.get("allow_session") is not False)
+            and (e.data.get("allow_permanent") is not False) == (approval_data.get("allow_permanent") is not False)
+        ), None)
+        if leader is None:
+            entry = _ApprovalEntry(approval_data)
+            _approval._gateway_queues.setdefault(session_key, []).append(entry)
     if leader is not None:
         adopted = _await_coalesced_leader(session_key, leader, payload)
         if adopted is not None:
             return adopted
 
-    entry = _ApprovalEntry(approval_data)
-    with _approval._lock:
-        _approval._gateway_queues.setdefault(session_key, []).append(entry)
+    # A leader that was approved once cannot authorize this follower, so it
+    # falls through here as a newly registered independent request.
+    if leader is not None:
+        with _approval._lock:
+            entry = _ApprovalEntry(approval_data)
+            _approval._gateway_queues.setdefault(session_key, []).append(entry)
 
     def _drop_entry(reason: str) -> None:
         with _approval._lock:

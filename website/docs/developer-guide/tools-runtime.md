@@ -201,9 +201,14 @@ The terminal tool integrates a dangerous-command approval system defined in `too
    - **Gateway mode** — an async approval callback sends the request to the messaging platform
    - **Smart approval** — optionally, an auxiliary LLM can auto-approve low-risk commands that match patterns (e.g., `rm -rf node_modules/` is safe but matches "recursive delete")
 
-4. **Session state** — approvals are tracked per-session. Once you approve "recursive delete" for a session, subsequent `rm -rf` commands don't re-prompt.
+4. **Session state** — approvals are tracked per-session and per verified requester. A grant for one
+   participant in a shared gateway conversation never authorizes another participant.
 
-5. **Permanent allowlist** — the "allow permanently" option writes the pattern to `config.yaml`'s `command_allowlist`, persisting across sessions.
+5. **Permanent allowlist** — local operator entries live in `config.yaml`'s
+   `command_allowlist`. Gateway **Always** choices instead persist under
+   `approvals.requester_allowlist` using an exact `platform:principal` key (for example,
+   `telegram:123456`). Existing global `command_allowlist` entries are intentionally not applied
+   to authenticated gateway requesters.
 
 ## Terminal/runtime environments
 

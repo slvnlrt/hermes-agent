@@ -2092,38 +2092,53 @@ class RelayAdapter(BasePlatformAdapter):
                 "relay prompt_response %s (option=%s) already resolved — ignoring repeat", prompt_id, option_id
             )
             return True
-        state = self._pop_prompt(prompt_id)
-        if state is None:
+        state = self._pending_prompts.get(prompt_id)
+        if not state or state.get("expires_at", 0) < time.time():
+            self._pending_prompts.pop(prompt_id, None)
             logger.info("relay prompt_response for unknown/expired prompt %s (option=%s)", prompt_id, option_id)
             await self._notify_prompt_expired(event)
             return True
-        self._note_prompt_resolved(prompt_id)
-
         kind = state.get("kind")
         chat_id = str(state.get("chat_id") or getattr(event.source, "chat_id", ""))
         handler = _PROMPT_RESOLVERS.get(kind)
         try:
             if handler is None:
                 logger.warning("relay prompt_response with unknown kind %r", kind)
+            elif kind == "exec_approval":
+                # A requester mismatch must leave the native prompt live so
+                # the actual requester can still decide.
+                actor_id = str(getattr(event.source, "user_id", "") or "")
+                if await handler(self, state, option_id, chat_id, self._prompt_reply_metadata(event), actor_id):
+                    self._pending_prompts.pop(prompt_id, None)
+                    self._note_prompt_resolved(prompt_id)
             else:
-                # Acks are fire-and-forget: we are ON the read loop here (see
-                # _send_lifecycle_ack) and awaiting a send would self-deadlock.
+                state = self._pop_prompt(prompt_id)
+                if state is None:
+                    await self._notify_prompt_expired(event)
+                    return True
+                self._note_prompt_resolved(prompt_id)
                 await handler(self, state, option_id, chat_id, self._prompt_reply_metadata(event))
         except Exception:  # noqa: BLE001 - a resolver failure must not kill the reader
             logger.warning("relay prompt_response resolution failed", exc_info=True)
         return True
 
-    async def _resolve_exec_approval(self, state, option_id, chat_id, ack_meta) -> None:
-        from tools.approval import resolve_gateway_approval
+    async def _resolve_exec_approval(self, state, option_id, chat_id, ack_meta, clicker_id: str = "") -> bool:
+        from tools.approval import resolve_gateway_approval, REQUESTER_MISMATCH
 
         choice = option_id if option_id in _EXEC_APPROVAL_LABELS else "deny"
-        count = resolve_gateway_approval(str(state.get("session_key") or ""), choice)
-        label = _EXEC_APPROVAL_LABELS[choice] if count else "⌛ Approval expired — no command was waiting."
+        count = resolve_gateway_approval(str(state.get("session_key") or ""), choice, clicker_id=clicker_id or None)
+        if count == REQUESTER_MISMATCH:
+            self._send_lifecycle_ack(
+                chat_id, "⚠️ Only the user who triggered this command can approve or deny it.", ack_meta,
+            )
+            return False
+        label = _EXEC_APPROVAL_LABELS[choice] if count > 0 else "⌛ Approval expired — no command was waiting."
         # In-channel ack preserves the audit trail the native edit gives (the
         # connector's prompt message can't be edited cross-platform yet).
         self._send_lifecycle_ack(chat_id, label, ack_meta)
-        if count:
+        if count > 0:
             self.resume_typing_for_chat(chat_id)
+        return True
 
     async def _resolve_slash_confirm(self, state, option_id, chat_id, ack_meta) -> None:
         from tools import slash_confirm as slash_confirm_mod

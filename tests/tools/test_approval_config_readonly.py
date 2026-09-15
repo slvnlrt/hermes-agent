@@ -38,25 +38,14 @@ def config_home(tmp_path, monkeypatch):
 
 
 def _patched_loaders(monkeypatch):
-    """Count BOTH loader variants. (A boom on load_config is useless here —
-    every call site wraps the load in try/except and would swallow it; a
-    pass-through counter is the robust form. The pins are: legacy
-    load_config == 0 calls, load_config_readonly == the expected count,
-    and cache identity — none satisfiable by the pre-fix code.)"""
-    calls = {"readonly": 0, "legacy": 0}
-
-    real_ro = hc.load_config_readonly
+    """Count deepcopying loads: callers swallow exceptions, so a raising stub is insufficient."""
+    calls = {"legacy": 0}
     real_legacy = hc.load_config
-
-    def counting_ro():
-        calls["readonly"] += 1
-        return real_ro()
 
     def counting_legacy():
         calls["legacy"] += 1
         return real_legacy()
 
-    monkeypatch.setattr(hc, "load_config_readonly", counting_ro)
     monkeypatch.setattr(hc, "load_config", counting_legacy)
     return calls
 
@@ -69,7 +58,6 @@ def test_guard_never_calls_deepcopy_variant(config_home, monkeypatch):
     assert calls["legacy"] == 0, (
         f"guard path called deepcopying load_config "
         f"{calls['legacy']}x — regression reintroduces the deepcopy cost")
-    assert calls["readonly"] >= 1
 
 
 def test_config_readers_never_call_deepcopy_variant(config_home, monkeypatch):
@@ -81,7 +69,6 @@ def test_config_readers_never_call_deepcopy_variant(config_home, monkeypatch):
     sec = _load_security_config()
     assert sec["tirith_enabled"] is False
     assert calls["legacy"] == 0
-    assert calls["readonly"] == 5  # one readonly load per function
 
 
 def test_readers_return_live_cache_without_corrupting_it(

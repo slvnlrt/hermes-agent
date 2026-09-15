@@ -186,16 +186,17 @@ def _has_allowlist_shell_operator(command: str) -> bool:
 
 
 def _command_matches_permanent_allowlist(command: str) -> bool:
-    """True when command_allowlist holds this exact command text or a matching
-    glob. Permanent approvals historically store dangerous-pattern keys such as
-    ``recursive delete``; manual entries are command text, possibly with
-    shell-style wildcards like ``podman *``."""
+    """True when this requester's durable allowlist holds a matching command.
+
+    ``command_allowlist`` is retained as a local operator policy. Authenticated
+    gateway users inspect only their explicit requester-scoped grants, so a
+    legacy global entry cannot silently authorize another user's command.
+    """
     from tools import approval as _a
     command = (command or "").strip()
     if not command or _has_allowlist_shell_operator(command):
         return False
-    with _a._lock:
-        patterns = tuple(_a._permanent_set())
+    patterns = _a.permanent_patterns_for_requester(_ctx.get_current_requester_id())
     for pattern in patterns:
         pattern = pattern.strip() if isinstance(pattern, str) else ""
         if pattern and (command == pattern or (any(ch in pattern for ch in "*?[")

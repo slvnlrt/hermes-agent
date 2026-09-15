@@ -81,6 +81,7 @@ gateway:
     session_plural:        "✅ Commands approved (pattern approved for this session) ({count} commands). The agent is resuming..."
     always_singular:       "✅ Command approved (pattern approved permanently). The agent is resuming..."
     always_plural:         "✅ Commands approved (pattern approved permanently) ({count} commands). The agent is resuming..."
+    wrong_requester:       "⚠️ Only the user who triggered this command can approve it."
 
   background:
     usage:                 "Usage: /bg <prompt>\nExample: /bg Summarize the top HN stories today\n\nRuns the prompt in a separate session. You can keep chatting — the result will appear here when done."
@@ -138,6 +139,7 @@ gateway:
     denied_plural:         "❌ Commands denied ({count} commands)."
     denied_reason_singular: "❌ Command denied. Reason relayed to the agent: \"{reason}\""
     denied_reason_plural:  "❌ Commands denied ({count} commands). Reason relayed to the agent: \"{reason}\""
+    wrong_requester:       "⚠️ Only the user who triggered this command can deny it."
 
   fast:
     not_supported:         "⚡ /fast is only available for OpenAI models that support Priority Processing."

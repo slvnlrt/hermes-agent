@@ -1107,7 +1107,7 @@ class TestDispatchInteractiveReplyApproval:
         calls = []
         monkeypatch.setattr(
             "tools.approval.resolve_gateway_approval",
-            lambda session_key, choice: calls.append((session_key, choice)) or 1,
+            lambda session_key, choice, clicker_id=None: calls.append((session_key, choice, clicker_id)) or 1,
         )
 
         raw = {
@@ -1121,7 +1121,7 @@ class TestDispatchInteractiveReplyApproval:
         handled = await adapter._dispatch_interactive_reply(raw, {})
 
         assert handled is True
-        assert calls == [("sess-app-1", "approve")]
+        assert calls == [("sess-app-1", "approve", "15551234567")]
         assert "app1" not in adapter._exec_approval_state
         confirm_payload = adapter._http_client.post.call_args.kwargs["json"]
         assert confirm_payload["type"] == "text"
@@ -1177,34 +1177,60 @@ class TestDispatchInteractiveReplyAuthorization:
 
 
     @pytest.mark.asyncio
-    async def test_approval_tap_allowed_when_sender_allowlisted(self, monkeypatch):
+    async def test_approval_tap_allowed_when_sender_allowlisted(self):
+        """An allowlisted requester resolves its prompt; another allowlisted sender cannot."""
+        requester = "15551234567"
+        other_actor = "15557654321"
+        session_key = "whatsapp-session-1"
         adapter = _make_adapter(
             _dm_policy="allowlist",
-            _allow_from={"15551234567"},
+            _allow_from={requester, other_actor},
         )
-        adapter._exec_approval_state["app1"] = "sess-app-1"
+        adapter._exec_approval_state["app1"] = session_key
         adapter._http_client = MagicMock()
         adapter._http_client.post = AsyncMock(
             return_value=_mock_httpx_response(200, {"messages": [{"id": "x"}]})
         )
-        calls = []
-        monkeypatch.setattr(
-            "tools.approval.resolve_gateway_approval",
-            lambda session_key, choice: calls.append((session_key, choice)) or 1,
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+
+        entry = _ApprovalEntry(
+            {
+                "command": "rm -rf /tmp/example",
+                "description": "test approval",
+                "requester_id": requester,
+                "requester_required": True,
+            }
         )
+        with approval._lock:
+            approval._gateway_queues.pop(session_key, None)
+            approval._gateway_queues[session_key] = [entry]
+        try:
+            def approval_tap(sender):
+                return {
+                    "from": sender,
+                    "type": "interactive",
+                    "interactive": {
+                        "type": "button_reply",
+                        "button_reply": {"id": "appr:app1:approve", "title": "Approve"},
+                    },
+                }
 
-        raw = {
-            "from": "15551234567",
-            "type": "interactive",
-            "interactive": {
-                "type": "button_reply",
-                "button_reply": {"id": "appr:app1:approve", "title": "Approve"},
-            },
-        }
-        handled = await adapter._dispatch_interactive_reply(raw, {})
+            assert await adapter._dispatch_interactive_reply(approval_tap(other_actor), {}) is True
+            assert approval.has_blocking_approval(session_key)
+            assert not entry.event.is_set()
+            assert "app1" in adapter._exec_approval_state
 
-        assert handled is True
-        assert calls == [("sess-app-1", "approve")]
+            assert await adapter._dispatch_interactive_reply(approval_tap(requester), {}) is True
+            assert entry.event.is_set()
+            assert entry.result == "approve"
+            assert not approval.has_blocking_approval(session_key)
+            assert "app1" not in adapter._exec_approval_state
+            confirm_payload = adapter._http_client.post.call_args.kwargs["json"]
+            assert "Approved" in confirm_payload["text"]["body"]
+        finally:
+            with approval._lock:
+                approval._gateway_queues.pop(session_key, None)
 
 
 @pytest.mark.usefixtures("authorized_interactive_env")

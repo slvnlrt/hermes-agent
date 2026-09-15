@@ -198,11 +198,11 @@ class TestFeishuUpdatePrompt:
 
 
 # ===========================================================================
-# _resolve_approval — approval state pop + gateway resolution
+# _resolve_approval — gateway resolution without consuming state on mismatch
 # ===========================================================================
 
 class TestResolveApproval:
-    """Test _resolve_approval pops state and calls resolve_gateway_approval."""
+    """Test approval resolution preserves state until a valid requester acts."""
 
     @pytest.mark.asyncio
     async def test_resolves_once(self):
@@ -216,7 +216,9 @@ class TestResolveApproval:
         with patch("tools.approval.resolve_gateway_approval", return_value=1) as mock_resolve:
             await adapter._resolve_approval(1, "once", "Norbert", open_id="ou_user1", chat_id="oc_12345")
 
-        mock_resolve.assert_called_once_with("agent:main:feishu:group:oc_12345", "once")
+        mock_resolve.assert_called_once_with(
+            "agent:main:feishu:group:oc_12345", "once", clicker_id="ou_user1",
+        )
         assert 1 not in adapter._approval_state
 
 
@@ -235,6 +237,20 @@ class TestResolveApproval:
 
         mock_resolve.assert_not_called()
         assert 5 in adapter._approval_state
+
+    @pytest.mark.asyncio
+    async def test_wrong_requester_keeps_prompt_for_correct_requester(self):
+        adapter = _make_adapter()
+        adapter._approval_state[6] = {
+            "session_key": "sess-6",
+            "message_id": "msg_006",
+            "chat_id": "oc_12345",
+        }
+        with patch("tools.approval.resolve_gateway_approval", side_effect=[-1, 1]):
+            await adapter._resolve_approval(6, "once", "Mallory", open_id="ou_intruder", chat_id="oc_12345")
+            assert 6 in adapter._approval_state
+            await adapter._resolve_approval(6, "once", "Alice", open_id="ou_user1", chat_id="oc_12345")
+        assert 6 not in adapter._approval_state
 
 
 # ===========================================================================

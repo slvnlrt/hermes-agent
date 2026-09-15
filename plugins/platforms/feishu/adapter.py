@@ -2159,6 +2159,10 @@ class FeishuAdapter(BasePlatformAdapter):
         if checked is None:
             return self._card_response()
         open_id, chat_id, user_name = checked
+        from tools.approval import gateway_approval_requester_blocks
+        if gateway_approval_requester_blocks(state["session_key"], open_id):
+            logger.info("Feishu approval requester mismatch for session %s (clicker=%s)", state["session_key"], open_id)
+            return self._card_response()
         coro = self._resolve_approval(
             approval_id=approval_id, choice=choice, user_name=user_name, open_id=open_id, chat_id=chat_id,
         )
@@ -2213,25 +2217,30 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _resolve_approval(
         self, approval_id: Any, choice: str, user_name: str, *, open_id: str = "", chat_id: str = "",
     ) -> None:
-        """Pop approval state and unblock the waiting agent thread."""
-        state = self._pop_validated_prompt_state(
-            states=self._approval_state, ident=approval_id, label="Approval", open_id=open_id, chat_id=chat_id,
-            unauthorized_fmt="[Feishu] Unauthorized approval click by %s for approval %s",
-            operator_repr=open_id or "<unknown>",
-        )
+        """Resolve an approval without consuming native state on a wrong click."""
+        state = self._approval_state.get(approval_id)
         if not state:
+            logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
+            return
+        if not self._is_interactive_operator_authorized(open_id):
+            logger.warning("[Feishu] Unauthorized approval click by %s for approval %s", open_id or "<unknown>", approval_id)
+            return
+        expected_chat_id = str(state.get("chat_id", "") or "")
+        if expected_chat_id and chat_id and expected_chat_id != chat_id:
+            logger.warning("[Feishu] Approval %s chat mismatch (expected=%s, got=%s)", approval_id, expected_chat_id, chat_id)
             return
         try:
-            from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(state["session_key"], choice)
+            from tools.approval import resolve_gateway_approval, REQUESTER_MISMATCH
+            count = resolve_gateway_approval(state["session_key"], choice, clicker_id=open_id or None)
+            if count == REQUESTER_MISMATCH:
+                logger.info("Feishu approval requester mismatch for session %s (clicker=%s)", state["session_key"], open_id)
+                return
+            self._approval_state.pop(approval_id, None)
             logger.info(
                 "Feishu button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                 count, state["session_key"], choice, user_name,
             )
-            if not count and choice != "deny":
-                # The card already reads "Approved" (synchronous callback), but nothing was
-                # waiting — the wait timed out (fail-closed deny) or was resolved via /approve.
-                # Correct the record so the user doesn't believe the command ran.
+            if count <= 0:
                 _chat = str(state.get("chat_id", "") or chat_id or "")
                 if _chat:
                     try:
@@ -3107,13 +3116,18 @@ class FeishuAdapter(BasePlatformAdapter):
         return "dm" if event_chat_type == "p2p" else "group"
 
     async def _resolve_sender_profile(self, sender_id: Any, *, is_bot: bool = False) -> Dict[str, Optional[str]]:
-        """Map Feishu's ID tiers onto SessionSource: user_id (tenant) > open_id (app) as primary,
-        union_id (developer-scoped, cross-app stable) as user_id_alt — session keys prefer the alt."""
+        """Map Feishu's callback-capable open id to the primary source identity.
+
+        ``union_id`` remains the stable session-routing alternate, but approval
+        callbacks supply ``open_id``. Keeping the primary principal on that
+        verified callback identity prevents a display-name or ID-tier mismatch
+        from bypassing or orphaning a pending approval.
+        """
         open_id = getattr(sender_id, "open_id", None) or None
         user_id = getattr(sender_id, "user_id", None) or None
         union_id = getattr(sender_id, "union_id", None) or None
-        primary_id = user_id or open_id
-        name_lookup_id = open_id if is_bot else (primary_id or union_id)  # bots/basic_batch only takes open_id
+        primary_id = open_id or user_id
+        name_lookup_id = open_id if is_bot else (primary_id or union_id)
         display_name = await self._resolve_sender_name_from_api(name_lookup_id, is_bot=is_bot)
         return {"user_id": primary_id, "user_name": display_name, "user_id_alt": union_id}
 

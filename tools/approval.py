@@ -25,7 +25,7 @@ from tools.approval_context import (
     _get_session_platform, _is_cron_approval_context,
     _is_gateway_approval_context, _is_interactive_cli, _is_single_query_approval_context,
     _is_unattended_platform_approval_context, _resolve_cli_approval_callback, _should_fall_through_to_cli_approval,
-    _tirith_fail_open, get_current_session_key,
+    _tirith_fail_open, get_current_requester_id, get_current_session_key,
 )
 from tools.approval_detection import (
     _approval_key_aliases, _check_sudo_stdin_guard, detect_dangerous_command, detect_hardline_command,
@@ -49,11 +49,17 @@ _YOLO_MODE_FROZEN: bool = is_truthy_value(os.getenv("HERMES_YOLO_MODE", ""))
 
 _lock = threading.Lock()
 _pending: dict[str, dict] = {}
-_session_approved: dict[str, set] = {}
+# "Allow session" grants are scoped by (session_key, requester_id). Shared
+# gateway session keys omit the user id, so a flat map would let a grant
+# approved by user A cover later dangerous commands from user B. The empty
+# requester scope is reserved for local operator sessions; authenticated
+# gateway authorization never treats it as a wildcard.
+_session_approved: dict[tuple[str, str], set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
 # Routed multiplex profiles: one permanent allowlist per profile home (see ``_permanent_set``).
 _permanent_approved_by_home: dict[str, set] = {}
+_requester_permanent_approved_by_home: dict[str, dict[str, set]] = {}
 
 # --- Consecutive-denial circuit breaker for smart approvals ---------------------------------------------------------
 # Each retry of a smart-denied command burns another guardian LLM call. After ``approvals.denial_breaker_threshold``
@@ -118,6 +124,15 @@ def _denial_breaker_addendum(session_key: str) -> str:
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
 
+# Sentinel return value from ``resolve_gateway_approval`` when the clicker is
+# not the verified requester of the (oldest) pending approval and
+# ``approvals.require_requester_match`` is enabled.  Distinct from 0 (nothing
+# pending / already resolved) so a caller can show a tailored "only the
+# requester can approve/deny this command" message instead of a generic
+# "already handled" one.  Negative so any legacy ``if count:`` / ``count > 0``
+# truthiness check treats it as "not resolved".
+REQUESTER_MISMATCH: int = -1
+
 
 def register_gateway_notify(session_key: str, cb) -> None:
     """Register ``cb(approval_data: dict) -> None`` for sending approval requests. The callback
@@ -136,15 +151,47 @@ def unregister_gateway_notify(session_key: str) -> None:
         entry.event.set()
 
 
+def _requester_blocks(entry, clicker_id) -> bool:
+    """Return whether *clicker_id* may resolve *entry* under requester binding.
+
+    With ``approvals.require_requester_match`` (the default), every gateway
+    decision requires the exact verified principal that created it. A missing
+    callback identity is not an escape hatch, and a gateway turn lacking a
+    verified requester cannot be resolved at all. Empty requester ids remain
+    valid only for explicitly local, non-gateway approval surfaces.
+    """
+    from tools.approval_context import _get_require_requester_match
+
+    if not _get_require_requester_match():
+        return False
+    data = entry.data or {}
+    requester_id = str(data.get("requester_id") or "")
+    if data.get("requester_required"):
+        return not requester_id or not clicker_id or requester_id != str(clicker_id)
+    return bool(requester_id and (not clicker_id or requester_id != str(clicker_id)))
+
+
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
                              reason: Optional[str] = None,
-                             request_id: Optional[str] = None) -> int:
+                             request_id: Optional[str] = None,
+                             clicker_id=None) -> int:
     """Unblock waiting agent thread(s) from the gateway's /approve or /deny handler.
 
     *resolve_all* resolves every pending approval (``/approve all``); otherwise the oldest
     (FIFO) or the one matching *request_id*. *reason* is the ``/deny <reason>`` free text,
-    relayed to the agent in the BLOCKED message. Returns the number resolved.
+    relayed to the agent in the BLOCKED message.
+
+    *clicker_id* is the verified platform identity of the user acting on the
+    approval (button click or ``/approve`` / ``/deny``). With requester
+    binding enabled it MUST exactly match the principal recorded on a gateway
+    entry; a missing identity is rejected rather than preserving a legacy
+    bypass. Local entries that were not created by a gateway remain
+    intentionally unbound.
+
+    Returns the number of approvals resolved (0 means nothing was pending),
+    or :data:`REQUESTER_MISMATCH` when no selected entry can be resolved by
+    this principal.
     """
     with _lock:
         queue = _gateway_queues.get(session_key)
@@ -154,17 +201,36 @@ def resolve_gateway_approval(session_key: str, choice: str,
             targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
             if not targets:
                 return 0
+            # The requester binding covers this surface too: resolving one
+            # approval by id is the same act as resolving the oldest, so a
+            # non-requester must be refused here as well.
+            if any(_requester_blocks(entry, clicker_id) for entry in targets):
+                return REQUESTER_MISMATCH
             queue[:] = [entry for entry in queue if entry not in targets]
         elif resolve_all:
-            targets = list(queue)
-            queue.clear()
+            targets = [e for e in queue if not _requester_blocks(e, clicker_id)]
+            blocked_any = len(targets) != len(queue)
+            for entry in targets:
+                queue.remove(entry)
+            if not queue:
+                _gateway_queues.pop(session_key, None)
+            if not targets and blocked_any:
+                return REQUESTER_MISMATCH
         else:
+            oldest = queue[0]
+            if _requester_blocks(oldest, clicker_id):
+                return REQUESTER_MISMATCH
             targets = [queue.pop(0)]
-        if not queue:
-            _gateway_queues.pop(session_key, None)
+            if not queue:
+                _gateway_queues.pop(session_key, None)
 
     for entry in targets:
-        entry.result = choice
+        effective_choice = choice
+        if effective_choice == "always" and entry.data.get("allow_permanent") is False:
+            effective_choice = "session" if entry.data.get("allow_session") is not False else "once"
+        if effective_choice == "session" and entry.data.get("allow_session") is False:
+            effective_choice = "once"
+        entry.result = effective_choice
         if reason:
             entry.reason = reason
         entry.event.set()
@@ -216,16 +282,40 @@ def get_pending_gateway_approval(session_key: str) -> dict | None:
         return dict(queue[0].data)
 
 
+def gateway_approval_requester_blocks(session_key: str, clicker_id) -> bool:
+    """Return True when *clicker_id* may NOT resolve the oldest pending approval.
+
+    Non-mutating peek mirroring the check inside ``resolve_gateway_approval``.
+    Useful for surfaces (e.g. Feishu) that decide the confirmation UI in a
+    synchronous handler before the async resolve runs, so they can show a
+    "only the requester can approve" message instead of a misleading card.
+
+    Returns False only when nothing is pending, binding is deliberately disabled,
+    or the clicker exactly matches a bound requester. Missing gateway identities
+    are blocked under the default strict policy.
+    """
+    with _lock:
+        queue = _gateway_queues.get(session_key)
+        if not queue:
+            return False
+        return _requester_blocks(queue[0], clicker_id)
+
+
 def submit_pending(session_key: str, approval: dict):
     """Store a pending approval request for a session."""
     with _lock:
         _pending[session_key] = approval
 
 
-def approve_session(session_key: str, pattern_key: str):
-    """Approve a pattern for this session only."""
+def approve_session(session_key: str, pattern_key: str, requester_id: str = ""):
+    """Approve a pattern for exactly one requester scope in this session.
+
+    The empty scope is for local operator sessions only. Gateway lookups never
+    inherit it, so a local or legacy grant cannot authorize another participant
+    in a shared authenticated conversation.
+    """
     with _lock:
-        _session_approved.setdefault(session_key, set()).add(pattern_key)
+        _session_approved.setdefault((session_key, requester_id or ""), set()).add(pattern_key)
 
 
 def _release_permission_mode_dependents(session_key: str) -> None:
@@ -263,7 +353,8 @@ def clear_session(session_key: str) -> None:
     if not session_key:
         return
     with _lock:
-        _session_approved.pop(session_key, None)
+        for key in [k for k in _session_approved if k[0] == session_key]:
+            _session_approved.pop(key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
@@ -323,17 +414,42 @@ def _permanent_set() -> set:
     return approved
 
 
-def is_approved(session_key: str, pattern_key: str) -> bool:
-    """Session-scoped or permanent approval. Accepts the canonical key and the legacy
-    regex-derived key so existing command_allowlist entries survive key migrations."""
+def is_approved(session_key: str, pattern_key: str, requester_id: str = "") -> bool:
+    """Check the exact requester scope for an approval.
+
+    ``command_allowlist`` remains an explicit local-operator policy. Old
+    global entries are therefore honored only for local/unidentified sessions;
+    authenticated gateway requesters use their own requester-scoped permanent
+    approvals and never inherit global or empty-session entries.
+    """
+    requester_id = str(requester_id or "")
     aliases = _approval_key_aliases(pattern_key)
+    from tools.approval_context import _get_require_requester_match, _is_gateway_approval_context
+    if not requester_id and _is_gateway_approval_context() and _get_require_requester_match():
+        return False
     with _lock:
-        approved = _permanent_set() | _session_approved.get(session_key, set())
-    return any(alias in approved for alias in aliases)
+        permanent = _requester_permanent_set(requester_id) if requester_id else _permanent_set()
+        session_approvals = _session_approved.get((session_key, requester_id), set())
+        return any(alias in permanent or alias in session_approvals for alias in aliases)
+
+
+def permanent_patterns_for_requester(requester_id: str = "") -> set:
+    """Return permanent command patterns visible to this approval requester.
+
+    This is the command-text matcher seam; unlike :func:`is_approved`, callers
+    cannot accidentally inspect the local global allowlist for a remote
+    authenticated gateway user.
+    """
+    requester_id = str(requester_id or "")
+    from tools.approval_context import _get_require_requester_match, _is_gateway_approval_context
+    if not requester_id and _is_gateway_approval_context() and _get_require_requester_match():
+        return set()
+    with _lock:
+        return set(_requester_permanent_set(requester_id) if requester_id else _permanent_set())
 
 
 def approve_permanent(pattern_key: str):
-    """Add a pattern to the permanent allowlist."""
+    """Add an explicit local-operator pattern to the permanent allowlist."""
     with _lock:
         _permanent_set().add(pattern_key)
 
@@ -346,19 +462,28 @@ def load_permanent(patterns: set):
         governing.update(patterns)
 
 
-def _persist_choice(session_key: str, choice: str, warnings: list[tuple]) -> None:
-    """Persist a human ``session``/``always`` choice for each ``(key, _, is_tirith)``. Tirith
-    findings are session-max by design (no broad permanent allowlisting of content-level
-    findings), so ``always`` downgrades them to session. ``once`` persists nothing."""
+def _persist_choice(session_key: str, choice: str, warnings: list[tuple], requester_id: str = "") -> None:
+    """Persist a human ``session``/``always`` choice at its requester scope.
+
+    Legacy ``command_allowlist`` entries are local operator policy, not evidence
+    that an authenticated remote principal consented. New remote ``always``
+    choices persist under ``approvals.requester_allowlist`` at the exact
+    ``platform:principal`` namespace; local choices keep the documented
+    ``command_allowlist`` behavior.
+    """
     for key, _, is_tirith in warnings:
         if choice not in ("session", "always"):
             continue
-        approve_session(session_key, key)
+        approve_session(session_key, key, requester_id)
         if choice == "always" and not is_tirith:
-            approve_permanent(key)
-            with _lock:
-                snapshot = set(_permanent_set())
-            save_permanent_allowlist(snapshot)
+            if requester_id:
+                approve_requester_permanent(key, requester_id)
+                save_requester_permanent_allowlist(requester_id)
+            else:
+                approve_permanent(key)
+                with _lock:
+                    snapshot = set(_permanent_set())
+                save_permanent_allowlist(snapshot)
 
 
 # --- Config persistence for permanent allowlist ---------------------------------------------------------------------
@@ -385,6 +510,65 @@ def _read_permanent_allowlist() -> set:
         logger.warning("Recovered legacy string command_allowlist; re-save it as a list of strings.")
     return set(raw)
 
+def _read_requester_permanent_allowlist(config: dict | None = None) -> dict[str, set]:
+    """Read qualified ``platform:principal`` permanent grants from the active profile.
+
+    ``command_allowlist`` deliberately remains a local operator policy. Legacy
+    global entries are never migrated or implicitly applied to authenticated
+    gateway requesters; operators can explicitly configure scoped entries here.
+    """
+    if config is None:
+        from hermes_cli.config import load_config_readonly
+        config = load_config_readonly()
+    approvals = config.get("approvals") if isinstance(config, dict) else None
+    raw = approvals.get("requester_allowlist") if isinstance(approvals, dict) else {}
+    if not isinstance(raw, dict):
+        if raw not in (None, {}):
+            logger.warning("Ignoring malformed approvals.requester_allowlist; configure a mapping of qualified principals to lists.")
+        return {}
+    return {
+        str(requester): set(patterns)
+        for requester, patterns in raw.items()
+        if isinstance(requester, str) and ":" in requester
+        and isinstance(patterns, list) and all(isinstance(pattern, str) for pattern in patterns)
+    }
+
+
+def _requester_permanent_key(requester_id: str) -> str:
+    """Return the trusted ``platform:principal`` persistence namespace, or ``""``."""
+    requester_id = str(requester_id or "").strip()
+    platform = approval_context._get_session_platform().strip().lower()
+    return f"{platform}:{requester_id}" if platform and requester_id else ""
+
+
+def _requester_permanent_map() -> dict[str, set]:
+    """Permanent grants for the active profile, keyed by qualified principal."""
+    key = _baseline_key()
+    scoped = _requester_permanent_approved_by_home.get(key)
+    if scoped is None:
+        try:
+            scoped = _read_requester_permanent_allowlist()
+        except Exception as exc:
+            logger.warning("Failed to load requester approval allowlist: %s", exc)
+            scoped = {}
+        _requester_permanent_approved_by_home[key] = scoped
+    return scoped
+
+
+def _requester_permanent_set(requester_id: str) -> set:
+    """Return grants for this platform-qualified requester, never raw/global."""
+    scope = _requester_permanent_key(requester_id)
+    return _requester_permanent_map().get(scope, set()) if scope else set()
+
+
+def approve_requester_permanent(pattern_key: str, requester_id: str) -> None:
+    """Persist a remote ``always`` decision for one verified platform principal."""
+    scope = _requester_permanent_key(requester_id)
+    if not scope:
+        return
+    with _lock:
+        _requester_permanent_map().setdefault(scope, set()).add(pattern_key)
+
 
 # What ``command_allowlist`` held the last time this process synchronised with the
 # file, per profile home ("" = the unscoped launch profile). Everything in the
@@ -393,6 +577,7 @@ def _read_permanent_allowlist() -> set:
 # granted this here" from "this was on disk when we started, and may since have
 # been revoked".
 _permanent_baseline_by_home: dict[str, set] = {}
+_requester_permanent_baseline_by_home: dict[str, dict[str, set]] = {}
 
 
 def _baseline_key() -> str:
@@ -401,13 +586,22 @@ def _baseline_key() -> str:
 
 
 def load_permanent_allowlist() -> set:
-    """Load ``command_allowlist`` from config and sync it into the approval state
-    so is_approved() honors 'always' choices from previous sessions."""
+    """Load local and requester-scoped permanent approvals from config.
+
+    Existing ``command_allowlist`` entries stay local-only: they are not
+    silently upgraded into grants for every authenticated gateway user.
+    """
     try:
         patterns = _read_permanent_allowlist()
+        requester_patterns = _read_requester_permanent_allowlist()
         load_permanent(patterns)
         with _lock:
-            _permanent_baseline_by_home[_baseline_key()] = set(patterns)
+            key = _baseline_key()
+            _permanent_baseline_by_home[key] = set(patterns)
+            _requester_permanent_approved_by_home[key] = requester_patterns
+            _requester_permanent_baseline_by_home[key] = {
+                requester: set(keys) for requester, keys in requester_patterns.items()
+            }
         return patterns
     except Exception as e:
         logger.warning("Failed to load permanent allowlist: %s", e)
@@ -446,6 +640,34 @@ def save_permanent_allowlist(patterns: set):
             governing.update(merged)
     except Exception as e:
         logger.warning("Could not save allowlist: %s", e)
+
+def save_requester_permanent_allowlist(requester_id: str) -> None:
+    """Save only one qualified principal's newly granted permanent keys."""
+    scope = _requester_permanent_key(requester_id)
+    if not scope:
+        return
+    try:
+        from hermes_cli.config import load_config, save_config
+        config = load_config()
+        approvals = config.setdefault("approvals", {})
+        if not isinstance(approvals, dict):
+            logger.warning("Could not save requester allowlist: approvals config is not a mapping.")
+            return
+        on_disk = _read_requester_permanent_allowlist(config)
+        with _lock:
+            key = _baseline_key()
+            current = set(_requester_permanent_set(requester_id))
+            baseline = _requester_permanent_baseline_by_home.get(key, {}).get(scope, set())
+            merged = on_disk.get(scope, set()) | (current - baseline)
+            on_disk[scope] = merged
+            approvals["requester_allowlist"] = {
+                principal: sorted(patterns) for principal, patterns in sorted(on_disk.items()) if patterns
+            }
+            save_config(config)
+            _requester_permanent_approved_by_home[key] = on_disk
+            _requester_permanent_baseline_by_home.setdefault(key, {})[scope] = set(merged)
+    except Exception as exc:
+        logger.warning("Could not save requester allowlist: %s", exc)
 
 
 # --- Bypass check (yolo / mode=off) ---------------------------------------------------------------------------------
@@ -741,17 +963,23 @@ def _smart_gate(spec: _GateSpec, command: str, description: str, pattern_key: st
 def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], warnings: list[tuple],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
-                    is_ask: bool, smart: bool = False,
-                    permanent_capable: bool = True, pending_body=None) -> dict:
+                    is_ask: bool, smart: bool = False, permanent_capable: bool = True,
+                    one_operation: bool = False, pending_body=None, requester_id: str = "") -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``warnings`` are the ``(key, _, is_tirith)`` tuples :func:`_persist_choice` stores on
     session/always. ``permanent_capable`` hides [a]lways when no key could be permanently
-    allowlisted (pure-tirith prompts); a smart-DENY owner override reduces every surface to
-    once/deny and persists nothing. ``pending_body`` is a thunk, built only once a human is
-    actually asked, so a smart APPROVE never pays for redacting a large script.
+    allowlisted (pure-tirith prompts); ``one_operation`` limits every surface to once/deny,
+    including stale text/native clients that try to submit a broader choice. A smart-DENY
+    owner override has the same one-operation constraint. ``pending_body`` is a thunk, built
+    only once a human is actually asked, so a smart APPROVE never pays for redacting a large script.
     """
     from agent.redact import redact_sensitive_text
+    if is_gateway and not requester_id and approval_context._get_require_requester_match():
+        return _blocked(
+            f"BLOCKED: approval required ({description}) but this gateway request has no verified requester identity.",
+            pattern_key=pattern_key, description=description,
+        )
 
     smart_denied = False
     if smart:
@@ -760,7 +988,11 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         if result is not None:
             return result
     pending_body = pending_body() if pending_body else None
-    allow_permanent = permanent_capable and not smart_denied
+    allow_session = not smart_denied and not one_operation
+    allow_permanent = (
+        permanent_capable and not smart_denied and not one_operation
+        and (not requester_id or bool(_requester_permanent_key(requester_id)))
+    )
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -773,9 +1005,9 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                        outcome=outcome, **extra)
 
     def grant(choice: str) -> dict:
-        # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
-        if not smart_denied:
-            _persist_choice(session_key, choice, warnings)
+        if one_operation or smart_denied:
+            choice = "once"
+        _persist_choice(session_key, choice, warnings, requester_id)
         if spec.user_approved:
             return _user_approved(session_key, description)
         return _approved()
@@ -784,7 +1016,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         attempt = _present_with_selected_transport(
             command=command, description=description, pattern_key=pattern_key, pattern_keys=pattern_keys,
             session_key=session_key, surface="gateway" if (is_gateway or is_ask) else "cli",
-            allow_session=not smart_denied, allow_permanent=allow_permanent,
+            allow_session=allow_session, allow_permanent=allow_permanent,
         )
         choice, denied = _transport_choice(attempt, pattern_key=pattern_key, description=description)
         if denied is not None:
@@ -804,14 +1036,14 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         display_description = redact_sensitive_text(description)
         notify_cb = _gateway_notify_cb(session_key)
         if notify_cb is not None:
-            # Smart DENY overrides are one-operation decisions, so the UI must not offer a
-            # permanent scope. Session approval is safe for every non-Smart-DENY prompt —
-            # including pure-tirith ones, where persistence already caps scope at session.
+            # Smart-denied and strict one-operation prompts expose only once/deny.
             data = {
                 "command": display_command, "pattern_key": pattern_key,
                 "pattern_keys": pattern_keys, "description": display_description,
-                "allow_permanent": permanent_capable and not smart_denied,
-                "allow_session": not smart_denied,
+                "allow_permanent": allow_permanent,
+                "allow_session": allow_session,
+                "requester_id": requester_id,
+                "requester_required": approval_context._get_require_requester_match(),
             }
             if smart_denied:
                 data["smart_denied"] = True
@@ -854,8 +1086,10 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     hook_kwargs = dict(command=prompt_command, description=prompt_description, pattern_key=pattern_key,
                        pattern_keys=list(pattern_keys), session_key=session_key, surface="cli")
     approval_context._fire_approval_hook("pre_approval_request", **hook_kwargs)
-    choice = prompt_dangerous_approval(prompt_command, prompt_description, allow_permanent=allow_permanent,
-                                       smart_denied=smart_denied, approval_callback=approval_callback)
+    choice = prompt_dangerous_approval(
+        prompt_command, prompt_description, allow_permanent=allow_permanent,
+        allow_session=allow_session, smart_denied=smart_denied, approval_callback=approval_callback,
+    )
     approval_context._fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
     if choice == "timeout":
         return deny(spec.cli_timeout, "timeout")
@@ -884,6 +1118,7 @@ def _run_approval_gate(
     advice: str = "Find an alternative approach that avoids this action.",
     cron_deny_message: str = "", single_query_deny_message: str = "", unattended_deny_message: str = "",
     autoapprove_log_prefix: str, fail_closed_when_no_human: bool = False, no_human_block_message: str = "",
+    require_human: bool = False,
 ) -> dict:
     """Shared human-approval gate for a flagged action (tool call or write): decision core for
     :func:`request_tool_approval` and the file-tool write gates.
@@ -894,15 +1129,43 @@ def _run_approval_gate(
     context BLOCKS instead of auto-approving, so a plugin-flagged action never runs ungated.
     Unattended deny text is ``ctx.block_message(subject, noun, advice)`` unless the caller passes
     an explicit ``*_deny_message`` (the file-tool write gates word their own).
+
+    ``require_human``: strict per-operation human confirmation.  When True, every automatic
+    bypass is skipped — yolo, mode=off, session-cache, cron/unattended auto-approve — so
+    only a real interactive CLI prompt or gateway round-trip can approve the action.  If no
+    human surface is available, the action is blocked.  Session/permanent persistence is
+    disabled (``permanent_capable=False``): each invocation requires its own fresh approval.
+    Intended for mutating operations whose exact scope must be confirmed by the operator
+    every time (e.g. batch mail moves, plugin escalations with resolved targets).
     """
+    session_key = get_current_session_key()
+    requester_id = get_current_requester_id()
+
+    if require_human:
+        # Strict mode: skip every automatic bypass.  Only a real human decision is accepted.
+        approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
+        if not is_cli and not is_gateway and not is_ask:
+            logger.warning("require_human approval (pattern: %s): %s — no interactive user/gateway "
+                           "present; BLOCKED.", pattern_key, description)
+            return _blocked(
+                no_human_block_message or (
+                    f"BLOCKED: human confirmation required ({description}) but no "
+                    "interactive user or gateway is present."),
+                pattern_key=pattern_key, description=description)
+        return _human_decision(
+            _ACTION_GATE, command=display_target, description=description, pattern_key=pattern_key,
+            pattern_keys=[pattern_key], warnings=[(pattern_key, None, False)], session_key=session_key,
+            approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
+            requester_id=requester_id, permanent_capable=False, one_operation=True,
+        )
+
     # Hardline blocks are the caller's job BEFORE this gate, so yolo here only skips the recoverable approval layer.
     # ``approvals.mode: off`` is the third bypass source (the Desktop "Approvals: off" toggle writes it); the shell
     # guards honour it, so every action routed through this gate (computer_use, plugin rules, SSH-config writes,
     # dangerous-pattern prompts) must too, or "off" still prompts on those surfaces.
     if _yolo_active() or approval_context._get_approval_mode() == "off":
         return _approved()
-    session_key = get_current_session_key()
-    if is_approved(session_key, pattern_key):
+    if is_approved(session_key, pattern_key, requester_id):
         return _approved()
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
@@ -947,6 +1210,7 @@ def _run_approval_gate(
         _ACTION_GATE, command=display_target, description=description, pattern_key=pattern_key,
         pattern_keys=[pattern_key], warnings=[(pattern_key, None, False)], session_key=session_key,
         approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
+        requester_id=requester_id,
     )
 
 
@@ -1012,7 +1276,8 @@ def check_dangerous_command(command: str, env_type: str,
     )
 
 
-def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", approval_callback=None) -> dict:
+def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "",
+                          approval_callback=None, require_human: bool = False) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
     Entry point for a plugin ``pre_tool_call`` hook returning ``{"action": "approve", ...}``:
@@ -1022,6 +1287,12 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
     non-gateway context fails CLOSED. ``rule_key`` controls the ``[a]lways`` allowlist grain;
     when empty it is ``tool_name`` + a hash of ``reason`` so DISTINCT reasons on the same tool
     persist independently. Returns the ``check_dangerous_command`` result shape.
+
+    ``require_human``: when True, every automatic bypass (yolo, mode=off, session cache,
+    cron/unattended auto-approve) is skipped — only a real interactive CLI prompt or gateway
+    round-trip can approve the action.  Each invocation requires its own fresh human decision;
+    session/permanent persistence is disabled.  Intended for mutating operations whose exact
+    scope (resolved targets, account, mailboxes) must be confirmed by the operator every time.
     """
     description = reason or f"Plugin requires approval for {tool_name}"
     if not rule_key:
@@ -1034,9 +1305,10 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
         display_target=f"<{tool_name}> (plugin approval rule)", approval_callback=approval_callback,
         subject=subject, advice="Find an alternative approach.",
         autoapprove_log_prefix=f"plugin-escalated tool call '{tool_name}' in non-interactive non-gateway context",
-        fail_closed_when_no_human=True,
+        fail_closed_when_no_human=not require_human,
         no_human_block_message=(f"BLOCKED: {subject} but no interactive user or gateway is present "
                                 "to approve it. A plugin flagged this action for human confirmation."),
+        require_human=require_human,
     )
 
 
@@ -1112,13 +1384,14 @@ def check_all_command_guards(command: str, env_type: str,
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
     warnings = []
     session_key = get_current_session_key()
+    requester_id = get_current_requester_id()
     if tirith_result["action"] in {"block", "warn"}:
         findings = tirith_result.get("findings") or []
         rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
         tirith_key = f"tirith:{rule_id}"
-        if not is_approved(session_key, tirith_key):
+        if not is_approved(session_key, tirith_key, requester_id):
             warnings.append((tirith_key, _format_tirith_description(tirith_result), True))
-    if is_dangerous and not is_approved(session_key, pattern_key):
+    if is_dangerous and not is_approved(session_key, pattern_key, requester_id):
         warnings.append((pattern_key, description, False))
     if not warnings:
         return _approved()
@@ -1136,6 +1409,7 @@ def check_all_command_guards(command: str, env_type: str,
         session_key=session_key, approval_callback=approval_callback,
         is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask, smart=approval_mode == "smart",
         permanent_capable=any(not is_t for _, _, is_t in warnings),
+        requester_id=requester_id,
     )
 
 
@@ -1194,12 +1468,13 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
         return _approved()
 
     session_key = get_current_session_key()
+    requester_id = get_current_requester_id()
     # Built only past the early-return gates so common paths don't copy a potentially-large script into this string.
     command = f"execute_code <<'PY'\n{code}\nPY"
 
     # Without this, "Approve session" / "Always" choices are stored but never
     # consulted, so every execute_code call re-prompts (#39275).
-    if is_approved(session_key, pattern_key):
+    if is_approved(session_key, pattern_key, requester_id):
         return _approved()
 
     # Smart mode: an APPROVE only suppresses the redundant whole-script prompt; the per-call terminal() guards still
@@ -1212,6 +1487,7 @@ def check_execute_code_guard(code: str, env_type: str, has_host_access: bool = F
         approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
         smart=approval_mode == "smart",
         pending_body=lambda: f"**Code:**\n```python\n{redact_sensitive_text(code)}\n```",
+        requester_id=requester_id,
     )
 
 

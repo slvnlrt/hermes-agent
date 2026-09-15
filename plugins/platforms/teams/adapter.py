@@ -576,7 +576,7 @@ class TeamsAdapter(BasePlatformAdapter):
     async def _on_card_action(
         self, ctx: "ActivityContext[AdaptiveCardInvokeActivity]"
     ) -> "InvokeResponse[AdaptiveCardActionMessageResponse]":
-        from tools.approval import resolve_gateway_approval, has_blocking_approval
+        from tools.approval import resolve_gateway_approval, has_blocking_approval, REQUESTER_MISMATCH, gateway_approval_requester_blocks
 
         data = ctx.activity.value.action.data or {}
         hermes_action = data.get("hermes_action", "")
@@ -591,7 +591,12 @@ class TeamsAdapter(BasePlatformAdapter):
             return self._invoke_message("Unknown action.")
         if not has_blocking_approval(session_key):
             return self._invoke_card([TextBlock(text="⚠️ Approval already resolved or expired.", wrap=True)])
-        resolve_gateway_approval(session_key, choice)
+        clicker_id = getattr(ctx.activity.from_, "aad_object_id", None) or getattr(ctx.activity.from_, "id", None)
+        count = resolve_gateway_approval(session_key, choice, clicker_id=clicker_id)
+        if count == REQUESTER_MISMATCH:
+            return self._invoke_card([TextBlock(text="⚠️ Only the user who triggered this command can approve/deny it.", wrap=True)])
+        if count <= 0:
+            return self._invoke_card([TextBlock(text="⚠️ Approval already resolved or expired.", wrap=True)])
         body = _approval_body(data.get("cmd", ""), data.get("desc", ""))
         body.append(TextBlock(text=_APPROVAL_LABELS[choice], wrap=True, weight="Bolder"))
         return self._invoke_card(body)

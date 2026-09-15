@@ -899,14 +899,14 @@ class TestDefaultInteractionDispatch:
 
 
     @pytest.mark.asyncio
-    async def test_approval_click_once_maps_to_once(self):
-        """'allow-once' button → resolve_gateway_approval(session, 'once')."""
+    async def test_approval_click_once_maps_to_verified_operator(self):
+        """'allow-once' passes the interaction's verified operator id."""
         adapter = self._make_adapter()
 
         resolve_calls = []
 
-        def fake_resolve(session_key, choice, resolve_all=False):
-            resolve_calls.append((session_key, choice, resolve_all))
+        def fake_resolve(session_key, choice, resolve_all=False, clicker_id=None):
+            resolve_calls.append((session_key, choice, resolve_all, clicker_id))
             return 1
 
         # Patch the *module-level* function that _default_interaction_dispatch
@@ -926,7 +926,7 @@ class TestDefaultInteractionDispatch:
         finally:
             tools.approval.resolve_gateway_approval = orig
 
-        assert resolve_calls == [("agent:main:qqbot:dm:u-42", "once", False)]
+        assert resolve_calls == [("agent:main:qqbot:dm:u-42", "once", False, "u-42")]
 
 
     @pytest.mark.asyncio
@@ -934,8 +934,8 @@ class TestDefaultInteractionDispatch:
         adapter = self._make_adapter()
         resolve_calls = []
 
-        def fake_resolve(session_key, choice, resolve_all=False):
-            resolve_calls.append((session_key, choice, resolve_all))
+        def fake_resolve(session_key, choice, resolve_all=False, clicker_id=None):
+            resolve_calls.append((session_key, choice, resolve_all, clicker_id))
             return 1
 
         import tools.approval
@@ -1020,88 +1020,87 @@ class TestProfileNamespaceApprovalAuthz:
         assert self._parse("") is None
 
     @pytest.mark.asyncio
-    async def test_c2c_click_on_named_profile_key_resolves(self):
-        """Approval click carrying a named-profile c2c key resolves (was rejected)."""
+    async def test_c2c_click_on_named_profile_key_resolves_requester_approval(self):
+        """A verified c2c requester resolves its own named-profile approval."""
         adapter = self._make_adapter()
+        session_key = "agent:coder:qqbot:c2c:u-42"
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
 
-        resolve_calls = []
-
-        def fake_resolve(session_key, choice, resolve_all=False):
-            resolve_calls.append((session_key, choice, resolve_all))
-            return 1
-
-        import tools.approval
-        orig = tools.approval.resolve_gateway_approval
-        tools.approval.resolve_gateway_approval = fake_resolve
+        entry = _ApprovalEntry(
+            {
+                "command": "rm -rf /tmp/example",
+                "description": "test approval",
+                "requester_id": "u-42",
+                "requester_required": True,
+            }
+        )
+        with approval._lock:
+            approval._gateway_queues.pop(session_key, None)
+            approval._gateway_queues[session_key] = [entry]
         try:
             from gateway.platforms.qqbot.keyboards import parse_interaction_event
             event = parse_interaction_event({
                 "id": "i",
                 "chat_type": 2,
                 "user_openid": "u-42",
-                "data": {"resolved": {"button_data": "approve:agent:coder:qqbot:c2c:u-42:allow-once"}},
+                "data": {"resolved": {"button_data": f"approve:{session_key}:allow-once"}},
             })
             await adapter._default_interaction_dispatch(event)
-        finally:
-            tools.approval.resolve_gateway_approval = orig
 
-        assert resolve_calls == [("agent:coder:qqbot:c2c:u-42", "once", False)]
+            assert entry.event.is_set()
+            assert entry.result == "once"
+            assert not approval.has_blocking_approval(session_key)
+        finally:
+            with approval._lock:
+                approval._gateway_queues.pop(session_key, None)
 
     @pytest.mark.asyncio
-    async def test_group_click_on_named_profile_key_authorizes_session_owner(self):
-        """Group approval click under a named profile authorizes the session owner."""
+    async def test_group_click_on_named_profile_key_keeps_pending_for_wrong_actor_then_resolves_owner(self):
+        """A group member cannot resolve the owner's prompt; the owner can."""
         adapter = self._make_adapter()
+        session_key = "agent:coder:qqbot:group:g-1:owner"
+        from tools import approval
+        from tools.approval_gateway_wait import _ApprovalEntry
 
-        resolve_calls = []
-
-        def fake_resolve(session_key, choice, resolve_all=False):
-            resolve_calls.append((session_key, choice, resolve_all))
-            return 1
-
-        import tools.approval
-        orig = tools.approval.resolve_gateway_approval
-        tools.approval.resolve_gateway_approval = fake_resolve
+        entry = _ApprovalEntry(
+            {
+                "command": "rm -rf /tmp/example",
+                "description": "test approval",
+                "requester_id": "owner",
+                "requester_required": True,
+            }
+        )
+        with approval._lock:
+            approval._gateway_queues.pop(session_key, None)
+            approval._gateway_queues[session_key] = [entry]
         try:
             from gateway.platforms.qqbot.keyboards import parse_interaction_event
-            event = parse_interaction_event({
-                "id": "i", "chat_type": 1,
-                "group_openid": "g-1",
-                "group_member_openid": "owner",
-                "data": {"resolved": {"button_data": "approve:agent:coder:qqbot:group:g-1:owner:allow-once"}},
-            })
-            await adapter._default_interaction_dispatch(event)
-        finally:
-            tools.approval.resolve_gateway_approval = orig
-
-        assert resolve_calls == [("agent:coder:qqbot:group:g-1:owner", "once", False)]
-
-    @pytest.mark.asyncio
-    async def test_named_profile_key_still_rejects_wrong_operator(self):
-        """The namespace relaxation must not weaken the operator check."""
-        adapter = self._make_adapter()
-
-        resolve_calls = []
-
-        def fake_resolve(session_key, choice, resolve_all=False):
-            resolve_calls.append((session_key, choice, resolve_all))
-            return 1
-
-        import tools.approval
-        orig = tools.approval.resolve_gateway_approval
-        tools.approval.resolve_gateway_approval = fake_resolve
-        try:
-            from gateway.platforms.qqbot.keyboards import parse_interaction_event
-            event = parse_interaction_event({
-                "id": "i", "chat_type": 1,
+            wrong_actor = parse_interaction_event({
+                "id": "wrong", "chat_type": 1,
                 "group_openid": "g-1",
                 "group_member_openid": "attacker",
-                "data": {"resolved": {"button_data": "approve:agent:coder:qqbot:group:g-1:owner:allow-once"}},
+                "data": {"resolved": {"button_data": f"approve:{session_key}:allow-once"}},
             })
-            await adapter._default_interaction_dispatch(event)
-        finally:
-            tools.approval.resolve_gateway_approval = orig
+            await adapter._default_interaction_dispatch(wrong_actor)
 
-        assert resolve_calls == []
+            assert approval.has_blocking_approval(session_key)
+            assert not entry.event.is_set()
+
+            owner = parse_interaction_event({
+                "id": "owner", "chat_type": 1,
+                "group_openid": "g-1",
+                "group_member_openid": "owner",
+                "data": {"resolved": {"button_data": f"approve:{session_key}:allow-once"}},
+            })
+            await adapter._default_interaction_dispatch(owner)
+
+            assert entry.event.is_set()
+            assert entry.result == "once"
+            assert not approval.has_blocking_approval(session_key)
+        finally:
+            with approval._lock:
+                approval._gateway_queues.pop(session_key, None)
 
 
 class TestSendExecApproval:

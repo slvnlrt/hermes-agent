@@ -2311,8 +2311,14 @@ class MatrixAdapter(BasePlatformAdapter):
         if choice is None:
             return handled
         try:
-            from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(prompt.session_key, choice)
+            from tools.approval import resolve_gateway_approval, REQUESTER_MISMATCH
+            count = resolve_gateway_approval(prompt.session_key, choice, clicker_id=sender)
+            if count == REQUESTER_MISMATCH:
+                try:
+                    await self._send_notice(room_id, "Only the user who triggered this command can approve/deny it.")
+                except Exception:
+                    pass
+                return True
             if count:
                 prompt.resolved = True
                 self._approval_prompts_by_event.pop(reacts_to, None)

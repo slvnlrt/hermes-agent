@@ -1580,8 +1580,17 @@ DEFAULT_CONFIG = {
         # / Cancel via tools.slash_confirm; native buttons on Telegram/ Discord/Slack). "Always
         # Approve" → false. HERMES_TUI_NO_CONFIRM=1 skips the TUI modal.
         "destructive_slash_confirm": True,
+        # Whether an approval may only be resolved by the verified user who triggered the
+        # command. When true (default), a missing callback identity and a click from a different
+        # participant both fail closed. Set false only for a deliberately shared approval policy.
+        "require_requester_match": True,
+        # Remote "Always" choices are persisted only for this exact verified platform principal,
+        # using "platform:principal" mapping keys. Legacy top-level command_allowlist entries
+        # remain local-operator policy and do not authorize authenticated gateway requesters.
+        "requester_allowlist": {},
     },
-    # Permanently allowed dangerous command patterns (added via "always" approval).
+    # Explicit local-operator permanent command patterns. Legacy global entries remain local-only;
+    # gateway "Always" choices are stored under approvals.requester_allowlist instead.
     "command_allowlist": [],
     # User-defined quick commands that bypass the agent loop (type: exec only).
     "quick_commands": {},

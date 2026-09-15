@@ -6073,8 +6073,14 @@ def _define_discord_view_classes() -> None:
             # Unblock the waiting agent thread FIRST. A click after the approval
             # wait timed out (count == 0) must not claim "Approved".
             try:
-                from tools.approval import resolve_gateway_approval
-                count = resolve_gateway_approval(self.session_key, choice)
+                from tools.approval import resolve_gateway_approval, REQUESTER_MISMATCH
+                clicker_id = str(interaction.user.id) if interaction.user else None
+                count = resolve_gateway_approval(self.session_key, choice, clicker_id=clicker_id)
+                if count == REQUESTER_MISMATCH:
+                    await interaction.response.send_message(
+                        "Only the user who triggered this command can approve/deny it.", ephemeral=True)
+                    self.resolved = False
+                    return
                 logger.info(
                     "Discord button resolved %d approval(s) for session %s (choice=%s, user=%s)",
                     count, self.session_key, choice, interaction.user.display_name,

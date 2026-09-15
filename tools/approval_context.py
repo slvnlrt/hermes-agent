@@ -27,6 +27,12 @@ _approval_tool_call_id: contextvars.ContextVar[str] = _ctx("approval_tool_call_i
 # hooks so observer plugins attach marks to the REAL session scope — otherwise they fall back to a synthetic "default"
 # session whose scope never closes, so close-time exporters never ship them.
 _approval_session_id: contextvars.ContextVar[str] = _ctx("approval_session_id")
+# Verified platform identity of the user whose message triggered the current
+# approval request. Set by the gateway alongside the session key from the
+# adapter's callback-capable primary ``source.user_id``. An empty value is
+# valid only for local operator surfaces; requester-bound gateways fail closed
+# rather than treating it as a wildcard.
+_approval_requester_id: contextvars.ContextVar[str] = _ctx("approval_requester_id")
 # Interactive-CLI flag. Concurrent ACP sessions share a ThreadPoolExecutor, so mutating
 # os.environ["HERMES_INTERACTIVE"] races: one session's `finally` restore can clobber another's set mid-run, dropping
 # it onto the non-interactive auto-approve path so a dangerous command runs without the approval callback firing
@@ -80,6 +86,31 @@ def set_current_session_key(session_key: str) -> contextvars.Token[str]:
 def reset_current_session_key(token: contextvars.Token[str]) -> None:
     """Restore the prior approval session key context."""
     _approval_session_key.reset(token)
+
+
+def set_current_requester_id(requester_id: str) -> contextvars.Token[str]:
+    """Bind the verified requester id for the current context.
+
+    Symmetric to :func:`set_current_session_key`.  The gateway sets this from
+    the message ``source`` so an approval created during this turn records the
+    verified principal that requested it.  Pass ``""`` when there is no verified
+    requester (DM 1:1, CLI) — no binding is then enforced at resolution.
+    """
+    return _approval_requester_id.set(requester_id or "")
+
+
+def reset_current_requester_id(token: contextvars.Token[str]) -> None:
+    """Restore the prior requester id context."""
+    _approval_requester_id.reset(token)
+
+
+def get_current_requester_id() -> str:
+    """Return the verified requester id bound to the current context.
+
+    Empty string when unset (CLI, cron, DM 1:1, legacy callers) — callers treat
+    this as "no requester binding" and skip the clicker==requester check.
+    """
+    return _approval_requester_id.get()
 
 
 _Tokens = tuple[contextvars.Token[str], contextvars.Token[str], contextvars.Token[str]]
@@ -282,6 +313,21 @@ def _get_unattended_approval_mode() -> str:
     deny — an unattended session never silently runs a flagged action unless the
     operator explicitly trusts it."""
     return _binary_approval_mode("unattended_mode")
+
+
+def _get_require_requester_match() -> bool:
+    """Whether an approval may only be resolved by its verified requester.
+
+    Reads ``approvals.require_requester_match`` (default ``True``). When True,
+    a click or ``/approve`` must carry the exact verified requester identity;
+    missing gateway requester/clicker identities fail closed. Setting False is
+    the deliberate compatibility opt-out for shared approval authority.
+    """
+    try:
+        value = _get_approval_config().get("require_requester_match", True)
+    except Exception:
+        return True
+    return is_truthy_value(value) if not isinstance(value, bool) else value
 
 
 def _tirith_fail_open() -> bool:

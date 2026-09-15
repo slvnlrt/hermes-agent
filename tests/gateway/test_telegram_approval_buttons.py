@@ -238,6 +238,23 @@ class TestTelegramApprovalCallback:
         assert "Alice\\_Bob" in edit_kwargs["text"]
         assert "Approved once" in edit_kwargs["text"]
 
+    @pytest.mark.asyncio
+    async def test_wrong_requester_does_not_consume_native_prompt(self):
+        adapter = _make_adapter()
+        adapter._approval_state[8] = "agent:main:telegram:group:12345:99"
+        query = AsyncMock()
+        query.data = "ea:once:8"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock(id="999", first_name="Mallory")
+        query.answer = AsyncMock()
+        update = MagicMock(callback_query=query)
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            with patch("tools.approval.resolve_gateway_approval", return_value=-1):
+                await adapter._handle_callback_query(update, MagicMock())
+        assert 8 in adapter._approval_state
+        query.answer.assert_awaited()
+
 
     @pytest.mark.asyncio
     async def test_update_prompt_callback_not_affected(self, tmp_path):

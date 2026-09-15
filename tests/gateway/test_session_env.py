@@ -273,3 +273,25 @@ def test_cron_session_set_clear_and_reset_tristate(monkeypatch):
     reset_session_vars()
     assert get_session_env("HERMES_CRON_SESSION") == "1"
 
+
+
+# ---------------------------------------------------------------------------
+# get_verified_principal accessor
+# ---------------------------------------------------------------------------
+
+
+def test_get_verified_principal_returns_user_id(monkeypatch):
+    """get_verified_principal reads HERMES_SESSION_USER_ID from the contextvar."""
+    from gateway.session_context import get_verified_principal
+    tokens = set_session_vars(user_id="U12345")
+    try:
+        assert get_verified_principal() == "U12345"
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_get_verified_principal_returns_default_when_unset():
+    """When no session is bound, get_verified_principal returns the default."""
+    from gateway.session_context import get_verified_principal
+    assert get_verified_principal() == ""
+    assert get_verified_principal("fallback") == "fallback"

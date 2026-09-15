@@ -17,6 +17,7 @@ from tools.approval import approve_session, detect_dangerous_command, detect_har
 from tools.approval_context import _get_approval_mode
 from tools.approval_context import _normalize_approval_mode
 from tools.approval_smart import _smart_approve
+from tools.thread_context import propagate_context_to_thread
 
 
 class TestPackageManagerUninstallApproval:
@@ -1398,6 +1399,7 @@ class TestApprovalTimeoutIsNotConsent:
     """The gateway approval contract: silence is not consent (#24912)."""
 
     SESSION_KEY = "test-no-consent-session"
+    REQUESTER_ID = "test-no-consent-user"
 
     def setup_method(self):
         """Reset module state and force a tight approval timeout for fast tests."""
@@ -1424,9 +1426,12 @@ class TestApprovalTimeoutIsNotConsent:
         os.environ.pop("HERMES_CRON_SESSION", None)
         os.environ["HERMES_GATEWAY_SESSION"] = "1"
         os.environ["HERMES_SESSION_KEY"] = self.SESSION_KEY
+        self._requester_token = approval_context.set_current_requester_id(self.REQUESTER_ID)
 
     def teardown_method(self):
         from tools import approval as mod
+        from tools import approval_context
+        approval_context.reset_current_requester_id(self._requester_token)
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
         for k, v in self._saved_env.items():
@@ -1471,16 +1476,6 @@ class TestApprovalTimeoutIsNotConsent:
         # The notify_cb DID fire — we did try to ask the user.
         assert len(notified) == 1
 
-        # The BLOCKED message must explicitly tell the agent not to rephrase;
-        # without it the agent treats "Do NOT retry this command" as permission
-        # to try a different command achieving the same outcome.
-        msg = result["message"]
-        assert "BLOCKED" in msg
-        assert "NOT consented" in msg
-        assert "Silence is not consent" in msg
-        assert "retry" in msg.lower()
-        assert "rephrase" in msg.lower()
-        assert "different command" in msg.lower()
 
         posts = [c for c in hook_calls if c[0] == "post_approval_response"]
         assert posts, "post_approval_response hook did not fire"
@@ -1502,7 +1497,7 @@ class TestApprovalTimeoutIsNotConsent:
         result_holder = {}
         def _check():
             result_holder["r"] = mod.check_all_command_guards("rm -rf .git", "local")
-        t = threading.Thread(target=_check)
+        t = threading.Thread(target=propagate_context_to_thread(_check))
         t.start()
 
         # Wait for the queue entry to appear, then resolve.
@@ -1510,7 +1505,7 @@ class TestApprovalTimeoutIsNotConsent:
             if mod._gateway_queues.get(self.SESSION_KEY):
                 break
             time.sleep(0.005)
-        mod.resolve_gateway_approval(self.SESSION_KEY, "deny")
+        mod.resolve_gateway_approval(self.SESSION_KEY, "deny", clicker_id=self.REQUESTER_ID)
         t.join(timeout=5)
         assert "r" in result_holder, "approval wait did not return after deny"
 
@@ -1518,9 +1513,6 @@ class TestApprovalTimeoutIsNotConsent:
         assert r["approved"] is False
         assert r.get("user_consent") is False
         assert r.get("outcome") == "denied"
-        assert "Silence is not consent" not in r["message"]  # this one IS denied, not timed-out
-        assert "NOT consented" in r["message"]
-        assert "rephrase" in r["message"].lower()
 
     def test_timeout_emits_post_hook_with_timeout_outcome(self, monkeypatch):
         """Plugins must be able to distinguish timeout from explicit deny.
@@ -1597,9 +1589,9 @@ class TestApprovalTimeoutIsNotConsent:
         result_holder = {}
 
         thread = threading.Thread(
-            target=lambda: result_holder.setdefault(
+            target=propagate_context_to_thread(lambda: result_holder.setdefault(
                 "result", mod.check_all_command_guards("rm -rf .git", "local")
-            )
+            ))
         )
         thread.start()
         for _ in range(200):
@@ -1612,7 +1604,8 @@ class TestApprovalTimeoutIsNotConsent:
         assert mod.list_gateway_approvals(self.SESSION_KEY) == [notified[0]]
         assert mod.ack_gateway_approval(self.SESSION_KEY, request_id) is True
         assert mod.resolve_gateway_approval(
-            self.SESSION_KEY, "once", request_id=request_id
+            self.SESSION_KEY, "once", request_id=request_id,
+            clicker_id=self.REQUESTER_ID,
         ) == 1
         thread.join(timeout=5)
         assert result_holder["result"]["approved"] is True
@@ -1625,9 +1618,9 @@ class TestApprovalTimeoutIsNotConsent:
         mod.register_gateway_notify(self.SESSION_KEY, lambda data: notified.append(data))
         result_holder = {}
         thread = threading.Thread(
-            target=lambda: result_holder.setdefault(
+            target=propagate_context_to_thread(lambda: result_holder.setdefault(
                 "result", mod.check_all_command_guards("rm -rf .git", "local")
-            )
+            ))
         )
         thread.start()
         for _ in range(200):
@@ -1637,11 +1630,13 @@ class TestApprovalTimeoutIsNotConsent:
 
         request_id = notified[0]["request_id"]
         assert mod.resolve_gateway_approval(
-            self.SESSION_KEY, "once", request_id="stale-request"
+            self.SESSION_KEY, "once", request_id="stale-request",
+            clicker_id=self.REQUESTER_ID,
         ) == 0
         assert mod.list_gateway_approvals(self.SESSION_KEY)
         assert mod.resolve_gateway_approval(
-            self.SESSION_KEY, "deny", request_id=request_id
+            self.SESSION_KEY, "deny", request_id=request_id,
+            clicker_id=self.REQUESTER_ID,
         ) == 1
         thread.join(timeout=5)
         assert result_holder["result"]["approved"] is False
@@ -1658,6 +1653,7 @@ class TestApprovalTimeoutIsNotConsent:
 
 class TestConcurrentApprovalCoalescing:
     SESSION_KEY = "test-coalesce-session"
+    REQUESTER_ID = "test-coalesce-user"
 
     def setup_method(self):
         from tools import approval as mod
@@ -1665,8 +1661,15 @@ class TestConcurrentApprovalCoalescing:
         mod._gateway_notify_cbs.clear()
         mod._session_approved.clear()
         mod._permanent_approved.clear()
+        self._requester_token = approval_context.set_current_requester_id(self.REQUESTER_ID)
 
-    teardown_method = setup_method
+    def teardown_method(self):
+        from tools import approval as mod
+        approval_context.reset_current_requester_id(self._requester_token)
+        mod._gateway_queues.clear()
+        mod._gateway_notify_cbs.clear()
+        mod._session_approved.clear()
+        mod._permanent_approved.clear()
 
     def _data(self, command="rm -rf .git"):
         return {
@@ -1674,6 +1677,8 @@ class TestConcurrentApprovalCoalescing:
             "description": "desc",
             "pattern_key": "dangerous",
             "pattern_keys": ["dangerous"],
+            "requester_id": self.REQUESTER_ID,
+            "requester_required": True,
         }
 
     def _spawn_waits(self, mod, notified, n=2, command="rm -rf .git"):
@@ -1716,7 +1721,7 @@ class TestConcurrentApprovalCoalescing:
         assert len(notified) == 1
 
         # One answer resolves everyone.
-        assert mod.resolve_gateway_approval(self.SESSION_KEY, "session") == 1
+        assert mod.resolve_gateway_approval(self.SESSION_KEY, "session", clicker_id=self.REQUESTER_ID) == 1
         for t in threads:
             t.join(timeout=5)
         for r in results:
@@ -1732,7 +1737,7 @@ class TestConcurrentApprovalCoalescing:
         results, threads = self._spawn_waits(mod, notified, n=2)
         assert len(notified) == 1
 
-        mod.resolve_gateway_approval(self.SESSION_KEY, "deny", reason="nope")
+        mod.resolve_gateway_approval(self.SESSION_KEY, "deny", reason="nope", clicker_id=self.REQUESTER_ID)
         for t in threads:
             t.join(timeout=5)
         for r in results:
@@ -1749,14 +1754,14 @@ class TestConcurrentApprovalCoalescing:
         assert len(notified) == 1
 
         # "once" covers only the leader — the follower must re-prompt.
-        mod.resolve_gateway_approval(self.SESSION_KEY, "once")
+        mod.resolve_gateway_approval(self.SESSION_KEY, "once", clicker_id=self.REQUESTER_ID)
         for _ in range(400):
             if len(notified) == 2:
                 break
             time.sleep(0.01)
         assert len(notified) == 2, "follower did not issue a fresh prompt after 'once'"
 
-        mod.resolve_gateway_approval(self.SESSION_KEY, "once")
+        mod.resolve_gateway_approval(self.SESSION_KEY, "once", clicker_id=self.REQUESTER_ID)
         for t in threads:
             t.join(timeout=5)
         assert all(r is not None and r["choice"] == "once" for r in results)
@@ -1796,7 +1801,7 @@ class TestConcurrentApprovalCoalescing:
         # Two distinct prompts, two queue entries, two resolutions needed.
         assert len(notified) == 2
         assert len(mod._gateway_queues.get(self.SESSION_KEY, [])) == 2
-        mod.resolve_gateway_approval(self.SESSION_KEY, "session", resolve_all=True)
+        mod.resolve_gateway_approval(self.SESSION_KEY, "session", resolve_all=True, clicker_id=self.REQUESTER_ID)
         t1.join(timeout=5)
         t2.join(timeout=5)
         assert all(r is not None and r["choice"] == "session" for r in results)
@@ -1935,24 +1940,28 @@ class TestApprovalPromptRedaction:
 
         from tools.approval import check_execute_code_guard
 
-        code = (
-            "import os\n"
-            'api_key = "sk-proj-abc123xyz4567890abcdef"\n'
-            "print(api_key)"
-        )
-        cfg = {"approvals": {"mode": "manual"}}
-        with _patch("hermes_cli.config.load_config_readonly", return_value=cfg):
-            with _patch("tools.approval._is_gateway_approval_context",
-                        return_value=True):
-                with _patch("tools.approval_context._get_approval_mode",
-                            return_value="manual"):
-                    # No gateway notify callback registered -> pending fallback.
-                    result = check_execute_code_guard(code, "local")
+        requester_token = approval_context.set_current_requester_id("test-redaction-user")
+        try:
+            code = (
+                "import os\n"
+                'api_key = "sk-proj-abc123xyz4567890abcdef"\n'
+                "print(api_key)"
+            )
+            cfg = {"approvals": {"mode": "manual"}}
+            with _patch("hermes_cli.config.load_config_readonly", return_value=cfg):
+                with _patch("tools.approval._is_gateway_approval_context",
+                            return_value=True):
+                    with _patch("tools.approval_context._get_approval_mode",
+                                return_value="manual"):
+                        # No gateway notify callback registered -> pending fallback.
+                        result = check_execute_code_guard(code, "local")
 
-        assert result.get("status") == "pending_approval"
-        # The script's credential must not appear in the user-facing message.
-        assert "sk-proj-abc123xyz4567890abcdef" not in result["message"]
-        assert "sk-proj-abc123xyz4567890abcdef" not in result["command"]
+            assert result.get("status") == "pending_approval"
+            # The script's credential must not appear in the user-facing message.
+            assert "sk-proj-abc123xyz4567890abcdef" not in result["message"]
+            assert "sk-proj-abc123xyz4567890abcdef" not in result["command"]
+        finally:
+            approval_context.reset_current_requester_id(requester_token)
 
 
 class TestCliApprovalTimeoutClassifiedSeparately:

@@ -66,6 +66,7 @@ gateway:
     session_plural:        "✅ Comandos aprobados (patrón aprobado para esta sesión) ({count} comandos). El agente se está reanudando..."
     always_singular:       "✅ Comando aprobado (patrón aprobado permanentemente). El agente se está reanudando..."
     always_plural:         "✅ Comandos aprobados (patrón aprobado permanentemente) ({count} comandos). El agente se está reanudando..."
+    wrong_requester:       "⚠️ Solo el usuario que activó este comando puede aprobarlo."
 
   background:
     usage:                 "Uso: /bg <prompt>\nEjemplo: /bg Resume las principales historias de HN de hoy\n\nEjecuta el prompt en una sesión separada. Puedes seguir chateando — el resultado aparecerá aquí cuando termine."
