@@ -36,8 +36,7 @@ def _session_has_live_transport(session: dict | None, *, excluding=None) -> bool
 
 
 def _warn_foreign_login(session: dict, transport) -> None:
-    """Ownership is not enforced; a second login sharing a session is only logged, and the agent keeps the
-    creator's user id."""
+    """Log a distinct authenticated principal joining a non-owner-scoped session."""
     attaching = _transport_auth_user_id(transport)
     if attaching is None:
         return
@@ -47,14 +46,18 @@ def _warn_foreign_login(session: dict, transport) -> None:
                        session.get("session_key"), creator or "(none)", attaching)
 
 
+def _transport_may_attach(session: dict, transport) -> bool:
+    """Reject a remote transport only when this session has an owner scope."""
+    return not _session_has_local_owner_scope(session) or _transport_has_local_owner_provenance(transport)
+
+
 def _attach_session_transport(session: dict | None, transport) -> bool:
     """Add live peers; flatten captured queued fanouts without nesting authority."""
     if not session or transport is None:
         return False
     with _session_transport_lock:
         if isinstance(transport, FanoutTransport):
-            # Snapshot and attach share detach's lock: a queued fanout cannot
-            # resurrect a still-open peer removed during flattening.
+            # A fanout is flattened so a local member cannot certify its remote peers.
             attached = [_attach_session_transport(session, peer) for peer in transport.transports()]
             return any(attached)
         existing = session.get("transport")
@@ -67,6 +70,13 @@ def _attach_session_transport(session: dict | None, transport) -> bool:
                 return False
             session["transport"] = transport
             return True
+        if not _transport_may_attach(session, transport):
+            logger.warning("Refused remote attachment to owner-scoped session %s", session.get("session_key"))
+            return False
+        if session.get("_local_owner_provenance") and not _transport_has_local_owner_provenance(transport):
+            # Preserve anonymous fanout when local_user_id is unset, but make
+            # the shared runtime permanently ineligible for a later owner build.
+            session["_local_owner_mixed"] = True
         if existing is transport:
             return True
         if isinstance(existing, FanoutTransport):

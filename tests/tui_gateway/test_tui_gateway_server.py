@@ -4638,6 +4638,59 @@ def test_deferred_session_record_stamps_the_creating_login():
     assert server._session_auth_user_id(record) == "oidc:carol"
 
 
+def test_owner_scoped_session_refuses_remote_reattach_before_history_access(monkeypatch):
+    """A warm local-owner agent cannot be observed or reused by an unadmitted WS."""
+    local = server._stdio_transport
+    remote = _LoginSocket("remote-user")
+    record = _login_session(
+        monkeypatch, "sid-local-owner", "owner-key", local,
+        _local_owner_provenance=True,
+        agent=types.SimpleNamespace(_memory_local_owner_applied=True),
+        history=[], history_lock=threading.Lock())
+
+    assert not server._attach_session_transport(record, remote)
+    token = bind_transport(remote)
+    try:
+        refusal = server._reattach_refusal("rid", "sid-local-owner", record)
+    finally:
+        reset_transport(token)
+
+    assert refusal["error"]["code"] == 4001
+    assert "local-owner" in refusal["error"]["message"]
+
+
+def test_local_eligibility_without_configured_owner_keeps_existing_remote_fanout(monkeypatch):
+    """Default config changes no session-attachment behavior."""
+    local, remote = server._stdio_transport, _LoginSocket("remote-user")
+    record = _login_session(
+        monkeypatch, "sid-local-anonymous", "anonymous-key", local,
+        _local_owner_provenance=True)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"memory": {}})
+
+    assert server._attach_session_transport(record, remote)
+    assert record["_local_owner_mixed"] is True
+
+
+def test_pending_local_owner_build_refuses_remote_before_provider_initialization(monkeypatch):
+    local, remote = server._stdio_transport, _LoginSocket("remote-user")
+    record = _login_session(
+        monkeypatch, "sid-pending-owner", "pending-key", local,
+        _local_owner_provenance=True, agent=None)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"memory": {"local_user_id": "owner"}})
+
+    assert not server._attach_session_transport(record, remote)
+
+
+
+def test_stdio_tee_preserves_local_owner_admission(monkeypatch):
+    from tui_gateway.transport import FanoutTransport, TeeTransport
+
+    wrapped = TeeTransport(server._stdio_transport, _LoginSocket())
+    monkeypatch.setattr(server, "_stdio_transport", wrapped)
+
+    assert server._transport_has_local_owner_provenance(wrapped)
+    assert not server._transport_has_local_owner_provenance(FanoutTransport(wrapped, _LoginSocket()))
+
 def test_compute_host_turn_frame_carries_the_session_login(monkeypatch):
     record = _login_session(monkeypatch, "sid-host", "host-key", _LoginSocket(), history=[],
                             history_lock=threading.Lock(), cwd="/tmp", cols=80)

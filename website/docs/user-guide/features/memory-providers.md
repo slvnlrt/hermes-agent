@@ -25,6 +25,34 @@ memory:
   provider: openviking   # or honcho, mem0, hindsight, holographic, retaindb, byterover, supermemory
 ```
 
+### Single-owner local identity
+
+Providers that scope memory by user need an identity even for local CLI and
+TUI sessions. On a **single-user Hermes home**, configure:
+
+```yaml
+memory:
+  provider: your-provider
+  local_user_id: "your-existing-messaging-user-id"
+```
+
+This is opt-in. Reusing the identifier already supplied by your messaging
+channel lets an identity-scoped provider recall the same personal memories
+from local surfaces, without moving old records. Check the provider's scoping
+contract first; this setting does not migrate or merge existing memories.
+
+An explicit `user_id` or `user_id_alt` supplied by a transport always wins.
+The local identity is applied only after the server admits a real local
+factory: the interactive CLI/TUI stdio path (including its Tee sidecar),
+the Desktop loopback channel authenticated by its Desktop-owned credential,
+or the server-spawned PTY internal credential. Arbitrary loopback and legacy
+token WebSockets do not qualify. The admission fact is retained across normal
+resume, reset, branch, and model rebuilds, but an unidentified remote client
+cannot attach to an already local-owner-scoped session. Sources tagged `tool`,
+`cron`, `kanban`, `subagent`, `gateway_hygiene`, or background execution do
+not inherit it. A bare `AIAgent(platform='cli')` from external code and direct
+one-shot/headless CLI execution do not qualify.
+
 ## How It Works
 
 When a memory provider is active, Hermes automatically:

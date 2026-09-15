@@ -51,6 +51,7 @@ logger = logging.getLogger("run_agent")
 _warned_unavailable_providers: set[str] = set()
 
 
+
 def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
     """Warn once per provider that a configured memory provider is unavailable.
 
@@ -1193,14 +1194,33 @@ def _apply_display_config(agent, _agent_cfg, platform):
         _ra().logger.warning("Tool loop guardrail config ignored: %s", _tlg_err)
 
 
-def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
+def _memory_provider_init_kwargs(agent, platform, mem_config=None) -> Dict[str, Any]:
     """Scoping kwargs for ``MemoryManager.initialize_all`` (status_callback is CLI-only:
-    gateway status travels a different path and the indicator no-ops without it)."""
+    gateway status travels a different path and the indicator no-ops without it).
+
+    ``mem_config`` is the ``memory`` section of ``config.yaml``; when supplied the helper
+    resolves ``local_user_id`` for verified local surfaces.
+
+    The local-owner decision uses ``agent._local_owner_provenance`` — a server-established
+    boolean set only by verified local factories. Platform strings, session source env vars,
+    and JSON-RPC params are NEVER sufficient on their own.
+    """
+    from run_agent import _session_source_for_agent
+
+    _source = _session_source_for_agent(platform)
+    _automated = {"tool", "cron", "kanban", "subagent", "gateway_hygiene", "background"}
+    _execution_context = getattr(agent, "_execution_context", None)
+    _automated_context = next(
+        (value for value in (_execution_context, _source, platform) if value in _automated),
+        None,
+    )
     kwargs = {
         "session_id": agent.session_id,
         "platform": platform or "cli",
         "hermes_home": str(get_hermes_home()),
-        "agent_context": "primary",
+        "session_source": _source,
+        # Never let a stale/bound source turn an automated platform primary.
+        "agent_context": _automated_context or "primary",
     }
     if kwargs["platform"] == "cli":
         kwargs["warning_callback"] = agent._emit_warning
@@ -1217,6 +1237,21 @@ def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
         _val = getattr(agent, f"_{_ident}")
         if _val:
             kwargs[_ident] = _val
+    # Single-owner local surfaces: opt-in configured identity.
+    # Trust is established by the server-set _local_owner_provenance flag, NOT by
+    # platform/session_source string matching. Explicit gateway identity always wins.
+    agent._memory_local_owner_applied = False
+    if (
+        "user_id" not in kwargs
+        and "user_id_alt" not in kwargs
+        and kwargs["agent_context"] == "primary"
+        and getattr(agent, "_local_owner_provenance", False)
+        and mem_config is not None
+    ):
+        _local_user_id = mem_config.get("local_user_id", "")
+        if isinstance(_local_user_id, str) and _local_user_id.strip():
+            kwargs["user_id"] = _local_user_id.strip()
+            agent._memory_local_owner_applied = True
     # Profile identity for per-profile provider scoping
     with suppress(Exception):
         from hermes_cli.profiles import get_active_profile_name
@@ -1283,7 +1318,7 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform):
                         _unavailable_reason = _mp.unavailable_reason()
                     _warn_memory_provider_unavailable(_mem_provider_name, _unavailable_reason)
                 if agent._memory_manager.providers:
-                    agent._memory_manager.initialize_all(**_memory_provider_init_kwargs(agent, platform))
+                    agent._memory_manager.initialize_all(**_memory_provider_init_kwargs(agent, platform, mem_config))
                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
                 else:
                     _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
@@ -2204,6 +2239,7 @@ def init_agent(
     checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
     requested_provider: str = None, capabilities: Optional[Dict[str, bool]] = None,
+    _local_owner_provenance: bool = False, _execution_context: str | None = None,
 ):
     """Initialize the AI Agent (body of :meth:`AIAgent.__init__`).
 
@@ -2217,6 +2253,11 @@ def init_agent(
         assistant message — use structured outputs there instead.
       skip_context_files: skip SOUL.md/.hermes.md/AGENTS.md/CLAUDE.md/.cursorrules injection;
         load_soul_identity keeps ~/.hermes/SOUL.md as identity regardless.
+      _local_owner_provenance: server-established boolean; True only from verified local
+        factories. Default False. A bare ``AIAgent(platform='cli')`` alone MUST NOT
+        grant ``memory.local_user_id``. Never infer from platform strings or session source.
+      _execution_context: server-established execution role for automated work. It preserves
+        the public platform and gateway identity while preventing primary-owner fallback.
     """
     _install_safe_stdio()
 
@@ -2225,6 +2266,11 @@ def init_agent(
         setattr(agent, _name, _params[_name])
     for _name in _GATEWAY_IDENTITY_PARAMS:
         setattr(agent, f"_{_name}", _params[_name])
+    # Server-established local-human provenance: only verified local factories set this True.
+    # Default False — a bare AIAgent(platform='cli') MUST NOT grant owner identity.
+    agent._local_owner_provenance = bool(_local_owner_provenance)
+    agent._memory_local_owner_applied = False
+    agent._execution_context = _execution_context
     # Shared iteration budget: parent creates, children inherit.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
     # CLI replaces this with _cprint so raw ANSI status lines go through prompt_toolkit's

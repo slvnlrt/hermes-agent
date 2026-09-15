@@ -1226,6 +1226,10 @@ DEFAULT_CONFIG = {
         # External memory provider plugin (empty = built-in only); only ONE at a time: "openviking",
         # "mem0", "hindsight", "holographic", "retaindb", "byterover".
         "provider": "",
+        # Opt-in owner identity for single-user CLI/TUI/Desktop/Web sessions.  Reuse a
+        # messaging user id to share that provider's scope.  Never applied to gateway
+        # identities or tool/cron/kanban/subagent session sources.
+        "local_user_id": "",
     },
     # Subagent delegation — override the provider:model used by delegate_task so children run on a
     # cheaper/faster model. Uses the same runtime provider resolution as CLI/gateway startup, so

@@ -90,11 +90,25 @@ class MyMemoryProvider(MemoryProvider):
         """Called once at agent startup.
 
         kwargs always includes:
+          platform (str): Session surface ("cli", "telegram", "cron", …).
           hermes_home (str): Active HERMES_HOME path. Use for storage.
+          session_source (str): Effective source; may differ from platform
+              when HERMES_SESSION_SOURCE overrides it (e.g. "kanban", "tool").
+          agent_context (str): "primary" for human-facing turns; the source
+              name ("cron", "tool", "kanban", "subagent", "gateway_hygiene")
+              for automated work.
+
+        Gateway sessions add user_id, user_id_alt, chat_id, chat_type,
+        thread_id, gateway_session_key. Verified local factories may supply
+        user_id from memory.local_user_id when no gateway identity exists (see
+        the user guide). The trust fact is stamped at server admission from
+        stdio or an authenticated Desktop/internal-PTY channel; it is never
+        inferred from platform/session_source strings, persisted state, RPC
+        input, or environment alone. `agent_context` is non-primary for
+        automated work even when its platform remains a human-facing gateway.
         """
         self._api_key = os.environ.get("MY_API_KEY", "")
         self._session_id = session_id
-
     # ... implement remaining methods
 ```
 

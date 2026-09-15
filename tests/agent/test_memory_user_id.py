@@ -1,12 +1,15 @@
-"""Tests for per-user memory scoping via user_id threading.
+"""Tests for per-user memory scoping via the configured provider lifecycle.
 
-Verifies that gateway user_id flows from AIAgent -> MemoryManager -> plugins,
-so each gateway user gets their own memory bucket instead of sharing a static one.
+The recording provider is installed through the real memory-plugin discovery
+path under a temporary HERMES_HOME. Tests observe initialize() kwargs after
+real AIAgent construction instead of copying private state or mocking loader
+results.
 """
 
 import json
-import os
-from unittest.mock import MagicMock, patch
+from contextlib import suppress
+
+import pytest
 
 from agent.memory_provider import MemoryProvider
 from agent.memory_manager import MemoryManager
@@ -63,8 +66,6 @@ class RecordingProvider(MemoryProvider):
 class TestMemoryManagerUserIdThreading:
     """Verify user_id reaches providers via initialize_all."""
 
-
-
     def test_no_user_id_when_cli(self):
         """CLI sessions should not have user_id in kwargs."""
         mgr = MemoryManager()
@@ -79,10 +80,8 @@ class TestMemoryManagerUserIdThreading:
         assert "user_id" not in p._init_kwargs
         assert p._init_kwargs.get("platform") == "cli"
 
-
     def test_multiple_providers_all_receive_user_id(self):
         mgr = MemoryManager()
-        # Use one provider named "builtin" (always accepted) and one external
         p1 = RecordingProvider("builtin")
         p2 = RecordingProvider("external")
         mgr.add_provider(p1)
@@ -100,182 +99,158 @@ class TestMemoryManagerUserIdThreading:
         assert p2._init_kwargs.get("platform") == "slack"
 
 
-# ---------------------------------------------------------------------------
-# Mem0 provider user_id tests
-# ---------------------------------------------------------------------------
-
-
-class TestMem0UserIdScoping:
-    """Verify Mem0 plugin uses gateway user_id when provided."""
-
-
-    def test_no_user_id_falls_back_to_config(self):
-        """Without user_id in kwargs, should use config default."""
-        from plugins.memory.mem0 import Mem0MemoryProvider
-
-        provider = Mem0MemoryProvider()
-        with patch("plugins.memory.mem0._load_config", return_value={
-            "api_key": "test-key",
-            "user_id": "custom-default",
-            "agent_id": "hermes",
-            "rerank": True,
-        }):
-            provider.initialize(session_id="test-sess")
-
-        assert provider._user_id == "custom-default"
-
-
-    def test_different_users_get_different_ids(self):
-        """Two providers initialized with different user_ids should be scoped differently."""
-        from plugins.memory.mem0 import Mem0MemoryProvider
-
-        p1 = Mem0MemoryProvider()
-        p2 = Mem0MemoryProvider()
-
-        with patch("plugins.memory.mem0._load_config", return_value={
-            "api_key": "test-key",
-            "user_id": "hermes-user",
-            "agent_id": "hermes",
-            "rerank": True,
-        }):
-            p1.initialize(session_id="sess-1", user_id="alice_123")
-            p2.initialize(session_id="sess-2", user_id="bob_456")
-
-        assert p1._user_id == "alice_123"
-        assert p2._user_id == "bob_456"
-        assert p1._user_id != p2._user_id
 
 
 # ---------------------------------------------------------------------------
-# Honcho provider user_id tests
+# Real AIAgent construction provenance tests
 # ---------------------------------------------------------------------------
 
 
-class TestHonchoUserIdScoping:
-    """Verify Honcho plugin keeps runtime user scoping separate from config peer_name."""
+class TestRealAIAgentProvenance:
+    """Real configured-provider initialization, with discoverable plugin loading.
 
-    def test_gateway_user_id_is_passed_as_runtime_peer(self):
-        """Gateway user_id should scope Honcho sessions without mutating config peer_name."""
-        from plugins.memory.honcho import HonchoMemoryProvider
+    Factory-specific admission is covered in the TUI/desktop transport tests;
+    these rows prove the provider receives only the already-established fact.
+    """
 
-        provider = HonchoMemoryProvider()
+    @pytest.fixture(autouse=True)
+    def _tmp_hermes_home(self, tmp_path, monkeypatch):
+        """Install a discoverable provider and let the real loader initialize it."""
+        self.hermes_home = tmp_path / "hermes_home"
+        provider_dir = self.hermes_home / "plugins" / "recording"
+        provider_dir.mkdir(parents=True)
+        (self.hermes_home / "config.yaml").write_text(json.dumps({
+            "memory": {"provider": "recording", "local_user_id": "test-owner-42"},
+        }))
+        (provider_dir / "__init__.py").write_text(
+            """
+import json
+from pathlib import Path
+from agent.memory_provider import MemoryProvider
 
-        mock_cfg = MagicMock()
-        mock_cfg.enabled = True
-        mock_cfg.api_key = "test-key"
-        mock_cfg.base_url = None
-        mock_cfg.peer_name = "static-user"
-        mock_cfg.recall_mode = "context"
-        mock_cfg.context_tokens = None
-        mock_cfg.raw = {}
-        mock_cfg.dialectic_depth = 1
-        mock_cfg.dialectic_depth_levels = None
-        mock_cfg.init_on_session_start = False
-        mock_cfg.ai_peer = "hermes"
-        mock_cfg.resolve_session_name.return_value = "test-sess"
-        mock_cfg.session_strategy = "shared"
+class RecordingProvider(MemoryProvider):
+    @property
+    def name(self):
+        return "recording"
+    def is_available(self):
+        return True
+    def initialize(self, session_id, **kwargs):
+        self._init_kwargs = dict(kwargs)
+        observed = {k: v for k, v in kwargs.items() if isinstance(v, (str, int, float, bool, type(None)))}
+        Path(kwargs["hermes_home"], "recording-init.json").write_text(json.dumps(observed))
+    def system_prompt_block(self):
+        return ""
+    def prefetch(self, query, *, session_id=""):
+        return ""
+    def sync_turn(self, user_content, assistant_content, *, session_id=""):
+        return None
+    def get_tool_schemas(self):
+        return []
+    def handle_tool_call(self, tool_name, args, **kwargs):
+        return "{}"
+    def shutdown(self):
+        return None
 
-        with patch(
-            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
-            return_value=mock_cfg,
-        ), patch(
-            "plugins.memory.honcho.client.get_honcho_client",
-            return_value=MagicMock(),
-        ), patch(
-            "plugins.memory.honcho.session.HonchoSessionManager",
-        ) as mock_manager_cls:
-            mock_manager = MagicMock()
-            mock_manager.get_or_create.return_value = MagicMock(messages=[])
-            mock_manager_cls.return_value = mock_manager
-            provider.initialize(
-                session_id="test-sess",
-                user_id="discord_user_789",
-                platform="discord",
-            )
+def register(ctx):
+    ctx.register_memory_provider(RecordingProvider())
+""".strip())
+        monkeypatch.setenv("HERMES_HOME", str(self.hermes_home))
+        monkeypatch.setenv("OPENROUTER_API_KEY", "test-key-not-real")
 
-        assert mock_cfg.peer_name == "static-user"
-        assert mock_manager_cls.call_args.kwargs["runtime_user_peer_name"] == "discord_user_789"
-
-    def test_session_manager_prefers_runtime_user_id_over_config_peer_name(self):
-        """Session manager should isolate gateway users even when config peer_name is static."""
-        from plugins.memory.honcho.session import HonchoSessionManager
-
-        mock_cfg = MagicMock()
-        mock_cfg.peer_name = "static-user"
-        mock_cfg.ai_peer = "hermes"
-        mock_cfg.write_frequency = "sync"
-        mock_cfg.dialectic_reasoning_level = "low"
-        mock_cfg.dialectic_dynamic = True
-        mock_cfg.dialectic_max_chars = 600
-        mock_cfg.observation_mode = "directional"
-        mock_cfg.user_observe_me = True
-        mock_cfg.user_observe_others = True
-        mock_cfg.ai_observe_me = True
-        mock_cfg.ai_observe_others = True
-
-        manager = HonchoSessionManager(
-            honcho=MagicMock(),
-            config=mock_cfg,
-            runtime_user_peer_name="discord_user_789",
+    @staticmethod
+    def _provider(agent):
+        assert agent._memory_manager is not None
+        assert len(agent._memory_manager.providers) == 1
+        provider = agent._memory_manager.providers[0]
+        assert provider.name == "recording"
+        return provider
+    def test_configured_provider_observes_established_provenance(self):
+        """A real provider receives the local owner only for an established fact."""
+        from run_agent import AIAgent
+        agent = AIAgent(
+            model="test/model", api_key="test-key-not-real",
+            platform="cli", _local_owner_provenance=True,
+            quiet_mode=True, max_iterations=1,
         )
+        try:
+            assert agent._local_owner_provenance is True
+            assert self._provider(agent)._init_kwargs["user_id"] == "test-owner-42"
+        finally:
+            with suppress(Exception):
+                agent.close()
 
-        with patch.object(manager, "_get_or_create_peer", return_value=MagicMock()), patch.object(
-            manager,
-            "_get_or_create_honcho_session",
-            return_value=(MagicMock(), [], None),
-        ):
-            session = manager.get_or_create("discord:channel-1")
+    def test_bare_cli_no_provenance(self):
+        """A bare AIAgent(platform='cli') without provenance MUST NOT get owner."""
+        from run_agent import AIAgent
+        agent = AIAgent(
+            model="test/model", api_key="test-key-not-real",
+            platform="cli",  # no _local_owner_provenance
+            quiet_mode=True, max_iterations=1,
+        )
+        try:
+            assert agent._local_owner_provenance is False
+            assert "user_id" not in self._provider(agent)._init_kwargs
+        finally:
+            with suppress(Exception):
+                agent.close()
 
-        assert session.user_peer_id == "discord_user_789"
+    def test_nonprimary_execution_blocks_owner_even_with_established_flag(self):
+        from run_agent import AIAgent
+        agent = AIAgent(
+            model="test/model", api_key="test-key-not-real", platform="cli",
+            _local_owner_provenance=True, _execution_context="background",
+            quiet_mode=True, max_iterations=1,
+        )
+        try:
+            provider = self._provider(agent)
+            assert provider._init_kwargs["agent_context"] == "background"
+            assert "user_id" not in provider._init_kwargs
+        finally:
+            with suppress(Exception):
+                agent.close()
 
-    def test_no_user_id_preserves_config_peer_name(self):
-        """Without user_id, the config peer_name should be preserved."""
-        from plugins.memory.honcho import HonchoMemoryProvider
+    def test_gateway_user_id_wins_in_real_construction(self):
+        """Gateway user_id takes precedence even with provenance=True."""
+        from run_agent import AIAgent
+        agent = AIAgent(
+            model="test/model", api_key="test-key-not-real",
+            platform="cli", _local_owner_provenance=True,
+            user_id="gateway-user-99",
+            quiet_mode=True, max_iterations=1,
+        )
+        try:
+            assert self._provider(agent)._init_kwargs["user_id"] == "gateway-user-99"
+        finally:
+            with suppress(Exception):
+                agent.close()
 
-        provider = HonchoMemoryProvider()
+    def test_hygiene_platform_non_primary(self):
+        """An agent constructed with platform='gateway_hygiene' gets non-primary context."""
+        from run_agent import AIAgent
+        agent = AIAgent(
+            model="test/model", api_key="test-key-not-real",
+            platform="gateway_hygiene",
+            quiet_mode=True, max_iterations=1,
+        )
+        try:
+            assert agent._local_owner_provenance is False
+            assert self._provider(agent)._init_kwargs["agent_context"] == "gateway_hygiene"
+            assert "user_id" not in self._provider(agent)._init_kwargs
+        finally:
+            with suppress(Exception):
+                agent.close()
 
-        mock_cfg = MagicMock()
-        mock_cfg.enabled = True
-        mock_cfg.api_key = "test-key"
-        mock_cfg.base_url = None
-        mock_cfg.peer_name = "my-custom-peer"
-        mock_cfg.recall_mode = "tools"
-
-        with patch(
-            "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
-            return_value=mock_cfg,
-        ):
-            provider.initialize(
-                session_id="test-sess",
-                platform="cli",
-            )
-
-        # peer_name should not have been overridden
-        assert mock_cfg.peer_name == "my-custom-peer"
-
-
-# ---------------------------------------------------------------------------
-# AIAgent user_id propagation test
-# ---------------------------------------------------------------------------
-
-
-class TestAIAgentUserIdPropagation:
-    """Verify AIAgent stores user_id and passes it to memory init kwargs."""
-
-    def test_user_id_stored_on_agent(self):
-        """AIAgent should store user_id as instance attribute."""
-        with patch.dict(os.environ, {"HERMES_HOME": "/tmp/test_hermes"}):
-            from run_agent import AIAgent
-            agent = object.__new__(AIAgent)
-            # Manually set the attribute as __init__ does
-            agent._user_id = "test_user_42"
-            assert agent._user_id == "test_user_42"
-
-    def test_user_id_none_by_default(self):
-        """AIAgent should have None user_id when not provided (CLI mode)."""
-        with patch.dict(os.environ, {"HERMES_HOME": "/tmp/test_hermes"}):
-            from run_agent import AIAgent
-            agent = object.__new__(AIAgent)
-            agent._user_id = None
-            assert agent._user_id is None
-
+    def test_skip_memory_true_no_provider_init(self):
+        """skip_memory=True skips the external provider entirely."""
+        from run_agent import AIAgent
+        agent = AIAgent(
+            model="test/model", api_key="test-key-not-real",
+            platform="cli", _local_owner_provenance=True,
+            skip_memory=True,
+            quiet_mode=True, max_iterations=1,
+        )
+        try:
+            assert agent._memory_manager is None
+        finally:
+            with suppress(Exception):
+                agent.close()

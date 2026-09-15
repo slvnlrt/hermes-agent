@@ -457,7 +457,8 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         new_agent = _rebuild_session_agent(
             sid, session, session_id=session["session_key"],
             platform_override=_session_source(session),
-            context_cwd_is_launch_artifact=_context_cwd_is_launch_artifact(session))
+            context_cwd_is_launch_artifact=_context_cwd_is_launch_artifact(session),
+            _local_owner_provenance=_session_is_local_provenance(session))
     finally:
         _clear_session_context(tokens)
     session.update(updates)

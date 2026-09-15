@@ -976,7 +976,8 @@ def _deferred_build_agent_kwargs(current: dict, session_db) -> dict:
     runtime identity (like the eager resume's overrides splat) so the build can't drop the provider. No
     stored runtime, or an unroutable provider → this session's picked model/effort/tier, else the default."""
     kw = {"session_db": session_db, "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(current),
-          "platform_override": _session_source(current)}
+          "platform_override": _session_source(current),
+          "_local_owner_provenance": _session_is_local_provenance(current)}
     if resume_sid := current.get("resume_session_id"):
         kw["session_id"] = resume_sid
     resume_overrides = current.get("resume_runtime_overrides")
@@ -989,6 +990,36 @@ def _deferred_build_agent_kwargs(current: dict, session_db) -> dict:
                                      ("service_tier_override", current.get("create_service_tier_override")))
                    if v is not None})
     return kw
+
+
+def _transport_has_local_owner_provenance(transport) -> bool:
+    """Whether server admission, not a client surface claim, marked this transport local."""
+    return transport is not None and (
+        transport is _stdio_transport or bool(getattr(transport, "_local_owner_eligible", False)))
+
+
+def _configured_local_owner_id() -> bool:
+    """Whether a yet-to-build local session would apply the configured owner."""
+    memory = (_load_cfg().get("memory") or {})
+    value = memory.get("local_user_id", "") if isinstance(memory, dict) else ""
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _session_has_local_owner_scope(session: dict | None) -> bool:
+    """Whether an existing or pending build can use the local memory owner."""
+    session = session or {}
+    if not _session_is_local_provenance(session):
+        return False
+    agent = session.get("agent")
+    if agent is not None:
+        return bool(getattr(agent, "_memory_local_owner_applied", False))
+    return _configured_local_owner_id()
+
+
+def _session_is_local_provenance(session: dict | None) -> bool:
+    """Return the local admission fact unless an anonymous remote joined first."""
+    return bool((session or {}).get("_local_owner_provenance", False)) and not bool(
+        (session or {}).get("_local_owner_mixed", False))
 
 
 def _wire_session_agent(sid: str, key: str, agent) -> bool:
@@ -2316,7 +2347,7 @@ def _make_agent(
     model_override: dict | str | None = None, provider_override: str | None = None,
     reasoning_config_override: dict | None = None, service_tier_override: str | None = None,
     platform_override: str | None = None, context_cwd_is_launch_artifact: bool | None = None,
-    auth_user_id: str | None = None):
+    auth_user_id: str | None = None, _local_owner_provenance: bool = False):
     # AC-4 test seam: dead unless armed by the isolated certify harness.
     from tui_gateway.synthetic_turn import maybe_build_synthetic_agent
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
@@ -2360,7 +2391,7 @@ def _make_agent(
         checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
         skip_context_files=ignore_rules, skip_memory=ignore_rules, fallback_model=_load_fallback_model(),
-        **_agent_cbs(sid))
+        _local_owner_provenance=_local_owner_provenance, **_agent_cbs(sid))
     if context_cwd_is_launch_artifact is None:
         context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(session)
     agent._context_cwd_is_launch_artifact = bool(context_cwd_is_launch_artifact)
@@ -2419,6 +2450,7 @@ def _init_session(
             # Async events go to the transport that created the session (stdio for Ink, WS for the dashboard).
             "transport": current_transport() or _stdio_transport,
             "auth_user_id": _transport_auth_user_id(current_transport()),
+            "_local_owner_provenance": bool(getattr(agent, "_local_owner_provenance", False)),
         }
         _session_todo_state(_sessions[sid])
     _hydrate_session_cwd(sid, key, session_db, profile_home)
@@ -2484,6 +2516,8 @@ def _deferred_session_record(
         "tool_started_at": {}, "todo_state": todo_state,
         "transport": current_transport() or _stdio_transport,
         "auth_user_id": _transport_auth_user_id(current_transport()),
+        "_local_owner_provenance": _transport_has_local_owner_provenance(
+            current_transport() or _stdio_transport),
     }
 
 

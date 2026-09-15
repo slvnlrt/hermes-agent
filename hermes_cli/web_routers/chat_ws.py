@@ -564,12 +564,11 @@ async def gateway_ws(ws: WebSocket) -> None:
         return
     from tui_gateway.ws import handle_ws
 
-    # The authenticated identity (ticket / internal credential) stamped by
-    # _ws_auth_reason becomes the identity authority for privileged RPCs
-    # (browser.controller.register). None on the legacy token path.
+    # Server admission, not the RPC payload, determines owner eligibility.
     await handle_ws(
         ws,
         auth_identity=getattr(ws, "_hermes_auth_identity", None),
+        local_owner_eligible=bool(getattr(ws, "_hermes_local_owner_eligible", False)),
         subprotocol=getattr(ws, "_hermes_ws_subprotocol", None),
     )
 

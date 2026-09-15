@@ -481,27 +481,29 @@ def _cancel_ws_orphan_reap(sid: str) -> None:
 
 
 def _reattach_refusal(rid, sid: str, session: dict) -> dict | None:
-    """Under ``_session_resume_lock``: why a reattaching RPC (resume/activate/prompt.submit) must NOT rebind
-    ``session`` — it is stale, or a client-gone interrupt is still settling and the reap Timer must keep
-    polling. None when the reattach may proceed."""
+    """Under ``_session_resume_lock``: reject stale, settling, or remote-owner cache attachments."""
     if _sessions.get(sid) is not session:
         return _err(rid, 4007, "session no longer live; retry resume")
     if session.get("_client_gone_interrupt_requested"):
         return _err(rid, 4009, "session disconnect interrupt settling")
+    transport = current_transport() or _stdio_transport
+    if _session_has_local_owner_scope(session) and not _transport_has_local_owner_provenance(transport):
+        return _err(rid, 4001, "remote client cannot attach to a local-owner session")
     return None
 
 
-def _rebind_live_transport(sid: str, session: dict, transport: Transport) -> None:
-    """Attach a live peer without displacing existing subscribers (caller holds ``history_lock``).
-    Subagent control authority needs no bookkeeping here: it resolves against ``session["transport"]``
-    at RPC time (``tools.delegate_tool_registry._subagent_transport_matches``)."""
-    _attach_session_transport(session, transport)
-    # Every transport that showed this session (pop-outs resume the same sid); on disconnect the last
-    # viewer becomes the transport instead of the drop sentinel.
+def _rebind_live_transport(sid: str, session: dict, transport: Transport) -> bool:
+    """Attach a live peer without displacing existing subscribers.
+
+    The return value is authoritative: callers that can answer an RPC must run
+    ``_reattach_refusal`` first, rather than treating a failed attach as success.
+    """
+    if not _attach_session_transport(session, transport):
+        return False
     session.setdefault("viewers", {})[transport] = time.time()
-    # See #83716.
     if transport is not _detached_ws_transport:
-        _cancel_ws_orphan_reap(sid)  # the client is back — a pending ws-orphan reap must not fire
+        _cancel_ws_orphan_reap(sid)
+    return True
 
 
 def _ws_orphan_turn_activity_is_fresh(session: dict) -> bool:

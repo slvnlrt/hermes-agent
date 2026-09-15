@@ -209,6 +209,27 @@ class TestWsAuthOkLoopback:
         assert _web_server_chat._ws_auth_ok(ws) is True
 
 
+    def test_legacy_loopback_token_never_stamps_local_owner(self, loopback_app, monkeypatch):
+        monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+        monkeypatch.delenv("HERMES_DASHBOARD_SESSION_TOKEN", raising=False)
+        ws = _fake_ws(query={"token": web_server._SESSION_TOKEN})
+        assert _web_server_chat._ws_auth_ok(ws) is True
+        assert not getattr(ws, "_hermes_local_owner_eligible", False)
+
+    def test_desktop_loopback_credential_stamps_local_owner(self, loopback_app, monkeypatch):
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", web_server._SESSION_TOKEN)
+        ws = _fake_ws(query={"token": web_server._SESSION_TOKEN})
+        assert _web_server_chat._ws_auth_ok(ws) is True
+        assert ws._hermes_local_owner_eligible is True
+
+    def test_desktop_credential_on_nonloopback_peer_is_not_local_owner(self, loopback_app, monkeypatch):
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", web_server._SESSION_TOKEN)
+        ws = _fake_ws(query={"token": web_server._SESSION_TOKEN}, client_host="192.0.2.7")
+        assert _web_server_chat._ws_auth_ok(ws) is True
+        assert not getattr(ws, "_hermes_local_owner_eligible", False)
+
 class TestWsAuthOkGated:
     """Gate ON — ticket path only."""
 

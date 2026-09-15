@@ -1120,7 +1120,7 @@ class GatewayTurnMixin:
             _hyg_codex_outcome, session_entry.session_id, _hyg_codex_auto, f"{plan.approx_tokens:,}",
         )
 
-    async def _hmwa_hygiene_build_agent(self, _hyg_model, _hyg_runtime, session_entry):
+    async def _hmwa_hygiene_build_agent(self, _hyg_model, _hyg_runtime, session_entry, source=None):
         """Build the detached hygiene ``AIAgent`` with the live session's system prompt. Returns
         ``(agent, sync_session_db)``."""
         from gateway.run import _GATEWAY_HYGIENE_PLATFORM, _seed_hygiene_system_prompt
@@ -1143,14 +1143,27 @@ class GatewayTurnMixin:
         _hyg_checkpoint_required = _is_truthy(
             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"), default=False,
         )
+        # Pass platform at construction so memory init sees the correct non-primary context.
+        # gateway_hygiene is in the _automated set, so agent_context will not be "primary".
+        # _local_owner_provenance defaults to False → no local_user_id inheritance.
+        # Thread the gateway user identity so a checkpoint targets the correct principal.
+        _hyg_gw_identity = {}
+        _id_source = source or getattr(session_entry, "origin", None)
+        if _id_source is not None:
+            for _id_key in ("user_id", "user_id_alt", "user_name", "chat_id", "chat_name",
+                             "chat_type", "thread_id"):
+                _id_val = getattr(_id_source, _id_key, None)
+                if _id_val:
+                    _hyg_gw_identity[_id_key] = _id_val
         _hyg_agent = AIAgent(
             **_hyg_runtime, model=_hyg_model, max_iterations=4, quiet_mode=True,
             skip_memory=not _hyg_checkpoint_required, enabled_toolsets=["memory"],
             session_id=session_entry.session_id, session_db=_hyg_session_db,
+            platform=_GATEWAY_HYGIENE_PLATFORM,
+            _execution_context=_GATEWAY_HYGIENE_PLATFORM,
+            **_hyg_gw_identity,
         )
         _seed_hygiene_system_prompt(_hyg_agent, _hyg_session_row)
-        # A rebuilt (not retained) prompt is deliberately stale for every real gateway surface.
-        _hyg_agent.platform = _GATEWAY_HYGIENE_PLATFORM
         return _hyg_agent, _hyg_session_db
 
     async def _hmwa_hygiene_detached_attempt(
@@ -1161,7 +1174,8 @@ class GatewayTurnMixin:
         continue with (compressed or original) on ``attempt.history``."""
         from gateway.run import HygieneTurnHoldExceeded
         from agent.conversation_compression import CompressionCommitFence
-        _hyg_agent, _hyg_session_db = await self._hmwa_hygiene_build_agent(_hyg_model, _hyg_runtime, session_entry)
+        _hyg_agent, _hyg_session_db = await self._hmwa_hygiene_build_agent(
+            _hyg_model, _hyg_runtime, session_entry, source=source)
         attempt.agent = _hyg_agent
         try:
             # Hygiene owns the session binding, so prefer in-place compaction over minting a
@@ -2242,7 +2256,10 @@ class GatewayTurnMixin:
                     provider_require_parameters=pr.get("require_parameters", False),
                     provider_data_collection=pr.get("data_collection"),
                     session_id=task_id,
+                    # This preserves the gateway's native platform and authenticated principal
+                    # for routing/scoping, while marking /bg non-primary before provider init.
                     platform=platform_key,
+                    _execution_context="background",
                     **{k: getattr(source, k) for k in (
                         "user_id", "user_id_alt", "user_name", "chat_id", "chat_name", "chat_type", "thread_id",
                     )},

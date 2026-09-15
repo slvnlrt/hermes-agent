@@ -351,7 +351,9 @@ def _(rid, params: dict) -> dict:
             "running": False, "session_key": key, "show_reasoning": _load_show_reasoning(), "source": source,
             "slash_worker": None, "tool_progress_mode": _load_tool_progress_mode(), "tool_started_at": {},
             "transport": current_transport() or _stdio_transport,
-            "auth_user_id": _transport_auth_user_id(current_transport())}
+            "auth_user_id": _transport_auth_user_id(current_transport()),
+            "_local_owner_provenance": _transport_has_local_owner_provenance(
+                current_transport() or _stdio_transport)}
         _register_session_cwd(_sessions[sid])
     # No DB row here (drafts left "Untitled" litter): created on the first prompt — except seeded sessions.
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop launch (and every "New agent" /
@@ -613,17 +615,24 @@ def _resume_adopt_stranded(ctx: _Resume) -> None:
                 ctx.target = ctx.found["id"]
     except Exception:
         logger.exception("stranded-session adoption failed for %s", ctx.target)
+def _resume_live_owner_refusal(ctx: _Resume) -> dict | None:
+    """Reject a remote caller before it reads a warm local-owner transcript."""
+    with _session_resume_lock:
+        live = _find_live_session_by_key(ctx.target, ctx.profile_home)
+        if live is None:
+            return None
+        return _reattach_refusal(ctx.rid, *live)
 
 
 def _resume_locate(ctx: _Resume) -> dict | None:
     """Resolve ``ctx.target`` to a stored row (``ctx.found``); a dict is an early response."""
     ctx.found = ctx.db.get_session(ctx.target)
     if ctx.found:
-        return None
+        return _resume_live_owner_refusal(ctx)
     ctx.found = ctx.db.get_session_by_title(ctx.target)
     if ctx.found:
         ctx.target = ctx.found["id"]
-        return None
+        return _resume_live_owner_refusal(ctx)
     if ctx.lazy and _child_run_active(ctx.target):
         # Fresh subagent watch window: `subagent.start` relays BEFORE the child's first DB flush. Proceed lazily
         # with empty history — the live mirror streams the turn and the row exists by upgrade time.
@@ -634,7 +643,7 @@ def _resume_locate(ctx: _Resume) -> dict | None:
         return _resume_live_unpersisted(ctx, live_sid, live)
     if ctx.owns_db:
         _resume_adopt_stranded(ctx)
-    return None if ctx.found else _err(ctx.rid, 4007, "session not found")
+    return _resume_live_owner_refusal(ctx) if ctx.found else _err(ctx.rid, 4007, "session not found")
 
 
 def _resume_follow_tip(ctx: _Resume) -> None:
@@ -793,7 +802,10 @@ def _resume_eager(ctx: _Resume) -> dict:
             agent = _make_agent_in_context(
                 sid, ctx.target, session_db=ctx.db, platform_override=source,
                 context_cwd_is_launch_artifact=(source in _LAUNCH_CWD_NOT_A_WORKSPACE and not ctx.profile_resume_cwd),
-                auth_user_id=_transport_auth_user_id(current_transport()), **stored_runtime_overrides)
+                auth_user_id=_transport_auth_user_id(current_transport()),
+                _local_owner_provenance=_transport_has_local_owner_provenance(
+                    current_transport() or _stdio_transport),
+                **stored_runtime_overrides)
         except Exception as e:
             return _err(ctx.rid, 5000, f"resume failed: {e}")
     with _session_resume_lock:
@@ -1920,7 +1932,8 @@ def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list
         with _profile_build_scope(parent_home):
             agent = _make_agent_in_context(new_sid, new_key, session_db=branch_db, platform_override=source,
                                            context_cwd_is_launch_artifact=_context_cwd_is_launch_artifact(session),
-                                           auth_user_id=parent_user_id)
+                                           auth_user_id=parent_user_id,
+                                           _local_owner_provenance=_session_is_local_provenance(session))
             _init_session(new_sid, new_key, agent, list(history), cols=session.get("cols", 80),
                           cwd=_session_cwd(session), session_db=branch_db, source=source, profile_home=parent_home,
                           explicit_cwd=bool(session.get("explicit_cwd")))
