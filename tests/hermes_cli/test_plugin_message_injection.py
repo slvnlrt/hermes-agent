@@ -52,6 +52,20 @@ def test_cli_running_injection_keeps_existing_interrupt_behaviour():
     assert cli._pending_input.empty()
 
 
+def test_cli_rejects_lifecycle_injection_without_enqueueing():
+    context, manager = _context()
+    cli = SimpleNamespace(
+        _agent_running=False,
+        _pending_input=SimpleQueue(),
+        _interrupt_queue=SimpleQueue(),
+    )
+    manager._cli_ref = cli
+
+    assert context.inject_message("wake", request_id="receipt-1") is False
+    assert cli._pending_input.empty()
+    assert cli._interrupt_queue.empty()
+
+
 def test_gateway_injection_requires_session_key(tmp_path, monkeypatch):
     _write_plugin_config(
         tmp_path,
@@ -202,3 +216,73 @@ def test_gateway_injection_fails_closed_on_host_exception(tmp_path, monkeypatch)
         )
         is False
     )
+
+
+
+
+def test_gateway_injection_rejects_already_expired(tmp_path, monkeypatch):
+    """inject_message returns False for a deadline already in the past."""
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+    outcomes = []
+
+    accepted = context.inject_message(
+        "wake up",
+        session_key="agent:main:telegram:dm:42",
+        request_id="expired-req",
+        expires_at=1.0,  # epoch second 1 — well in the past
+        on_complete=outcomes.append,
+    )
+
+    assert accepted is False
+    injector.assert_not_called()
+    # on_complete must NOT fire when inject_message returns False — caller owns fallback.
+    assert outcomes == []
+
+
+def test_gateway_injection_omits_lifecycle_kwargs_when_not_provided(tmp_path, monkeypatch):
+    """Without request_id/expires_at/on_complete the injector sees only the base kwargs."""
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+    injector = MagicMock(return_value=True)
+    manager.set_gateway_message_injector(object(), injector)
+
+    context.inject_message("ping", session_key="agent:main:telegram:dm:42")
+
+    kw = injector.call_args.kwargs
+    assert "request_id" not in kw
+    assert "expires_at" not in kw
+    assert "on_complete" not in kw
+
+
+def test_gateway_injection_on_complete_not_fired_on_rejection(tmp_path, monkeypatch):
+    """on_complete must not fire when the gateway rejects the injection."""
+    _write_plugin_config(
+        tmp_path,
+        monkeypatch,
+        {"allow_gateway_injection": True},
+    )
+    context, manager = _context()
+    manager.set_gateway_message_injector(object(), MagicMock(return_value=False))
+    outcomes = []
+
+    accepted = context.inject_message(
+        "wake up",
+        session_key="agent:main:telegram:dm:42",
+        request_id="rej",
+        expires_at=10**12,
+        on_complete=outcomes.append,
+    )
+
+    assert accepted is False
+    assert outcomes == []

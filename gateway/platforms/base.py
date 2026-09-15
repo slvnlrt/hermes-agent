@@ -384,7 +384,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import fence_state_after
-from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
+from gateway.platforms.event import (
+    MessageEvent, MessageType, ProcessingOutcome, event_receipts, expire_event_receipts,
+    mark_event_receipts_started, terminalize_event_receipts, transfer_event_receipts,
+)
 from gateway.session import SessionSource, build_session_key
 from gateway.session_transcript import TranscriptReadError
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
@@ -1681,6 +1684,9 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
                 existing.message_type = MessageType.PHOTO
             elif existing_type == MessageType.TEXT and event.message_type != MessageType.TEXT:
                 existing.message_type = event.message_type
+            # Receipt ownership follows a coalesced event; its terminal state is determined by
+            # the one final delivery rather than the discarded wrapper object.
+            transfer_event_receipts(event, existing)
             # Drop the *derived* STT cache (event changed); the echo ledger must survive or
             # notes echo twice.
             for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts"):
@@ -1691,6 +1697,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
         if merge_text and both_text:
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
+            transfer_event_receipts(event, existing)
             return
     pending_messages[session_key] = event
 
@@ -3507,9 +3514,10 @@ class BasePlatformAdapter(ABC):
         return True
 
     def _discard_text_debounce(self, session_key: str) -> None:
-        """Cancel and drop pending text debounce state for control commands."""
+        """Cancel and terminalize pending text debounce state for control commands."""
         state = self._text_debounce_store().pop(session_key, None)
         if state is not None:
+            terminalize_event_receipts(state.event, "cancelled")
             state.cancel_timer()
 
     # ── Session task + guard ownership helpers: paired with the _session_tasks owner map so
@@ -3537,7 +3545,9 @@ class BasePlatformAdapter(ABC):
         logger.warning("[%s] Healing stale session lock for %s (owner task is done/absent)",
                        self.name, session_key)
         self._active_sessions.pop(session_key, None)
-        self._pending_messages.pop(session_key, None)
+        pending = self._pending_messages.pop(session_key, None)
+        if pending is not None:
+            terminalize_event_receipts(pending, "cancelled")
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
         return True
@@ -3555,6 +3565,53 @@ class BasePlatformAdapter(ABC):
             self._release_session_guard(session_key, guard=guard)
             return False
         return True
+
+    @staticmethod
+    def _cancel_injection_deadline(event: MessageEvent) -> None:
+        handle = getattr(event, "_injection_deadline_handle", None)
+        if handle is not None:
+            handle.cancel()
+        with contextlib.suppress(AttributeError):
+            delattr(event, "_injection_deadline_handle")
+
+    def _expire_waiting_injection(self, event: MessageEvent, session_key: str) -> None:
+        """Expire an admitted injection while it is still waiting, without cancelling started work."""
+        if not expire_event_receipts(event):
+            self._arm_injection_deadline(event, session_key)
+            return
+        event._injection_expired_while_waiting = True
+        if self._pending_messages.get(session_key) is event:
+            self._pending_messages.pop(session_key, None)
+        state = self._text_debounce_store().get(session_key)
+        if state is not None and state.event is event:
+            self._text_debounce_store().pop(session_key, None)
+            state.cancel_timer()
+        owner = getattr(getattr(self, "_busy_session_handler", None), "__self__", None)
+        overflow_for = getattr(owner, "_overflow_queue", None)
+        if callable(overflow_for):
+            with contextlib.suppress(Exception):
+                overflow = overflow_for(session_key)
+                if overflow is not None:
+                    overflow[:] = [queued for queued in overflow if queued is not event]
+        self._cancel_injection_deadline(event)
+
+    def _arm_injection_deadline(self, event: MessageEvent, session_key: str) -> None:
+        """Arm the earliest receipt deadline once admission has succeeded."""
+        deadlines = [receipt.expires_at for receipt in event_receipts(event)
+                     if receipt.expires_at is not None and receipt.outcome is None and not receipt.started]
+        if not deadlines:
+            self._cancel_injection_deadline(event)
+            return
+        self._cancel_injection_deadline(event)
+        delay = min(deadlines) - time.time()
+        if delay <= 0:
+            self._expire_waiting_injection(event, session_key)
+            return
+        event._injection_deadline_rearm = (
+            lambda target: self._arm_injection_deadline(target, session_key))
+        loop = asyncio.get_running_loop()
+        event._injection_deadline_handle = loop.call_later(
+            delay, self._expire_waiting_injection, event, session_key)
 
     def _track_session_task(self, session_key: str, task: Any) -> bool:
         """Record ``task`` as the session owner and track it for shutdown; False when
@@ -3592,7 +3649,9 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Session cancellation raised while unwinding %s", self.name,
                              session_key, exc_info=True)
         if discard_pending:
-            self._pending_messages.pop(session_key, None)
+            pending = self._pending_messages.pop(session_key, None)
+            if pending is not None:
+                terminalize_event_receipts(pending, "cancelled")
             self._discard_text_debounce(session_key)
         if release_guard:
             self._release_session_guard(session_key)
@@ -3665,9 +3724,13 @@ class BasePlatformAdapter(ABC):
             self._heal_stale_session_lock(session_key)
         if session_key in self._active_sessions:
             await self._handle_message_while_active(event, session_key)
+            if event._gateway_accepted:
+                self._arm_injection_deadline(event, session_key)
             return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         event._gateway_accepted = self._start_session_processing(event, session_key)
+        if event._gateway_accepted:
+            self._arm_injection_deadline(event, session_key)
 
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass
@@ -4087,33 +4150,49 @@ class BasePlatformAdapter(ABC):
         if late_pending is not None:
             existing_task = self._session_tasks.get(session_key)
             if existing_task is not None and existing_task is not current_task:
-                # The in-band drain (or an earlier late-arrival drain) already spawned a follow-up task that
-                # owns this session. Re-queue the late-arrival event so that task picks it up — avoids
-                # spawning two concurrent _process_message_background tasks for the same key (#17758
-                # follow-up: prevents the create_task path from racing with itself across the
-                # in-band/finally boundary).
                 self._pending_messages[session_key] = late_pending
             else:
-                logger.debug(
-                    "[%s] Late-arrival pending message during cleanup — spawning drain task",
-                    self.name)
+                logger.debug("[%s] Late-arrival pending message during cleanup — spawning drain task",
+                             self.name)
                 self._spawn_drain_task(late_pending, session_key)
         elif current_task is not None and self._session_tasks.get(session_key) is current_task:
             self._cleanup_finished_session_task(session_key, interrupt_event)
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
-        delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
-
-        def _record_delivery(result):
-            nonlocal delivery_attempted, delivery_succeeded
-            if result is not None:
-                delivery_attempted = True
-                delivery_succeeded = delivery_succeeded or bool(getattr(result, "success", False))
-        # Reuse the interrupt event handle_message() installed; new Event only if removed externally.
+        delivery_attempted = delivery_succeeded = processing_ok = False  # feeds the processing-complete hook
+        delivery_all_succeeded = True  # lifecycle receipts require every response obligation
+        _had_injection_receipt = bool(event_receipts(event))
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
+        processing_events = _lazy_attr(self, "_processing_events", dict)
+        processing_events[session_key] = event
         _thread_metadata = _thread_metadata_for_event(event)
+
+        # A deadline prevents a waiting queued turn from starting. It never cancels work after
+        # this receipt-start boundary.
+        if getattr(event, "_injection_expired_while_waiting", False) or (
+            _had_injection_receipt and expire_event_receipts(event)
+        ):
+            self._finish_session_task(session_key, interrupt_event)
+            if processing_events.get(session_key) is event:
+                processing_events.pop(session_key, None)
+            return
+        if _had_injection_receipt and not mark_event_receipts_started(event):
+            self._finish_session_task(session_key, interrupt_event)
+            if processing_events.get(session_key) is event:
+                processing_events.pop(session_key, None)
+            return
+        self._cancel_injection_deadline(event)
+
+        def _record_delivery(result):
+            nonlocal delivery_attempted, delivery_succeeded, delivery_all_succeeded
+            if result is not None:
+                delivery_attempted = True
+                succeeded = bool(getattr(result, "success", False))
+                delivery_succeeded = delivery_succeeded or succeeded
+                delivery_all_succeeded = delivery_all_succeeded and succeeded
+
         typing_task = self._start_typing_refresh(event, interrupt_event, _thread_metadata)
         try:
             await self._run_processing_hook("on_processing_start", event)
@@ -4159,7 +4238,13 @@ class BasePlatformAdapter(ABC):
                     event, extracted, _final_thread_metadata,
                     anything_sent=delivery_attempted or _tts_caption_delivered,
                     record_delivery=_record_delivery)
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            if event_receipts(event):
+                processing_ok = delivery_all_succeeded if delivery_attempted else bool(
+                    getattr(event, "_injection_intentional_silence", False)
+                    or getattr(event, "_injection_delivery_confirmed", False)
+                )
+            else:
+                processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),
@@ -4178,12 +4263,14 @@ class BasePlatformAdapter(ABC):
                 self._spawn_drain_task(pending_event, session_key)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
+            terminalize_event_receipts(event, "cancelled")
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
             raise
         except BaseException as e:
+            terminalize_event_receipts(event, "failure")
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
@@ -4191,6 +4278,8 @@ class BasePlatformAdapter(ABC):
             if isinstance(e, (SystemExit, KeyboardInterrupt)):
                 raise
         finally:
+            if event_receipts(event):
+                terminalize_event_receipts(event, "success" if processing_ok else "failure")
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
@@ -4201,6 +4290,8 @@ class BasePlatformAdapter(ABC):
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
+            if processing_events.get(session_key) is event:
+                processing_events.pop(session_key, None)
 
     def _spawn_drain_task(self, pending_event: MessageEvent, session_key: str) -> None:
         """Hand the session to a fresh task for a queued follow-up — never recurse (chained
@@ -4240,6 +4331,8 @@ class BasePlatformAdapter(ABC):
         stragglers are untracked and left to unwind."""
         # Re-drain (max 5 rounds): a message arriving mid-gather spawns a task clear() would
         # untrack.
+        for event in list(getattr(self, "_processing_events", {}).values()):
+            terminalize_event_receipts(event, "cancelled")
         for _ in range(5):
             tasks = [task for task in self._background_tasks if not task.done()]
             if not tasks:
@@ -4256,13 +4349,17 @@ class BasePlatformAdapter(ABC):
                                "releasing tracking and letting them unwind in the background",
                                self.name, sum(not t.done() for t in tasks))
                 break
+        for event in self._pending_messages.values():
+            terminalize_event_receipts(event, "cancelled")
         with contextlib.suppress(Exception):  # flush pending messages to disk before clearing
             from gateway.shutdown_flush import flush_pending_to_file
             flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
         for state in self._text_debounce_store().values():
+            terminalize_event_receipts(state.event, "cancelled")
             state.cancel_timer()
         for bucket in (self._background_tasks, self._expected_cancelled_tasks, self._session_tasks,
-                       self._pending_messages, self._active_sessions, self._text_debounce_store()):
+                       self._pending_messages, self._active_sessions, self._text_debounce_store(),
+                       getattr(self, "_processing_events", {})):
             bucket.clear()
 
     def has_pending_interrupt(self, session_key: str) -> bool:

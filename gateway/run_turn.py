@@ -1780,6 +1780,7 @@ class GatewayTurnMixin:
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
+            event._injection_intentional_silence = True
             response = ""
 
         adapter = self._adapter_for_source(source)
@@ -1803,6 +1804,8 @@ class GatewayTurnMixin:
                     await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
                 except Exception as _e:
                     logger.debug("trailing footer send failed: %s", _e)
+            # ``already_sent`` is set only after the final streaming payload is confirmed.
+            event._injection_delivery_confirmed = True
             # Return None so the body isn't sent twice; stash the delivered text on the event for the
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):
@@ -2041,6 +2044,15 @@ class GatewayTurnMixin:
                 message_type=event.message_type,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
+
+            # Earlier queued owners are closed by their own in-band final delivery.  The terminal
+            # owner is the sole exception: its final response is still sent by this root adapter task.
+            if isinstance(agent_result, dict):
+                from gateway.platforms.event import transfer_event_receipts
+
+                terminal_receipt_owner = agent_result.pop("_queued_terminal_receipt_owner", None)
+                if terminal_receipt_owner is not None:
+                    transfer_event_receipts(terminal_receipt_owner, event)
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
             # send (bracketed by the adapter against this event) must be ledgered under that
@@ -3575,6 +3587,14 @@ class GatewayTurnMixin:
                 "Discarding pending follow-up for session %s during gateway %s",
                 session_key or "?", self._status_action_label(),
             )
+            from gateway.platforms.event import terminalize_event_receipts
+            if pending_event is not None:
+                terminalize_event_receipts(pending_event, "cancelled")
+            for queued_event in list(self._overflow_queue(session_key) or ()):
+                terminalize_event_receipts(queued_event, "cancelled")
+            overflow = self._overflow_queue(session_key)
+            if overflow is not None:
+                overflow.clear()
             pending_event = None
             pending = None
         return pending_event, pending
@@ -3582,8 +3602,11 @@ class GatewayTurnMixin:
     async def _run_agent_deliver_first_response(
         self, turn_ctx: TurnContext, adapter: Any, response: Any, result: Any, stream_task: Any,
     ) -> None:
-        """Deliver the first response before a queued follow-up runs, unless streaming already did."""
+        """Deliver an in-band response and close that follow-up's receipt from its own send."""
+        from gateway.platforms.event import terminalize_event_receipts
+
         session_key = turn_ctx.session_key
+        receipt_owner = getattr(turn_ctx, "_queued_receipt_owner", None)
         _sc = turn_ctx.stream_consumer_holder[0]
         if _sc and stream_task:
             try:
@@ -3596,12 +3619,14 @@ class GatewayTurnMixin:
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
+        delivery_succeeded = False
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
         if self._is_intentional_silence(_delivery_result, first_response):
             logger.info(
                 "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                 session_key or "?",
             )
+            delivery_succeeded = True
         elif first_response:
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
@@ -3610,7 +3635,7 @@ class GatewayTurnMixin:
                 session_key or "?",
             )
             try:
-                await self._deliver_queued_first_response(
+                delivery_succeeded = await self._deliver_queued_first_response(
                     first_response, source=turn_ctx.source, adapter=adapter,
                     metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
                     text_already_delivered=_already_streamed,
@@ -3621,6 +3646,8 @@ class GatewayTurnMixin:
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
+        if receipt_owner is not None:
+            terminalize_event_receipts(receipt_owner, "success" if delivery_succeeded else "failure")
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
         _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
         if callable(_bg_cb):
@@ -3634,6 +3661,7 @@ class GatewayTurnMixin:
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
+        from gateway.platforms.event import terminalize_event_receipts
         from gateway.platforms.base import merge_pending_message_event
         from gateway.run import _preserve_queued_followup_history_offset
         source, session_id, session_key, run_generation = (
@@ -3642,7 +3670,15 @@ class GatewayTurnMixin:
         _interrupt_depth, history, _status_thread_metadata = (
             turn_ctx._interrupt_depth, turn_ctx.history, turn_ctx._status_thread_metadata,
         )
-        logger.debug("Processing pending message: '%s...'", pending[:40])
+        logger.debug("Processing pending message: '%s...'", (pending or "")[:40])
+        pending_receipts = ()
+        if pending_event is not None:
+            from gateway.platforms.event import (
+                event_receipts, expire_event_receipts, mark_event_receipts_started,
+            )
+            pending_receipts = event_receipts(pending_event)
+            if pending_receipts and expire_event_receipts(pending_event):
+                return result
 
         # Clear the interrupt event so the recursive _run_agent isn't re-interrupted (infinite loop).
         _active = getattr(adapter, "_active_sessions", None) if adapter else None
@@ -3662,9 +3698,19 @@ class GatewayTurnMixin:
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
+        if pending_receipts:
+            if not mark_event_receipts_started(pending_event):
+                return result
+            cancel_deadline = getattr(adapter, "_cancel_injection_deadline", None)
+            if callable(cancel_deadline):
+                cancel_deadline(pending_event)
 
         # Interrupted: discard the response ("Operation interrupted." is noise).
-        if not result.get("interrupted"):
+        if result.get("interrupted"):
+            receipt_owner = getattr(turn_ctx, "_queued_receipt_owner", None)
+            if receipt_owner is not None:
+                terminalize_event_receipts(receipt_owner, "cancelled")
+        else:
             await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
 
         updated_history = result.get("messages", history)
@@ -3683,6 +3729,8 @@ class GatewayTurnMixin:
                     "Discarding stale goal continuation for session %s — goal is no longer active",
                     session_key or "?",
                 )
+                for receipt in pending_receipts:
+                    receipt.terminal("cancelled")
                 return result
             # Resolve the follow-up's session key BEFORE preparing the inbound text: native image
             # paths are buffered under the key given and consumed under next_session_key.
@@ -3697,6 +3745,8 @@ class GatewayTurnMixin:
                 event=pending_event, source=next_source, history=updated_history, session_key=next_session_key,
             )
             if next_message is None:
+                for receipt in pending_receipts:
+                    receipt.terminal("failure")
                 return result
             next_message_id = self._reply_anchor_for_event(pending_event)
             next_inbound_id = str(pending_event.message_id) if getattr(pending_event, "message_id", None) else None
@@ -3738,6 +3788,7 @@ class GatewayTurnMixin:
         await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")
         # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker
         # (the helper's own ``except Exception`` does not catch cancellation).
+        followup_result = None
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
 
@@ -3747,17 +3798,26 @@ class GatewayTurnMixin:
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
+                receipt_owner=pending_event if pending_receipts else None,
             )
+            await _run_followup_processing_hook(
+                _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
         except asyncio.CancelledError:
+            terminalize_event_receipts(pending_event, "cancelled")
+            if isinstance(followup_result, dict):
+                terminalize_event_receipts(
+                    followup_result.get("_queued_terminal_receipt_owner"), "cancelled")
             await _run_followup_processing_hook(
                 _hook_adapter, pending_event, "on_processing_complete", _followup_cancel_outcome(_hook_adapter))
             raise
         except BaseException:
+            terminalize_event_receipts(pending_event, "failure")
+            if isinstance(followup_result, dict):
+                terminalize_event_receipts(
+                    followup_result.get("_queued_terminal_receipt_owner"), "failure")
             await _run_followup_processing_hook(
                 _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.FAILURE)
             raise
-        await _run_followup_processing_hook(
-            _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
         merged = _preserve_queued_followup_history_offset(result, followup_result)
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal
@@ -4059,17 +4119,25 @@ class GatewayTurnMixin:
         channel_prompt: Optional[str] = None, moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None, message_type: Optional[str] = None,
-        persist_user_display_metadata: Optional[dict] = None,
+        persist_user_display_metadata: Optional[dict] = None, receipt_owner: Any = None,
     ) -> Dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
-            return await self._run_agent_via_proxy(
+            response = await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id,
             )
+            if receipt_owner is not None:
+                if isinstance(response, dict):
+                    response = {**response, "_queued_terminal_receipt_owner": receipt_owner}
+                else:
+                    from gateway.platforms.event import terminalize_event_receipts
+
+                    terminalize_event_receipts(receipt_owner, "failure")
+            return response
 
         from run_agent import AIAgent
 
@@ -4085,6 +4153,7 @@ class GatewayTurnMixin:
             persist_user_display_kind=persist_user_display_kind,
             persist_user_display_metadata=persist_user_display_metadata,
         )
+        turn_ctx._queued_receipt_owner = receipt_owner
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
@@ -4129,4 +4198,11 @@ class GatewayTurnMixin:
 
         await self._run_agent_mark_streamed_delivery(response, turn_ctx)
         self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
+        if receipt_owner is not None:
+            if isinstance(response, dict):
+                response = {**response, "_queued_terminal_receipt_owner": receipt_owner}
+            else:
+                from gateway.platforms.event import terminalize_event_receipts
+
+                terminalize_event_receipts(receipt_owner, "failure")
         return response

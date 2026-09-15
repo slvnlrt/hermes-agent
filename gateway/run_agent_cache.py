@@ -495,9 +495,27 @@ class GatewayAgentCacheMixin:
                 await adapter.interrupt_session_activity(session_key, source.chat_id, metadata=metadata)
             else:
                 await adapter.interrupt_session_activity(session_key, source.chat_id)
+        from gateway.platforms.event import terminalize_event_receipts
+
+        def _cancel_waiting_injection(event: Any) -> None:
+            if event is None:
+                return
+            cancel_deadline = getattr(adapter, "_cancel_injection_deadline", None)
+            if callable(cancel_deadline):
+                cancel_deadline(event)
+            else:
+                handle = getattr(event, "_injection_deadline_handle", None)
+                if handle is not None:
+                    handle.cancel()
+            terminalize_event_receipts(event, "cancelled")
+
         if adapter and hasattr(adapter, "get_pending_message"):
-            adapter.get_pending_message(session_key)  # consume and discard
+            _cancel_waiting_injection(adapter.get_pending_message(session_key))
         if state is not None:
+            overflow = state.conversation.queued_events
+            for queued_event in overflow:
+                _cancel_waiting_injection(queued_event)
+            overflow.clear()
             state.persistent.pending_command_text = None
         if release_running_state:
             # Guarded release: a message that arrived during the awaits above may already run as

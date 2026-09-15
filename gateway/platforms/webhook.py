@@ -225,6 +225,9 @@ class WebhookAdapter(BasePlatformAdapter):
         # Without an api_server listener this port is the shared listener: forward a secondary's
         # inbound-port platforms (Twilio, LINE, Teams, ...) registered in shared-listener mode.
         app.router.add_route("*", "/p/{profile}/{tail:.*}", self._handle_profile_ingress)
+        # Plugin-registered native routes; wired BEFORE AppRunner.setup() freezes the router
+        # so extensions can add their own aiohttp routes to the live app.
+        self._wire_plugin_handlers(app)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
         # SO_REUSEADDR: on macOS (BSD) two wildcard/specific sockets can silently split traffic while
@@ -244,7 +247,6 @@ class WebhookAdapter(BasePlatformAdapter):
         self._mark_connected(listener_base=listener_base_url(self._host, self._port))
         logger.info("[webhook] Listening on %s:%d — routes: %s", self._host or "* (all interfaces, IPv4+IPv6)",
                     self._port, ", ".join(self._routes.keys()) or "(none configured)")
-        self._wire_plugin_handlers(None)
         return True
 
     async def disconnect(self) -> None:

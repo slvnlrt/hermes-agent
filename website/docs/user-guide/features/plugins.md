@@ -103,7 +103,7 @@ Every `ctx.*` API below is available inside a plugin's `register(ctx)` function.
 | Add slash commands | `ctx.register_command(name, handler, description)` — adds `/name` in CLI and gateway sessions |
 | Dispatch tools from commands | `ctx.dispatch_tool(name, args)` — invokes a registered tool with parent-agent context auto-wired |
 | Add CLI commands | `ctx.register_cli_command(name, help, setup_fn, handler_fn)` — adds `hermes <plugin> <subcommand>` |
-| Inject messages | `ctx.inject_message(content, role="user", session_key=...)` - see [Injecting Messages](#injecting-messages) |
+| Inject messages | `ctx.inject_message(content, role="user", session_key=..., request_id=..., expires_at=..., on_complete=...)` - see [Injecting Messages](#injecting-messages) |
 | Ship data files | `Path(__file__).parent / "data" / "file.yaml"` |
 | Bundle skills | `ctx.register_skill(name, path)` — namespaced as `plugin:skill`, loaded via `skill_view("plugin:skill")` |
 | Gate on env vars | `requires_env: [API_KEY]` in plugin.yaml — prompted during `hermes plugins install` |
@@ -724,7 +724,7 @@ ctx.inject_message(
 )
 ```
 
-**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None) -> bool`
+**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None, request_id: str | None = None, expires_at: float | None = None, on_complete: Callable[[str], None] | None = None) -> bool`
 
 In CLI mode:
 
@@ -742,8 +742,34 @@ In gateway mode:
 - Injected text is always conversational input. It cannot invoke slash commands, approve tools, or resolve pending confirmation and clarification prompts.
 - The route and conversation are pinned while dispatch is pending. Hermes drops the request if topic recovery changes the route or the session rotates before handling starts.
 - The request enters the platform adapter's normal message path. Active sessions use the existing busy-session queue rather than starting a competing turn.
-- Returns `True` when the live gateway accepts the request for asynchronous dispatch. This does not confirm that the agent turn or platform delivery has completed.
-- Returns `False` when `session_key` is omitted, the permission is not granted, or no live gateway can accept the request. Unknown or unroutable session keys discovered after asynchronous acceptance are written to the gateway log.
+- Returns `True` when the live gateway accepts the request for asynchronous dispatch. This does not confirm that the agent turn or platform delivery has completed. When *on_complete* is provided, a terminal callback fires exactly once after resolution.
+- Returns `False` when `session_key` is omitted, the permission is not granted, no live gateway can accept the request, or the deadline in *expires_at* has already passed. Unknown or unroutable session keys discovered after asynchronous acceptance are written to the gateway log. When returning `False`, *on_complete* is never called — the caller owns fallback notification.
+
+### Receipt Lifecycle (optional)
+
+Plugins that need to track injection outcomes can pass receipt lifecycle parameters:
+
+- **`request_id`** — opaque identifier forwarded to the gateway scheduler; appears in gateway logs and event metadata.
+- **`expires_at`** — Unix epoch deadline. Injections are rejected immediately if already expired, and again at dispatch time and when dequeued for processing. Outcome: `"expired"`.
+- **`on_complete`** — callback invoked **exactly once** with an outcome string after terminal resolution (wrapped by the core for at-most-once safety):
+  - `"success"` — the agent processed the injection and delivered a response (or intentionally stayed silent).
+  - `"failure"` — the handler or platform delivery raised an error.
+  - `"cancelled"` — the gateway shut down or the processing task was cancelled.
+  - `"expired"` — the injection's `expires_at` deadline passed before processing started.
+  - `"not_routed"` — the session was not found, authorization was denied, or no adapter was available.
+
+`on_complete` fires only when `inject_message()` returns `True`. When it returns `False`, the caller handles the rejection directly.
+
+```python
+# Example: track injection outcome
+ctx.inject_message(
+    "Machine event for processing",
+    session_key="agent:main:telegram:dm:123456789",
+    request_id="evt-abc123",
+    expires_at=time.time() + 120,
+    on_complete=lambda outcome: store.finish("evt-abc123", outcome),
+)
+```
 
 This enables plugins like remote control viewers, messaging bridges, or webhook receivers to feed messages into the conversation from external sources.
 

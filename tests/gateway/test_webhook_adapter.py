@@ -25,7 +25,7 @@ from collections import deque
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from aiohttp import web
+from aiohttp import ClientSession, web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import Platform, PlatformConfig
@@ -1113,3 +1113,40 @@ def test_route_profile_validation_fails_closed():
         assert WebhookAdapter._route_allows_profile(
             {"profile": malformed}, "worker"
         ) is False
+
+
+class TestPluginHandlerWireOrder:
+    """Plugin routes are mounted before AppRunner freezes the live router."""
+
+    @pytest.mark.asyncio
+    async def test_connect_serves_plugin_route_and_disconnect_cleans_up(self):
+        adapter = _make_adapter(
+            routes={"test": {"events": ["push"], "secret": "s3cret", "prompt": "hi"}},
+            host="127.0.0.1",
+        )
+        seen = []
+
+        async def _plugin_route(request):
+            seen.append(request.path)
+            return web.Response(text="plugin route")
+
+        def _factory(app, wired_adapter):
+            assert wired_adapter is adapter
+            app.router.add_get("/plugin-route", _plugin_route)
+
+        manager = MagicMock()
+        manager.get_platform_handler_factories.return_value = [(_factory, "route-plugin")]
+        try:
+            with patch("hermes_cli.plugins.get_plugin_manager", return_value=manager):
+                assert await adapter.connect()
+            site = next(iter(adapter._runner.sites))
+            port = site._server.sockets[0].getsockname()[1]
+            async with ClientSession() as session:
+                async with session.get(f"http://127.0.0.1:{port}/plugin-route") as response:
+                    assert response.status == 200
+                    assert await response.text() == "plugin route"
+            assert seen == ["/plugin-route"]
+        finally:
+            await adapter.disconnect()
+        assert adapter._runner is None
+        assert adapter.is_connected is False

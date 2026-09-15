@@ -7,9 +7,98 @@ gateway.platforms.*.
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+import logging
+import threading
+import time
+from typing import Any, Callable, Dict, List, Optional
 
 from gateway.session import SessionSource
+
+logger = logging.getLogger(__name__)
+
+
+class InjectionReceipt:
+    """Process-local terminal receipt for one accepted plugin injection.
+
+    ``terminal`` is safe to call from the scheduling thread, event loop, or an adapter
+    cancellation callback.  It guarantees at-most-once callback invocation within this
+    process; a process crash before invocation remains inherently unacknowledged.
+    """
+
+    def __init__(self, callback: Callable[[str], None] | None = None,
+                 expires_at: float | None = None) -> None:
+        self.callback = callback
+        self.expires_at = expires_at
+        self._lock = threading.Lock()
+        self.outcome: str | None = None
+        self.started = False
+
+    def is_expired(self, now: float | None = None) -> bool:
+        return self.expires_at is not None and self.expires_at <= (time.time() if now is None else now)
+    def start(self) -> bool:
+        """Claim execution unless already terminal; callers check queued expiry first."""
+        with self._lock:
+            if self.outcome is not None:
+                return False
+            self.started = True
+            return True
+
+    def terminal(self, outcome: str) -> bool:
+        with self._lock:
+            if self.outcome is not None:
+                return False
+            self.outcome = outcome
+        if self.callback is not None:
+            try:
+                self.callback(outcome)
+            except Exception:
+                logger.warning("Plugin injection completion callback failed", exc_info=True)
+        return True
+
+    def __call__(self, outcome: str) -> bool:
+        return self.terminal(outcome)
+
+
+def event_receipts(event: Any) -> list[InjectionReceipt]:
+    """The event's process-local injection receipts, never serialized in metadata."""
+    return list(getattr(event, "_injection_receipts", ()) or ())
+
+
+def terminalize_event_receipts(event: Any, outcome: str) -> None:
+    for receipt in event_receipts(event):
+        receipt.terminal(outcome)
+
+
+def mark_event_receipts_started(event: Any) -> bool:
+    """Claim all receipts currently owned by an event; False when expiry won the race."""
+    receipts = event_receipts(event)
+    return bool(receipts) and all(receipt.start() for receipt in receipts)
+
+
+def expire_event_receipts(event: Any, now: float | None = None) -> bool:
+    """Terminalize waiting receipts and return whether the receipt-bearing event is empty."""
+    receipts = event_receipts(event)
+    if not receipts:
+        return False
+    live = [receipt for receipt in receipts if receipt.started or not receipt.is_expired(now)]
+    for receipt in receipts:
+        if receipt not in live:
+            receipt.terminal("expired")
+    event._injection_receipts = live
+    return not live
+def transfer_event_receipts(source: Any, target: Any) -> None:
+    """Move receipt ownership with a coalesced or runner-drained event."""
+    receipts = event_receipts(source)
+    if not receipts:
+        return
+    handle = getattr(source, "_injection_deadline_handle", None)
+    if handle is not None:
+        handle.cancel()
+    target._injection_receipts = [*event_receipts(target), *receipts]
+    source._injection_receipts = []
+    rearm = getattr(source, "_injection_deadline_rearm", None)
+    if callable(rearm):
+        rearm(target)
 
 
 class MessageType(Enum):
@@ -86,6 +175,10 @@ class MessageEvent:
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
+    def __post_init__(self) -> None:
+        # Deliberately an ordinary instance attribute: dataclasses.asdict() and every
+        # serializable event path must never traverse callbacks, locks, or deadlines.
+        self._injection_receipts: list[InjectionReceipt] = []
 
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""

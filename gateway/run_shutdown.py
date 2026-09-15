@@ -1754,6 +1754,12 @@ class GatewayShutdownMixin:
         self.adapters.clear()
         for _session_key in list(self._running_agents):
             self._release_running_agent_state(_session_key)
+        from gateway.platforms.event import terminalize_event_receipts
+        for event in self._pending_messages.values():
+            terminalize_event_receipts(event, "cancelled")
+        for overflow in dict(getattr(self, "_queued_events", None) or {}).values():
+            for event in overflow:
+                terminalize_event_receipts(event, "cancelled")
         # Flush pending messages before clearing: under FTS5 corruption they are the only surviving copy.
         with suppress(Exception):
             from gateway.shutdown_flush import flush_pending_to_file

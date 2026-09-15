@@ -66,6 +66,16 @@ def test_flush_writes_message_event_to_file(tmp_path, monkeypatch):
     assert payload["data"]["session_id"] == "20260728_120000_abc"
 
 
+
+def test_shutdown_does_not_spool_lifecycle_managed_injection(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr("gateway.shutdown_flush._get_flush_dir", lambda: flush_dir)
+    injection = MagicMock()
+    injection._injection_lifecycle_managed = True
+
+    assert flush_pending_to_file({"session_key_1": injection}, reason="shutdown") == 0
+    assert list(flush_dir.glob("*.json")) == []
+
 def test_recover_inserts_via_append_message_and_deletes_file(tmp_path, monkeypatch):
     flush_dir = _make_flush_dir(tmp_path)
     monkeypatch.setattr(

@@ -389,17 +389,16 @@ class GatewayNotificationsMixin:
         metadata: Optional[Dict[str, Any]] = None, event_message_id: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
-    ) -> None:
-        """Deliver a queued response using the normal text+attachment split.
-
-        ``session_key`` lets the text send record a delivery-ledger obligation like the normal final
-        send does, keyed on ``inbound_message_id`` (the raw inbound id, distinct from the
-        ``event_message_id`` reply anchor); see ``_send_queued_final_text``. Without a key the send
-        stays unledgered."""
+    ) -> bool:
+        """Deliver a queued response and report whether every response obligation succeeded."""
         from gateway.run import _strip_response_attachments_for_direct_send
+
+        delivery_attempted = text_already_delivered
+        delivery_succeeded = text_already_delivered
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
+                delivery_attempted = True
                 # Reconcile-by-edit first: a stream-sealed message already carries most of the answer;
                 # a plain send here would duplicate it.
                 _reconciled = False
@@ -415,37 +414,38 @@ class GatewayNotificationsMixin:
                         )
                         if getattr(_edit_res, "success", False):
                             _reconciled = True
+                            delivery_succeeded = True
                             logger.info(
                                 "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
                                 _sc_msg_id,
                             )
                         else:
-                            # P5(b): a DECLINE is not "editing unavailable". The
-                            # send below re-delivers the whole response to the
-                            # chat the connector just refused.
+                            # A connector decline must not fall through to a forbidden send.
                             from gateway.relay.egress import declined_send
 
                             if declined_send(_edit_res):
                                 logger.warning(
-                                    "Queued-lane reconcile edit DECLINED by the "
-                                    "connector's egress guard; not falling back "
-                                    "to a send (the destination is not approved)."
+                                    "Queued-lane reconcile edit DECLINED by the connector's egress guard; "
+                                    "not falling back to a send (the destination is not approved)."
                                 )
-                                return
+                                return False
                     except Exception as _qe:
                         logger.debug("Queued-lane reconcile edit failed (%s); falling back to send.", _qe)
                 if not _reconciled:
-                    await self._send_queued_final_text(
+                    send_result = await self._send_queued_final_text(
                         adapter, source, text_content, metadata, event_message_id, session_key,
                         inbound_message_id)
-        # Failed turns deliver their (normalized failure) text but must not upload attachments as if
-        # they succeeded — mirrors the ``not agent_result.get("failed")`` completed-turn guard.
-        if not deliver_media:
-            return
-        await self._deliver_media_from_response(
-            response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
-            thread_metadata=metadata,
-        )
+                    delivery_succeeded = bool(getattr(send_result, "success", False))
+        # Failed turns deliver their normalized failure text but do not upload attachments as success.
+        if deliver_media:
+            media_succeeded = await self._deliver_media_from_response(
+                response, MessageEvent(text="", source=source, message_id=event_message_id), adapter,
+                thread_metadata=metadata,
+            )
+            if media_succeeded is not None:
+                delivery_attempted = True
+                delivery_succeeded = delivery_succeeded and media_succeeded
+        return delivery_attempted and delivery_succeeded
 
     async def _send_queued_final_text(
         self, adapter, source: SessionSource, text_content: str, metadata: Optional[Dict[str, Any]],

@@ -65,6 +65,11 @@ def _write_payload(flush_dir: Path, payload: Dict[str, Any]) -> Path:
 
 def _flush_value(flush_dir: Path, kind: str, session_key: str, value: Any, **extra: Any) -> bool:
     """Serialise and write one pending value; return True when a payload was written."""
+    # Lifecycle-managed plugin injections have a process-local receipt and expiry contract.
+    # Replaying their text as a recovered human message would both lose that contract and upgrade
+    # its provenance, so their terminal receipt is the only consumer-facing record on shutdown.
+    if getattr(value, "_injection_lifecycle_managed", False) is True:
+        return False
     try:
         serialised = _serialise_value(value)
         if serialised is None:

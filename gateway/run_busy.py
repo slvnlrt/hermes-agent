@@ -131,11 +131,17 @@ class GatewayBusySessionMixin:
             pending_event = pending_slot.get(session_key)
             if self._is_goal_continuation_event(pending_event):
                 pending_slot.pop(session_key, None)
+                from gateway.platforms.event import terminalize_event_receipts
+                terminalize_event_receipts(pending_event, "cancelled")
                 removed += 1
 
         overflow = self._overflow_queue(session_key)
         if overflow:
             kept = [e for e in overflow if not self._is_goal_continuation_event(e)]
+            for event in overflow:
+                if event not in kept:
+                    from gateway.platforms.event import terminalize_event_receipts
+                    terminalize_event_receipts(event, "cancelled")
             removed += len(overflow) - len(kept)
             self._peek_session_state(session_key).conversation.queued_events = kept
         return removed

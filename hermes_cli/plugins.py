@@ -606,19 +606,48 @@ class PluginContext:
     # manager's home, never the active profile's (#65593 constraint).
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
+        request_id: str | None = None, expires_at: float | None = None,
+        on_complete: Callable[[str], None] | None = None,
     ) -> bool:
         """Inject a message into a CLI or gateway conversation (new turn if idle, interrupt if running).
         Gateway injection needs an existing ``session_key`` plus
         ``plugins.entries.<plugin_id>.allow_gateway_injection``; ``True`` means the gateway accepted the
-        request for async dispatch, not that delivery completed."""
+        request for async dispatch, not that delivery completed.
+
+        A receipt callback is process-local and invoked at most once with ``"success"``, ``"failure"``,
+        ``"cancelled"``, ``"expired"`` or ``"not_routed"``. A crash can still prevent completion, and
+        callers whose request is refused synchronously retain their fallback responsibility.
+        """
+        import math
+        import time as _time
+
+        if request_id is not None and (
+            not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id)
+        ):
+            raise ValueError("request_id must contain 1-128 letters, digits, '.', '_', ':' or '-'")
+        if expires_at is not None and (
+            isinstance(expires_at, bool) or not isinstance(expires_at, (int, float))
+            or not math.isfinite(expires_at)
+        ):
+            raise ValueError("expires_at must be a finite Unix timestamp")
+        if on_complete is not None and (
+            not callable(on_complete) or inspect.iscoroutinefunction(on_complete)
+        ):
+            raise TypeError("on_complete must be a synchronous callable")
+
         cli = self._manager._cli_ref
         msg = content if role == "user" else f"[{role}] {content}"
         if cli is not None:
+            if request_id is not None or expires_at is not None or on_complete is not None:
+                logger.warning("inject_message: CLI mode does not support injection lifecycle receipts")
+                return False
             queue_ = cli._interrupt_queue if getattr(cli, "_agent_running", False) else cli._pending_input
             queue_.put(msg)
             return True
         if not session_key:
             logger.warning("inject_message: gateway mode requires an existing session_key")
+            return False
+        if expires_at is not None and expires_at <= _time.time():
             return False
         if not self._gateway_injection_allowed():
             logger.warning("inject_message: gateway injection denied for plugin %s; set "
@@ -628,10 +657,18 @@ class PluginContext:
         if not self._manager.has_gateway_message_injector:
             logger.warning("inject_message: no live gateway is available")
             return False
+        kwargs: dict[str, Any] = dict(
+            session_key=session_key, content=msg, plugin_id=self.plugin_id,
+        )
+        if request_id is not None:
+            kwargs["request_id"] = request_id
+        if expires_at is not None:
+            kwargs["expires_at"] = expires_at
+        if on_complete is not None:
+            from gateway.platforms.event import InjectionReceipt
+            kwargs["on_complete"] = InjectionReceipt(on_complete, expires_at)
         try:
-            return bool(self._manager.inject_gateway_message(
-                session_key=session_key, content=msg, plugin_id=self.plugin_id,
-            ))
+            return bool(self._manager.inject_gateway_message(**kwargs))
         except Exception:
             logger.warning("inject_message: gateway scheduling failed for plugin %s", self.plugin_id,
                            exc_info=True)
