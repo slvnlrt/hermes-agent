@@ -2275,8 +2275,23 @@ class GatewayTurnMixin:
 
             result = await self._run_in_executor_with_context(run_sync)
 
-            response = result.get("final_response", "") if result else ""
-            if not response and result and result.get("error"):
+            if not isinstance(result, dict):
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=f"❌ Background task {task_id} failed: no result returned.",
+                    metadata=_thread_metadata,
+                )
+                return
+            if result.get("failed"):
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=f"❌ Background task {task_id} failed: {result.get('error') or 'agent run failed'}",
+                    metadata=_thread_metadata,
+                )
+                return
+
+            response = result.get("final_response", "")
+            if not response and result.get("error"):
                 response = f"Error: {result['error']}"
             # Fresh conversation, so history_offset=0: every message in the run belongs to this turn.
             if response:
@@ -2284,31 +2299,51 @@ class GatewayTurnMixin:
 
             preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
             header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
-            images, media_files, text_content = [], [], ""
+            images, media_files, text_content, dropped_media = [], [], "", []
             if response:
+                from gateway.run_notifications import _split_media_by_delivery_policy
+
                 media_files, response = adapter.extract_media(response)
-                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+                media_files, _, dropped_media = _split_media_by_delivery_policy(media_files, [])
                 images, text_content = adapter.extract_images(response)
-            if text_content:
-                await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
-            elif not images and not media_files:
-                await adapter.send(
-                    chat_id=source.chat_id, content=header + "(No response generated)", metadata=_thread_metadata,
-                )
+
+            def _attachment_name(path) -> str:
+                from urllib.parse import urlsplit
+
+                raw_path = str(path).split("?", 1)[0]
+                parsed = urlsplit(raw_path)
+                if parsed.scheme and parsed.netloc:
+                    raw_path = parsed.path
+                return raw_path.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1] or "?"
+
+            delivery_failures = list(dropped_media)
+            delivered_attachments = False
             for image_url, alt_text in (images or []):
-                with suppress(Exception):
-                    await adapter.send_image(
+                try:
+                    image_result = await adapter.send_image(
                         chat_id=source.chat_id, image_url=image_url, caption=alt_text, metadata=_thread_metadata,
                     )
+                except Exception as exc:
+                    logger.warning("Background task image delivery failed: %s", exc)
+                    delivery_failures.append(image_url)
+                else:
+                    if getattr(image_result, "success", True) is False:
+                        logger.warning(
+                            "Background task image delivery failed: %s",
+                            getattr(image_result, "error", None) or "send returned success=False",
+                        )
+                        delivery_failures.append(image_url)
+                    else:
+                        delivered_attachments = True
             # Route each media file by type (voice bubble / video / image / document), as the
             # streaming + kanban paths do.
             from gateway.platforms.base import should_send_media_as_audio as _should_send_media_as_audio
             from gateway.run_notifications import _IMAGE_EXTS, _VIDEO_EXTS
             for media_path, _is_voice in (media_files or []):
                 _ext = os.path.splitext(media_path)[1].lower()
-                with suppress(Exception):
+                try:
                     if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                        await adapter.send_voice(
+                        media_result = await adapter.send_voice(
                             chat_id=source.chat_id, audio_path=media_path, metadata=_thread_metadata,
                             is_voice=_is_voice,
                         )
@@ -2318,7 +2353,66 @@ class GatewayTurnMixin:
                             else (adapter.send_image_file, "image_path") if _ext in _IMAGE_EXTS
                             else (adapter.send_document, "file_path")
                         )
-                        await sender(chat_id=source.chat_id, metadata=_thread_metadata, **{key: media_path})
+                        media_result = await sender(
+                            chat_id=source.chat_id, metadata=_thread_metadata, **{key: media_path},
+                        )
+                except Exception as exc:
+                    logger.warning("Background task media delivery failed: %s", exc)
+                    delivery_failures.append(media_path)
+                else:
+                    if getattr(media_result, "success", True) is False:
+                        logger.warning(
+                            "Background task media delivery failed: %s",
+                            getattr(media_result, "error", None) or "send returned success=False",
+                        )
+                        delivery_failures.append(media_path)
+                    else:
+                        delivered_attachments = True
+
+            if delivery_failures:
+                failed_names = ", ".join(sorted({_attachment_name(path) for path in delivery_failures}))
+                delivery_status = "partially delivered" if text_content or delivered_attachments else "delivery failed"
+                failure_content = (
+                    f"⚠️ Background task {delivery_status}\nPrompt: \"{preview}\"\n\n"
+                )
+                if text_content:
+                    failure_content += f"{text_content}\n\n"
+                failure_content += f"Couldn't deliver attachment(s): {failed_names}."
+                notice_result = await adapter.send(
+                    chat_id=source.chat_id, content=failure_content, metadata=_thread_metadata,
+                )
+                if getattr(notice_result, "success", True) is False:
+                    logger.warning(
+                        "Background task delivery-failure notice was not delivered: %s",
+                        getattr(notice_result, "error", None) or "send returned success=False",
+                    )
+            elif text_content:
+                text_result = await adapter.send(
+                    chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata,
+                )
+                if getattr(text_result, "success", True) is False:
+                    logger.warning(
+                        "Background task response was not delivered: %s",
+                        getattr(text_result, "error", None) or "send returned success=False",
+                    )
+            elif images or media_files:
+                completion_result = await adapter.send(
+                    chat_id=source.chat_id, content=header + "(Attachment delivered)", metadata=_thread_metadata,
+                )
+                if getattr(completion_result, "success", True) is False:
+                    logger.warning(
+                        "Background task completion marker was not delivered: %s",
+                        getattr(completion_result, "error", None) or "send returned success=False",
+                    )
+            else:
+                completion_result = await adapter.send(
+                    chat_id=source.chat_id, content=header + "(No response generated)", metadata=_thread_metadata,
+                )
+                if getattr(completion_result, "success", True) is False:
+                    logger.warning(
+                        "Background task completion marker was not delivered: %s",
+                        getattr(completion_result, "error", None) or "send returned success=False",
+                    )
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)

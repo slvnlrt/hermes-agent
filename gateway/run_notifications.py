@@ -31,6 +31,51 @@ _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
 _WATCHER_ROUTE_FIELDS = ("session_key", "platform", "chat_type", "chat_id", "thread_id", "user_id", "user_name")
 _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 
+
+
+def _split_media_by_delivery_policy(media_files, local_files):
+    """Partition extracted media into accepted deliveries and withheld raw paths.
+
+    The delivery filters resolve accepted paths (including symlinks), so compare
+    each raw candidate through its own filter rather than comparing normalized
+    paths after a bulk filter. That preserves remote-fetch fallbacks and avoids
+    classifying a renamed survivor as a dropped attachment.
+    """
+    kept_media, kept_local, dropped = [], [], []
+    for media_path, is_voice in media_files or []:
+        accepted = BasePlatformAdapter.filter_media_delivery_paths([(media_path, is_voice)])
+        if accepted:
+            kept_media.extend(accepted)
+        else:
+            dropped.append(str(media_path))
+    for local_path in local_files or []:
+        accepted = BasePlatformAdapter.filter_local_delivery_paths([local_path])
+        if accepted:
+            kept_local.extend(accepted)
+        else:
+            dropped.append(str(local_path))
+    return kept_media, kept_local, dropped
+
+
+async def _notify_dropped_media(adapter, chat_id, dropped_paths, metadata=None) -> None:
+    """Tell the chat that explicit attachments could not be delivered."""
+    if not dropped_paths:
+        return
+    names = ", ".join(sorted({
+        str(path).rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1] or "?"
+        for path in dropped_paths
+    }))
+    try:
+        await adapter.send(
+            chat_id=chat_id,
+            content=f"Couldn't deliver attachment(s): {names}.",
+            metadata=metadata,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[%s] dropped-media notice failed: %s", getattr(adapter, "name", "?"), exc,
+        )
+
 # Durable async-delegation claim transitions: kind -> (tools.async_delegation function, failure log).
 _DURABLE_CLAIM_OPS = {
     "drop": ("drop_completion_delivery", "Could not drop durable completion claim"),
@@ -262,23 +307,21 @@ class GatewayNotificationsMixin:
 
     async def _deliver_media_from_response(
         self, response: str, event: MessageEvent, adapter, thread_metadata: Optional[Dict[str, Any]] = None
-    ) -> None:
-        """Deliver explicit MEDIA: tags from an already-streamed response (text already delivered).
-        EXPLICIT-ONLY, unlike the non-streaming path in ``gateway/platforms/base.py``: a bare local
-        path in a streamed reply is shown text or stale inspected content, and promoting it sent
-        files the model never asked for. MEDIA tags are NOT deduped against prior turns (a final-reply
-        directive is a deliberate attach); stale auto-appended tags are deduped upstream.
+    ) -> Optional[bool]:
+        """Deliver explicit MEDIA: tags from an already-streamed response.
 
-        Only ``MEDIA:`` directives — the explicit attachment contract — trigger post-stream uploads. See
-        #20834.
+        Returns ``None`` when the response contains no attachment obligation, otherwise whether
+        every requested attachment reached the adapter.  A returned ``SendResult(success=False)``
+        is the same delivery failure as an exception.
         """
         from urllib.parse import quote as _quote
-        with _log_suppressed(logging.WARNING, "Post-stream media extraction failed: %s"):
+
+        try:
             # Capture [[as_document]] before extract_media strips it: images then go via send_document.
             force_document_attachments = "[[as_document]]" in response
-            from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
+            from gateway.platforms.base import should_send_media_as_audio
             media_files, cleaned = adapter.extract_media(response)
-            media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+            media_files, _, dropped_media = _split_media_by_delivery_policy(media_files, [])
             # Strip image URLs (parity with the non-streaming chain); no extract_local_files here.
             # Do NOT deduplicate explicit MEDIA tags against prior turns here (#73771). This rescan is
             # already EXPLICIT-ONLY (see docstring): a MEDIA: directive in the final streamed reply is the
@@ -301,25 +344,44 @@ class GatewayNotificationsMixin:
 
             image_paths = [p for p, v in media_files if _is_photo(p, v)]
             non_image_media = [(p, v) for p, v in media_files if not _is_photo(p, v)]
+            if not (image_paths or non_image_media or dropped_media):
+                return None
+            delivery_failures = list(dropped_media)
             if image_paths:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
+                    image_result = await adapter.send_multiple_images(
+                        chat_id=chat_id, images=images, metadata=_thread_meta)
+                    if getattr(image_result, "success", True) is False:
+                        delivery_failures.extend(image_paths)
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
+                    delivery_failures.extend(image_paths)
             for media_path, is_voice in non_image_media:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        media_result = await adapter.send_voice(
                             chat_id=chat_id, audio_path=media_path, metadata=_thread_meta, is_voice=is_voice,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
+                        media_result = await adapter.send_video(
+                            chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
                     else:
-                        await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                        media_result = await adapter.send_document(
+                            chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                    if getattr(media_result, "success", True) is False:
+                        delivery_failures.append(media_path)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                    delivery_failures.append(media_path)
+            if delivery_failures:
+                await _notify_dropped_media(adapter, chat_id, delivery_failures, _thread_meta)
+                return False
+            return True
+        except Exception as e:
+            logger.warning("[%s] Post-stream media extraction failed: %s", getattr(adapter, "name", "?"), e)
+            return False
 
 
     async def _deliver_queued_first_response(
