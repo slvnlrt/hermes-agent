@@ -52,6 +52,7 @@ def _adapter():
         extract_media=BasePlatformAdapter.extract_media,
         extract_images=BasePlatformAdapter.extract_images,
         extract_local_files=BasePlatformAdapter.extract_local_files,
+        send=AsyncMock(return_value=SendResult(success=True, message_id="notice")),
         send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
         send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
         send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
@@ -111,4 +112,22 @@ async def test_explicit_media_tag_still_delivers_post_stream(tmp_path, monkeypat
     assert images_kwargs["chat_id"] == "C123CHAN"
     assert str(media_file) in images_kwargs["images"][0][0]
 
+
+
+@pytest.mark.asyncio
+async def test_post_stream_refused_attachment_reports_basename_only(tmp_path, monkeypatch):
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "declined-report.pdf")
+    adapter = _adapter()
+    adapter.send_document = AsyncMock(return_value=SendResult(success=False, error="connector declined"))
+
+    delivered = await GatewayRunner._deliver_media_from_response(
+        _fake_runner({}), f"MEDIA:{media_file}", _event(), adapter,
+    )
+
+    assert delivered is False
+    adapter.send_document.assert_awaited_once()
+    adapter.send.assert_awaited_once()
+    notice = adapter.send.await_args.kwargs["content"]
+    assert media_file.name in notice
+    assert str(tmp_path) not in notice
 
