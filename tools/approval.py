@@ -129,8 +129,8 @@ _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval
 # ``approvals.require_requester_match`` is enabled.  Distinct from 0 (nothing
 # pending / already resolved) so a caller can show a tailored "only the
 # requester can approve/deny this command" message instead of a generic
-# "already handled" one.  Negative so any legacy ``if count:`` / ``count > 0``
-# truthiness check treats it as "not resolved".
+# "already handled" one. Callers must compare this value explicitly or require
+# ``count > 0`` for success: ``bool(-1)`` is True.
 REQUESTER_MISMATCH: int = -1
 
 
