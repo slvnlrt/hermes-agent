@@ -325,7 +325,10 @@ class TestBlockingApprovalE2E:
         """Gateway waits use approvals.timeout, without a second timeout knob."""
         from tools import approval as approval_module
         from tools.approval import check_all_command_guards, register_gateway_notify, resolve_gateway_approval, unregister_gateway_notify
-        from tools.approval_context import reset_current_session_key, set_current_session_key
+        from tools.approval_context import (
+            reset_current_requester_id, reset_current_session_key,
+            set_current_requester_id, set_current_session_key,
+        )
 
         monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
         session_key = "e2e-timeout"
@@ -335,6 +338,7 @@ class TestBlockingApprovalE2E:
 
         def agent_thread():
             token = set_current_session_key(session_key)
+            requester_token = set_current_requester_id("timeout-user")
             os.environ["HERMES_GATEWAY_SESSION"] = "1"
             os.environ["HERMES_EXEC_ASK"] = "1"
             os.environ["HERMES_SESSION_KEY"] = session_key
@@ -350,13 +354,14 @@ class TestBlockingApprovalE2E:
                 os.environ.pop("HERMES_GATEWAY_SESSION", None)
                 os.environ.pop("HERMES_EXEC_ASK", None)
                 os.environ.pop("HERMES_SESSION_KEY", None)
+                reset_current_requester_id(requester_token)
                 reset_current_session_key(token)
 
         t = threading.Thread(target=agent_thread)
         t.start()
         t.join(timeout=1)
         if t.is_alive():
-            resolve_gateway_approval(session_key, "deny")
+            resolve_gateway_approval(session_key, "deny", clicker_id="timeout-user")
             t.join(timeout=5)
 
         assert result_holder[0]["approved"] is False
@@ -380,9 +385,13 @@ class TestBlockingApprovalE2E:
 
         def make_agent(idx, cmd):
             def run():
-                from tools.approval_context import reset_current_session_key, set_current_session_key
+                from tools.approval_context import (
+                    reset_current_requester_id, reset_current_session_key,
+                    set_current_requester_id, set_current_session_key,
+                )
 
                 token = set_current_session_key(session_key)
+                requester_token = set_current_requester_id("parallel-user")
                 os.environ["HERMES_GATEWAY_SESSION"] = "1"
                 os.environ["HERMES_EXEC_ASK"] = "1"
                 os.environ["HERMES_SESSION_KEY"] = session_key
@@ -392,6 +401,7 @@ class TestBlockingApprovalE2E:
                     os.environ.pop("HERMES_GATEWAY_SESSION", None)
                     os.environ.pop("HERMES_EXEC_ASK", None)
                     os.environ.pop("HERMES_SESSION_KEY", None)
+                    reset_current_requester_id(requester_token)
                     reset_current_session_key(token)
             return run
 
@@ -411,7 +421,7 @@ class TestBlockingApprovalE2E:
         assert len(_gateway_queues.get(session_key, [])) == 3
 
         # Approve all at once
-        count = resolve_gateway_approval(session_key, "session", resolve_all=True)
+        count = resolve_gateway_approval(session_key, "session", resolve_all=True, clicker_id="parallel-user")
         assert count == 3
 
         for t in threads:
@@ -546,7 +556,10 @@ class TestCrossSessionApprovalIsolation:
         """A dangerous command in session A's worker thread notifies
         session A's callback, even though os.environ points at session B."""
         from tools.approval import check_all_command_guards, register_gateway_notify, resolve_gateway_approval, unregister_gateway_notify
-        from tools.approval_context import reset_current_session_key, set_current_session_key
+        from tools.approval_context import (
+            reset_current_requester_id, reset_current_session_key,
+            set_current_requester_id, set_current_session_key,
+        )
         notified_a = []
         notified_b = []
         register_gateway_notify("session-A", lambda d: notified_a.append(d))
@@ -564,11 +577,13 @@ class TestCrossSessionApprovalIsolation:
             # it deliberately does NOT touch os.environ (mirroring the fixed
             # gateway, which no longer writes HERMES_SESSION_KEY).
             token = set_current_session_key("session-A")
+            requester_token = set_current_requester_id("user-A")
             try:
                 result_holder[0] = check_all_command_guards(
                     "rm -rf /important", "local"
                 )
             finally:
+                reset_current_requester_id(requester_token)
                 reset_current_session_key(token)
 
         t = threading.Thread(target=worker_a)
@@ -581,7 +596,7 @@ class TestCrossSessionApprovalIsolation:
             assert len(notified_b) == 0, "approval prompt leaked to session B (#24100)"
             assert "rm -rf /important" in notified_a[0]["command"]
 
-            resolve_gateway_approval("session-A", "once")
+            resolve_gateway_approval("session-A", "once", clicker_id="user-A")
             t.join(timeout=5)
             assert result_holder[0] is not None
             assert result_holder[0]["approved"] is True
@@ -604,7 +619,10 @@ class TestCrossSessionApprovalIsolation:
         the other.
         """
         from tools.approval import _gateway_queues, check_all_command_guards, register_gateway_notify, resolve_gateway_approval, unregister_gateway_notify
-        from tools.approval_context import reset_current_session_key, set_current_session_key
+        from tools.approval_context import (
+            reset_current_requester_id, reset_current_session_key,
+            set_current_requester_id, set_current_session_key,
+        )
 
         # No HERMES_SESSION_KEY in os.environ at all — pure contextvar routing.
         os.environ.pop("HERMES_SESSION_KEY", None)
@@ -618,9 +636,11 @@ class TestCrossSessionApprovalIsolation:
 
         def worker(key, cmd):
             token = set_current_session_key(key)
+            requester_token = set_current_requester_id(f"user-{key}")
             try:
                 results[key] = check_all_command_guards(cmd, "local")
             finally:
+                reset_current_requester_id(requester_token)
                 reset_current_session_key(token)
 
         ta = threading.Thread(target=worker, args=("sess-A", "rm -rf /a-data"))
@@ -641,7 +661,7 @@ class TestCrossSessionApprovalIsolation:
             assert len(qb) == 1, f"sess-B queue should hold 1, got {len(qb)}"
 
             # Resolve ONLY sess-A; sess-B must stay blocked (no cross-leak).
-            resolve_gateway_approval("sess-A", "once")
+            resolve_gateway_approval("sess-A", "once", clicker_id="user-sess-A")
             ta.join(timeout=5)
             assert results["sess-A"] is not None
             assert results["sess-A"]["approved"] is True
@@ -649,13 +669,13 @@ class TestCrossSessionApprovalIsolation:
             assert len(_gateway_queues.get("sess-B", [])) == 1
 
             # Now resolve sess-B independently.
-            resolve_gateway_approval("sess-B", "once")
+            resolve_gateway_approval("sess-B", "once", clicker_id="user-sess-B")
             tb.join(timeout=5)
             assert results["sess-B"] is not None
             assert results["sess-B"]["approved"] is True
         finally:
-            resolve_gateway_approval("sess-A", "deny")
-            resolve_gateway_approval("sess-B", "deny")
+            resolve_gateway_approval("sess-A", "deny", clicker_id="user-sess-A")
+            resolve_gateway_approval("sess-B", "deny", clicker_id="user-sess-B")
             ta.join(timeout=2)
             tb.join(timeout=2)
             os.environ.pop("HERMES_GATEWAY_SESSION", None)

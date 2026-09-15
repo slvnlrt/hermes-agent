@@ -702,8 +702,14 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     self._log_tag, session_key, event.operator_openid)
                 return
             try:
-                from tools.approval import resolve_gateway_approval  # lazy: keep adapter light
-                count = resolve_gateway_approval(session_key, choice)
+                from tools.approval import REQUESTER_MISMATCH, resolve_gateway_approval  # lazy: keep adapter light
+                count = resolve_gateway_approval(session_key, choice, clicker_id=event.operator_openid or None)
+                if count == REQUESTER_MISMATCH:
+                    logger.warning(
+                        "[%s] Rejected requester-mismatched approval click for session %s (operator=%s)",
+                        self._log_tag, session_key, event.operator_openid,
+                    )
+                    return
                 logger.info(
                     "[%s] Button resolved %d approval(s) for session %s (choice=%s, operator=%s)",
                     self._log_tag, count, session_key, choice, event.operator_openid)

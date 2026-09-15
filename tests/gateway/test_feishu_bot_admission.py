@@ -355,7 +355,7 @@ def test_hydrate_bot_identity_populates_self_ids_from_bot_v3_info(monkeypatch):
     assert adapter._bot_user_id == ""
 
 
-def test_resolve_sender_profile_uses_open_id_for_bot_name_lookup():
+def test_resolve_sender_profile_uses_open_id_as_callback_capable_primary():
     import asyncio
 
     from plugins.platforms.feishu.adapter import FeishuAdapter
@@ -379,7 +379,7 @@ def test_resolve_sender_profile_uses_open_id_for_bot_name_lookup():
     )
 
     assert seen_ids == ["ou_peer"]
-    assert profile["user_id"] == "u_peer"
+    assert profile["user_id"] == "ou_peer"
     assert profile["user_name"] == "Peer Bot"
 
 

@@ -92,10 +92,14 @@ def test_helper_clears_callbacks_on_teardown():
 # 3. check_execute_code_guard decision matrix
 # ---------------------------------------------------------------------------
 
+REQUESTER_ID = "cluster-test-user"
+
+
 @pytest.fixture
 def gw_session(monkeypatch):
     """A clean gateway session: HERMES_GATEWAY_SESSION set, a bound session
-    key, and isolated gateway queues/callbacks. Yields the session_key."""
+    key, verified requester identity, and isolated gateway queues/callbacks.
+    Yields the session_key."""
     monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
     monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
@@ -107,14 +111,16 @@ def gw_session(monkeypatch):
 
     session_key = "cluster-test-session"
     token = approval_context.set_current_session_key(session_key)
+    requester_token = approval_context.set_current_requester_id(REQUESTER_ID)
     with A._lock:
         A._gateway_queues.pop(session_key, None)
         A._gateway_notify_cbs.pop(session_key, None)
         A._permanent_approved.discard("execute_code")
-        A._session_approved.get(session_key, set()).discard("execute_code")
+        A._session_approved.get((session_key, REQUESTER_ID), set()).discard("execute_code")
     try:
         yield session_key
     finally:
+        approval_context.reset_current_requester_id(requester_token)
         approval_context.reset_current_session_key(token)
         with A._lock:
             A._gateway_queues.pop(session_key, None)
@@ -217,13 +223,13 @@ def test_guard_gateway_user_approves_is_one_shot(gw_session):
     assert res["approved"] is True
     assert res.get("user_approved") is True
     # One-shot: approval must NOT persist to future scripts.
-    assert A.is_approved(gw_session, "execute_code") is False
+    assert A.is_approved(gw_session, "execute_code", REQUESTER_ID) is False
 
 
 def test_guard_session_approval_short_circuits_prompt(gw_session):
     """Once session-approved, execute_code skips the approval prompt (#39275)."""
     # Manually set session approval.
-    A.approve_session(gw_session, "execute_code")
+    A.approve_session(gw_session, "execute_code", REQUESTER_ID)
     try:
         # Even with a denier registered, the is_approved check short-circuits.
         _register_resolver(gw_session, "deny")
@@ -231,7 +237,7 @@ def test_guard_session_approval_short_circuits_prompt(gw_session):
         assert res["approved"] is True
     finally:
         with A._lock:
-            s = A._session_approved.get(gw_session, set())
+            s = A._session_approved.get((gw_session, REQUESTER_ID), set())
             s.discard("execute_code")
 
 
@@ -266,7 +272,7 @@ def test_terminal_smart_deny_owner_override_is_one_operation(gw_session, monkeyp
     """A human may override DENY, but a broad UI choice must not be persisted."""
     with A._lock:
         A._permanent_approved.discard("owner-override-test-danger")
-        A._session_approved.get(gw_session, set()).discard("owner-override-test-danger")
+        A._session_approved.get((gw_session, REQUESTER_ID), set()).discard("owner-override-test-danger")
     monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(approval_smart, "_smart_approve", lambda _command, _description: "deny")
     monkeypatch.setattr(
@@ -292,7 +298,7 @@ def test_terminal_smart_deny_owner_override_is_one_operation(gw_session, monkeyp
     assert result["user_approved"] is True
     assert shown["approval_data"]["smart_denied"] is True
     assert shown["approval_data"]["allow_permanent"] is False
-    assert A.is_approved(gw_session, "owner-override-test-danger") is False
+    assert A.is_approved(gw_session, "owner-override-test-danger", REQUESTER_ID) is False
 
     _register_resolver(gw_session, "deny")
     changed = A.check_all_command_guards("dangerous /tmp/second", "local")
@@ -304,7 +310,7 @@ def test_execute_code_smart_deny_owner_override_is_one_operation(gw_session, mon
     """Never persist the coarse execute_code key after overriding smart DENY."""
     with A._lock:
         A._permanent_approved.discard("execute_code")
-        A._session_approved.get(gw_session, set()).discard("execute_code")
+        A._session_approved.get((gw_session, REQUESTER_ID), set()).discard("execute_code")
     monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(approval_smart, "_smart_approve", lambda _command, _description: "deny")
 
@@ -315,7 +321,7 @@ def test_execute_code_smart_deny_owner_override_is_one_operation(gw_session, mon
     assert result["user_approved"] is True
     assert shown["approval_data"]["smart_denied"] is True
     assert shown["approval_data"]["allow_permanent"] is False
-    assert A.is_approved(gw_session, "execute_code") is False
+    assert A.is_approved(gw_session, "execute_code", REQUESTER_ID) is False
 
     _register_resolver(gw_session, "deny")
     changed = A.check_execute_code_guard("print('second')", "local")
@@ -327,7 +333,7 @@ def test_smart_escalate_still_persists_session_choice(gw_session, monkeypatch):
     """The DENY restriction must not alter Smart ESCALATE's manual choices."""
     key = "smart-escalate-persistence"
     with A._lock:
-        A._session_approved.get(gw_session, set()).discard(key)
+        A._session_approved.get((gw_session, REQUESTER_ID), set()).discard(key)
     monkeypatch.setattr(approval_context, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(approval_smart, "_smart_approve", lambda _command, _description: "escalate")
     monkeypatch.setattr(
@@ -348,9 +354,9 @@ def test_smart_escalate_still_persists_session_choice(gw_session, monkeypatch):
     result = A.check_all_command_guards("dangerous escalate", "local")
 
     assert result["approved"] is True
-    assert shown["approval_data"]["allow_permanent"] is True
-    assert "smart_denied" not in shown["approval_data"]
-    assert A.is_approved(gw_session, key) is True
+    assert A.is_approved(gw_session, key, REQUESTER_ID) is True
+    _register_resolver(gw_session, "deny")
+    assert A.check_all_command_guards("dangerous escalate", "local")["approved"] is True
 
 
 def test_terminal_smart_deny_pending_payload_is_one_operation(gw_session, monkeypatch):
