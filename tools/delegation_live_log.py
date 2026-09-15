@@ -228,10 +228,17 @@ def create_live_transcripts(
     task_list: List[Dict[str, Any]], context: Optional[str] = None,
     delegation_id: Optional[str] = None, model: Optional[str] = None,
     provider: Optional[str] = None,
+    task_routes: Optional[List[tuple]] = None,
 ) -> tuple[Optional[str], List[Optional[LiveTranscriptWriter]], List[str]]:
     """One pre-headered writer per task + a manifest.json; prunes stale dirs.
     Returns ``(delegation_id, writers, paths)``; on any top-level failure
-    ``(None, [None]*n, [])`` so delegation proceeds untouched."""
+    ``(None, [None]*n, [])`` so delegation proceeds untouched.
+
+    When ``task_routes`` is provided (a list of ``(creds_i, routing_i)`` per task from
+    ``_resolve_all_task_routes``), each manifest task entry carries its actual model and
+    canonical provider.  The top-level ``model``/``provider`` are omitted to avoid
+    misattributing a mixed-provider batch to a single route.
+    """
     n = len(task_list)
     prune_stale_live_dirs()  # best-effort; never raises
     with _best_effort("creation"):
@@ -243,7 +250,8 @@ def create_live_transcripts(
         paths: List[str] = [str(w.path) for w in made if w.path is not None]
         if not paths:
             return None, [None] * n, []
-        _write_manifest(deleg_id, task_list, paths, model=model, provider=provider)
+        _write_manifest(deleg_id, task_list, paths, model=model, provider=provider,
+                        task_routes=task_routes)
         return deleg_id, writers, paths
     return None, [None] * n, []
 
@@ -254,17 +262,33 @@ def _manifest_path(delegation_id: str) -> Path:
 
 def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                     paths: List[str], model: Optional[str] = None,
-                    provider: Optional[str] = None) -> None:
+                    provider: Optional[str] = None,
+                    task_routes: Optional[List[tuple]] = None) -> None:
     with _best_effort("manifest write"):
-        _dump_json(_manifest_path(delegation_id), {
-            "delegation_id": delegation_id, "started": time.strftime(_TIME_FMT),
-            "task_count": len(task_list), "model": model, "provider": provider,
-            "tasks": [{
+        # When per-task routes are available, each task carries its own model/provider
+        # and the top-level fields are omitted to avoid misattribution.
+        top_model = None if task_routes else model
+        top_provider = None if task_routes else provider
+        tasks_payload = []
+        for i, t in enumerate(task_list):
+            entry: Dict[str, Any] = {
                 "index": i,
                 # Same mounted dir as the .log files, so the goal needs the same redaction.
                 "goal": _redact(str(t.get("goal", ""))[:500]),
                 "log": paths[i] if i < len(paths) else None,
-                "status": "running"} for i, t in enumerate(task_list)]})
+                "status": "running",
+            }
+            if task_routes and i < len(task_routes):
+                creds_i = task_routes[i][0]
+                # Only model and canonical provider; never keys, URLs, request overrides,
+                # command args, or auth-store provenance.
+                entry["model"] = creds_i.get("model")
+                entry["provider"] = creds_i.get("provider")
+            tasks_payload.append(entry)
+        _dump_json(_manifest_path(delegation_id), {
+            "delegation_id": delegation_id, "started": time.strftime(_TIME_FMT),
+            "task_count": len(task_list), "model": top_model, "provider": top_provider,
+            "tasks": tasks_payload})
 
 
 def update_manifest_statuses(delegation_id: Optional[str],

@@ -80,6 +80,7 @@ def _patch_delegate(monkeypatch):
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
+    fake_child.model = "m"
 
     def fast_child(task_index, goal, child=None, parent_agent=None, **kw):
         return {
@@ -140,6 +141,34 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
     # id, not the subagent-internal id the child build clobbered
     # HERMES_SESSION_ID with (see clobbering_build_child).
     assert evt["origin_session_id"] == "raw-sid-7"
+
+
+def test_mixed_model_background_completion_has_no_false_global_attribution(monkeypatch):
+    dt = _patch_delegate(monkeypatch)
+    set_session_vars(
+        platform="api_server", chat_id="mixed-session", session_key="mixed-session",
+        session_id="mixed-session", session_history_delivery="1", async_delivery=False,
+    )
+
+    def build_child(**kwargs):
+        return MagicMock(model=kwargs["model"], _delegate_role="leaf",
+                         _subagent_id=f"child-{kwargs['task_index']}")
+
+    def run_child(task_index, goal, child=None, **kwargs):
+        return {"task_index": task_index, "status": "completed", "summary": goal,
+                "api_calls": 1, "model": child.model, "exit_reason": "completed"}
+
+    monkeypatch.setattr(dt, "_build_child_agent", build_child)
+    monkeypatch.setattr(dt, "_run_single_child", run_child)
+    result = json.loads(dt.delegate_task(
+        tasks=[{"goal": "Summarize the first input", "model": "model-a"},
+               {"goal": "Summarize the second input", "model": "model-b"}],
+        background=True, parent_agent=_fake_parent(),
+    ))
+    assert result.get("status") == "dispatched", result
+    event = _drain_one()
+    assert event["model"] is None
+    assert {item["model"] for item in event["results"]} == {"model-a", "model-b"}
 
 
 # ---------------------------------------------------------------------------

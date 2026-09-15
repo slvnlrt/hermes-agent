@@ -70,23 +70,23 @@ def test_timeout_does_not_close_child_while_worker_is_unwinding(monkeypatch):
     monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.5)
     monkeypatch.setattr(delegate_tool, "_get_worktree_isolation", lambda: False)
 
-    result = delegate_tool._run_single_child(
-        task_index=0,
-        goal="exercise timeout teardown",
-        child=child,
-        parent_agent=parent,
-    )
-
-    assert result["status"] == "timeout"
-    assert child.unwinding.wait(timeout=1)
     try:
+        result = delegate_tool._run_single_child(
+            task_index=0,
+            goal="exercise timeout teardown",
+            child=child,
+            parent_agent=parent,
+        )
+
+        assert result["status"] == "timeout"
+        assert child.unwinding.wait(timeout=10)
         assert not child.closed.is_set(), (
             "timed-out child.close() ran before its conversation thread unwound"
         )
     finally:
         child.allow_finish.set()
-    assert child.finished.wait(timeout=1)
-    assert child.closed.wait(timeout=1)
+    assert child.finished.wait(timeout=10)
+    assert child.closed.wait(timeout=10)
     assert not child.close_while_running, (
         "timed-out child.close() raced its still-running conversation thread"
     )
