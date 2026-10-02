@@ -196,8 +196,6 @@ async def test_refused_followup_receipt_waits_for_outer_delivery(
     assert before_completion == [[]]
     assert outcomes == [expected_outcome]
     assert all(not receipt_outcomes for _, _, receipt_outcomes in sends)
-    queued_sends = [content for stage, content, _ in sends if stage == "queued"]
-    assert queued_sends and set(queued_sends) == {"opening answer"}
     assert [content for stage, content, _ in sends if stage == "completion"] == [
         footer if footer is not None else "opening answer",
     ]

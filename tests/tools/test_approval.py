@@ -522,7 +522,11 @@ class TestSensitiveRedirectPattern:
     @pytest.mark.parametrize("home", ["/root", "/home/alice", r"C:\Users\alice"])
     def test_resolved_home_redirect_requires_approval(self, monkeypatch, home):
         monkeypatch.setenv("HOME", home)
-        monkeypatch.setattr(approval_detection.os.path, "expanduser", lambda _path: home)
+        expanduser = approval_detection.os.path.expanduser
+        monkeypatch.setattr(
+            approval_detection.os.path, "expanduser",
+            lambda path: home if path == "~" else expanduser(path),
+        )
         command = f"cat key >> {home}/.ssh/authorized_keys"
         dangerous, key, _ = detect_dangerous_command(command)
         assert dangerous is True
@@ -531,7 +535,11 @@ class TestSensitiveRedirectPattern:
     @pytest.mark.parametrize("home", ["/", "C:\\"])
     def test_filesystem_root_is_not_a_sensitive_home(self, monkeypatch, home):
         monkeypatch.setenv("HOME", home)
-        monkeypatch.setattr(approval_detection.os.path, "expanduser", lambda _path: home)
+        expanduser = approval_detection.os.path.expanduser
+        monkeypatch.setattr(
+            approval_detection.os.path, "expanduser",
+            lambda path: home if path == "~" else expanduser(path),
+        )
         monkeypatch.setattr(approval_detection.os.path, "realpath", lambda path: path)
         command = f"cat key >> {home}.ssh/authorized_keys"
         assert detect_dangerous_command(command) == (False, None, None)
