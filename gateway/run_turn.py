@@ -3858,15 +3858,11 @@ class GatewayTurnMixin:
 
     async def _run_agent_deliver_first_response(
         self, turn_ctx: TurnContext, adapter: Any, response: Any, result: Any, stream_task: Any,
-    ) -> None:
-        """Deliver an in-band response and close that follow-up's receipt from its own send."""
-        from gateway.platforms.event import terminalize_event_receipts
-
+    ) -> bool:
+        """Deliver an in-band response and report whether all its obligations succeeded."""
         session_key = turn_ctx.session_key
-        receipt_owner = getattr(turn_ctx, "_queued_receipt_owner", None)
         if turn_ctx.mute_notification_reply:
-            terminalize_event_receipts(receipt_owner, "success")
-            return
+            return True
         _sc = turn_ctx.stream_consumer_holder[0]
         if _sc and stream_task:
             try:
@@ -3933,8 +3929,6 @@ class GatewayTurnMixin:
                     # this the completion path's already_sent rescan uploads every file twice.
                     result["media_already_delivered"] = _deliver_media
                     result["_queued_delivery_succeeded"] = delivery_succeeded
-        if receipt_owner is not None:
-            terminalize_event_receipts(receipt_owner, "success" if delivery_succeeded else "failure")
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
         _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
         if callable(_bg_cb):
@@ -3942,6 +3936,7 @@ class GatewayTurnMixin:
                 _bg_result = _bg_cb()
                 if inspect.isawaitable(_bg_result):
                     await _bg_result
+        return delivery_succeeded
 
     async def _run_agent_queued_followup(
         self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
@@ -3992,13 +3987,13 @@ class GatewayTurnMixin:
             if callable(cancel_deadline):
                 cancel_deadline(pending_event)
 
-        # Interrupted: discard the response ("Operation interrupted." is noise).
-        if result.get("interrupted"):
-            receipt_owner = getattr(turn_ctx, "_queued_receipt_owner", None)
-            if receipt_owner is not None:
-                terminalize_event_receipts(receipt_owner, "cancelled")
-        else:
-            await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
+        # Do not close this turn's receipt yet: a refused follow-up returns its result for
+        # outer completion, which can retry the body or still owe a trailing footer.
+        delivery_succeeded = False
+        if not result.get("interrupted"):
+            delivery_succeeded = await self._run_agent_deliver_first_response(
+                turn_ctx, adapter, response, result, stream_task,
+            )
 
         updated_history = result.get("messages", history)
         next_source, next_message, next_session_key = source, pending, session_key
@@ -4083,6 +4078,14 @@ class GatewayTurnMixin:
         followup_result = None
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
+            # Advancing relinquishes the outer send to the follow-up. Only now is this
+            # turn's own in-band delivery final; all early returns keep its receipt open.
+            receipt_owner = getattr(turn_ctx, "_queued_receipt_owner", None)
+            terminalize_event_receipts(
+                receipt_owner,
+                "cancelled" if result.get("interrupted") else
+                ("success" if delivery_succeeded else "failure"),
+            )
 
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,

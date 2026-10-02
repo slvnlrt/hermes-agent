@@ -476,10 +476,10 @@ def permanent_patterns_for_requester(requester_id: str = "") -> set:
 
 
 def _is_permanently_approved(pattern_key: str) -> bool:
-    """Permanent approval only, with compatibility for migrated pattern keys."""
+    """Check only the current requester's permanent grants, including migrated keys."""
     aliases = _approval_key_aliases(pattern_key)
-    with _lock:
-        return any(alias in _permanent_set() for alias in aliases)
+    permanent = permanent_patterns_for_requester(get_current_requester_id())
+    return any(alias in permanent for alias in aliases)
 
 
 def approve_permanent(pattern_key: str):

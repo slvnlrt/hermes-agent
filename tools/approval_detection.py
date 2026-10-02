@@ -528,10 +528,10 @@ def _home_prefix_fold_regex(path: str):
     """Compile a regex matching *path* as an absolute directory prefix.
     Components match with either separator so native Windows, forward-slash, and mixed forms all
     fold; the caller normalizes the tail's backslashes to ``/``. A non-empty tail is required, so a
-    bare home is never folded. Returns ``None`` for an unset/degenerate path (fewer than two
-    components: ``/``, ``C:\\``, ``""``) so a stray HOME cannot rewrite unrelated prefixes."""
+    bare home is never folded. Returns ``None`` for an unset path or filesystem root
+    (``/``, ``C:\\``); a single-component POSIX home such as ``/root`` is valid."""
     components = [c for c in re.split(r"[/\\]+", path) if c] if path else []
-    if len(components) < 2:
+    if not components or (len(components) == 1 and not path.startswith("/")):
         return None
     # Optional leading root separator; a Windows drive letter is a component.
     return re.compile(r"[/\\]*" + r"[/\\]+".join(re.escape(c) for c in components) + _PATH_TAIL)

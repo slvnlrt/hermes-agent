@@ -623,7 +623,7 @@ async def test_busy_followup_receipt_follows_its_own_failed_delivery_not_next_su
     runner._MAX_INTERRUPT_DEPTH = 8
     runner._is_goal_continuation_event = lambda _event: False
     runner._session_key_for_source = lambda _source: session_key
-    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value="A")
+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value="B")
     runner._reply_anchor_for_event = lambda _event: None
     runner._delivery_adapter_for = lambda _source: None
     runner._intake_adapter_for = lambda _source: None
@@ -635,22 +635,18 @@ async def test_busy_followup_receipt_follows_its_own_failed_delivery_not_next_su
     injection_a = _receipt_event(outcomes.append)
     injection_a.source = source
     injection_a.message_id = "A"
-    root_ctx = SimpleNamespace(
+    a_ctx = SimpleNamespace(
         source=source, session_id="sid", session_key=session_key, run_generation=1,
         _interrupt_depth=0, history=[], _status_thread_metadata=None, context_prompt=None,
-        result_holder=[{"interrupted": True, "messages": []}],
+        stream_consumer_holder=[None], event_message_id=None, inbound_message_id="A",
+        _queued_receipt_owner=injection_a, mute_notification_reply=False,
+        persist_user_display_kind=None,
     )
+    pending_b = MessageEvent(text="B", source=source, message_id="B")
+    outcomes_at_advancement = []
 
     async def _run_child(**kwargs):
-        a_ctx = SimpleNamespace(
-            source=source, session_key=session_key, run_generation=1,
-            stream_consumer_holder=[None], _status_thread_metadata=None, event_message_id=None,
-            inbound_message_id="A", _queued_receipt_owner=kwargs["receipt_owner"],
-            mute_notification_reply=False, persist_user_display_kind=None,
-        )
-        await GatewayRunner._run_agent_deliver_first_response(
-            runner, a_ctx, adapter, {"final_response": "A response"}, {"messages": []}, None,
-        )
+        outcomes_at_advancement.append(list(outcomes))
         b_ctx = SimpleNamespace(
             source=source, session_key=session_key, run_generation=1,
             stream_consumer_holder=[None], _status_thread_metadata=None, event_message_id=None,
@@ -664,10 +660,12 @@ async def test_busy_followup_receipt_follows_its_own_failed_delivery_not_next_su
 
     runner._run_agent = _run_child
     await GatewayRunner._run_agent_queued_followup(
-        runner, root_ctx, adapter, pending="A", pending_event=injection_a,
-        response={"final_response": "root"}, result={"interrupted": True, "messages": []}, stream_task=None,
+        runner, a_ctx, adapter, pending="B", pending_event=pending_b,
+        response={"final_response": "A response"},
+        result={"final_response": "A response", "messages": []}, stream_task=None,
     )
 
+    assert outcomes_at_advancement == [["failure"]]
     assert outcomes == ["failure"]
     assert [call.args[1] for call in adapter.send.await_args_list] == ["A response", "B response"]
 

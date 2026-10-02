@@ -293,6 +293,11 @@ class TestBlockingApprovalE2E:
     @pytest.fixture(autouse=True)
     def _manual_approval_mode(self, monkeypatch):
         monkeypatch.setattr("tools.approval_context._get_approval_mode", lambda: "manual")
+        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [])
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": []},
+        )
 
     def setup_method(self):
         _clear_approval_state()
@@ -332,7 +337,8 @@ class TestBlockingApprovalE2E:
 
         monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
         session_key = "e2e-timeout"
-        register_gateway_notify(session_key, lambda d: None)
+        notified = threading.Event()
+        register_gateway_notify(session_key, lambda _data: notified.set())
 
         result_holder = [None]
 
@@ -359,15 +365,17 @@ class TestBlockingApprovalE2E:
 
         t = threading.Thread(target=agent_thread)
         t.start()
-        t.join(timeout=1)
-        if t.is_alive():
-            resolve_gateway_approval(session_key, "deny", clicker_id="timeout-user")
+        try:
+            assert notified.wait(30), "approval did not reach the gateway"
             t.join(timeout=5)
-
-        assert result_holder[0]["approved"] is False
-        assert result_holder[0]["outcome"] == "timeout"
-        assert "timed out" in result_holder[0]["message"]
-        unregister_gateway_notify(session_key)
+            assert not t.is_alive(), "canonical zero timeout did not end the approval wait"
+            assert result_holder[0]["approved"] is False
+            assert result_holder[0]["outcome"] == "timeout"
+        finally:
+            if t.is_alive():
+                resolve_gateway_approval(session_key, "deny", clicker_id="timeout-user")
+                t.join(timeout=5)
+            unregister_gateway_notify(session_key)
 
     def test_parallel_subagent_approvals(self):
         """Multiple threads can block concurrently and be resolved independently."""

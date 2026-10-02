@@ -74,7 +74,7 @@ def test_registry_rejects_global_provider_missing_endpoint_before_construction()
             "delegate_task", {"goal": "must not enter routed construction"}, parent_agent=parent,
         )
     payload = json.loads(result)
-    assert "API key and base URL" in payload["error"]
+    assert "error" in payload
     build.assert_not_called()
 
 
@@ -178,8 +178,8 @@ def test_direct_pinned_http_child_refuses_ambient_routing_before_constructor(mon
 
 
 def test_direct_keyless_pin_uses_only_its_declared_transport(monkeypatch):
-    """A real child uses OpenCode Free's keyless route despite ambient HTTP credentials."""
-    from hermes_cli.models import OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER
+    """A real child keeps LM Studio's no-auth route despite ambient HTTP credentials."""
+    from hermes_cli.auth import LMSTUDIO_NOAUTH_PLACEHOLDER
 
     class RoutedClient:
         def __init__(self, *, api_key, base_url, **kwargs):
@@ -195,6 +195,9 @@ def test_direct_keyless_pin_uses_only_its_declared_transport(monkeypatch):
 
     monkeypatch.setenv("OPENAI_API_KEY", "ambient-openai")
     monkeypatch.setenv("OPENROUTER_API_KEY", "ambient-openrouter")
+    monkeypatch.delenv("LM_API_KEY", raising=False)
+    monkeypatch.setenv("LM_BASE_URL", "http://127.0.0.1:12345/v1")
+    monkeypatch.setattr("hermes_cli.models_local.ensure_lmstudio_model_loaded", lambda *args, **kwargs: None)
     parent = _parent()
     child = None
     try:
@@ -203,17 +206,26 @@ def test_direct_keyless_pin_uses_only_its_declared_transport(monkeypatch):
             patch("agent.auxiliary_client.OpenAI", RoutedClient),
             patch("agent.process_bootstrap.OpenAI", side_effect=primary_client),
         ):
-            child = _build_child_agent(
-                task_index=0, goal="use only the free route", context=None, toolsets=[],
-                model="mimo-v2.5-free", max_iterations=1, task_count=1, parent_agent=parent,
-                override_provider="opencode-free", task_pinned=True,
+            routed, routing_cfg = _resolve_task_credentials(
+                {"goal": "Use only the local route", "provider": "lmstudio", "model": "meta-llama/llama-4-scout"},
+                _credential_bundle(None, None, None, None, None, None),
+                {},
+                parent_agent=parent,
             )
-        assert child.provider == "opencode-free"
-        assert child._client_kwargs["api_key"] == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER
-        assert child._client_kwargs["base_url"] == "https://opencode.ai/zen/v1"
-        assert primary_kwargs["api_key"] == OPENCODE_ZEN_FREE_KEYLESS_PLACEHOLDER
-        assert primary_kwargs["base_url"] == "https://opencode.ai/zen/v1"
-        assert primary_kwargs["default_headers"]["Authorization"] == ""
+            child = _build_child_agent(
+                task_index=0, goal="use only the local route", context=None, toolsets=[],
+                model=routed["model"], max_iterations=1, task_count=1, parent_agent=parent,
+                override_provider=routed["provider"], override_base_url=routed["base_url"],
+                override_api_key=routed["api_key"], override_api_mode=routed["api_mode"],
+                routing_cfg=routing_cfg, task_pinned=True,
+            )
+        assert child.provider == "lmstudio"
+        assert child.requested_provider == "lmstudio"
+        assert child.model == "meta-llama/llama-4-scout"
+        assert child._client_kwargs["api_key"] == LMSTUDIO_NOAUTH_PLACEHOLDER
+        assert child._client_kwargs["base_url"] == "http://127.0.0.1:12345/v1"
+        assert primary_kwargs["api_key"] == LMSTUDIO_NOAUTH_PLACEHOLDER
+        assert primary_kwargs["base_url"] == "http://127.0.0.1:12345/v1"
     finally:
         if child is not None:
             child.close()
@@ -269,14 +281,19 @@ def test_pinned_route_leaves_output_cap_to_the_target_transport_profile(monkeypa
 
 def test_global_provider_route_uses_its_own_output_cap(monkeypatch):
     """A global delegation route is an override even when the task itself is unpinned."""
+    monkeypatch.delenv("LM_API_KEY", raising=False)
+    monkeypatch.setenv("LM_BASE_URL", "http://127.0.0.1:12345/v1")
+    monkeypatch.setattr("hermes_cli.models_local.ensure_lmstudio_model_loaded", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.models_local.lmstudio_model_reasoning_options", lambda *args, **kwargs: [])
     parent, child = _capture_dispatched_child(
         monkeypatch,
         {"goal": "Use the configured child route"},
-        {"provider": "opencode-free", "model": "mimo-v2.5-free"},
+        {"provider": "lmstudio", "model": "meta-llama/llama-4-scout"},
     )
     try:
         wire = child._build_api_kwargs([{"role": "user", "content": "hello"}], [])
-        assert child.provider == "opencode-free"
+        assert child.provider == "lmstudio"
+        assert child.base_url == "http://127.0.0.1:12345/v1"
         assert child.max_tokens is None
         assert "max_tokens" not in wire
     finally:

@@ -183,6 +183,53 @@ class TestSessionGrantScoping:
         finally:
             reset_session_vars()
 
+    @pytest.mark.parametrize("context", ["webhook", "cron", "single_query"])
+    def test_unattended_guard_uses_only_requesters_permanent_grants(
+        self, monkeypatch, context
+    ):
+        from gateway.session_context import reset_session_vars, set_session_vars
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"approvals": {
+                "mode": "manual", "cron_mode": "deny",
+                "single_query_mode": "deny", "unattended_mode": "deny",
+            }},
+        )
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": []},
+        )
+        monkeypatch.setattr(approval, "_resolve_cli_approval_callback", lambda _cb=None: None)
+        for name in ("HERMES_INTERACTIVE", "HERMES_EXEC_ASK", "HERMES_GATEWAY_SESSION",
+                     "HERMES_CRON_SESSION", "HERMES_SINGLE_QUERY_SESSION"):
+            monkeypatch.delenv(name, raising=False)
+        if context != "webhook":
+            monkeypatch.setenv(f"HERMES_{context.upper()}_SESSION", "1")
+
+        command = "rm -rf ./approval-test-target"
+        requester_token = approval_context.set_current_requester_id("")
+        set_session_vars(platform="webhook")
+        try:
+            approval.approve_permanent("recursive delete")
+            # Local policy still works, but cannot authorize a remote requester.
+            assert approval.check_all_command_guards(command, "local")["approved"] is True
+            approval_context.set_current_requester_id("alice")
+            assert approval.check_all_command_guards(command, "local")["approved"] is False
+
+            approval.approve_requester_permanent("recursive delete", "alice")
+            assert approval.check_all_command_guards(command, "local")["approved"] is True
+            approval_context.set_current_requester_id("bob")
+            assert approval.check_all_command_guards(command, "local")["approved"] is False
+
+            # The same principal name on another platform has no inherited grant.
+            approval_context.set_current_requester_id("alice")
+            set_session_vars(platform="api_server")
+            assert approval.check_all_command_guards(command, "local")["approved"] is False
+        finally:
+            approval_context.reset_current_requester_id(requester_token)
+            reset_session_vars()
+
 
 # ---------------------------------------------------------------------------
 # Requester contextvar lifecycle

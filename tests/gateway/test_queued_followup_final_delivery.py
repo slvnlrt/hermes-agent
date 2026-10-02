@@ -8,11 +8,15 @@ must not send that text — or its attachments — a second time, and must still
 queued lane's own send was refused.
 """
 
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 
 from gateway.config import Platform
 from gateway.platforms.base import SendResult
-from gateway.platforms.event import MessageEvent, MessageType, SessionSource
+from gateway.platforms.event import InjectionReceipt, MessageEvent, MessageType, SessionSource
 from gateway.run import GatewayRunner
 from tests.gateway.test_run_progress_topics import ProgressCaptureAdapter, _make_runner, _run_with_agent
 
@@ -123,3 +127,77 @@ async def test_refused_queued_send_leaves_the_completion_send_as_the_fallback(mo
     assert not result.get("already_sent")
 
     assert await _completion_seam(adapter, result, final) == final
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_success", "footer", "expected_outcome"),
+    [(False, None, "success"), (True, "turn footer", "failure")],
+    ids=["refused-body-successful-fallback", "successful-body-refused-footer"],
+)
+async def test_refused_followup_receipt_waits_for_outer_delivery(
+    initial_success, footer, expected_outcome,
+):
+    """A blocked follow-up leaves the opening injection responsible for its final obligations."""
+    adapter = _DocCaptureAdapter()
+    runner = _make_runner(adapter)
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="-1001", chat_type="group", thread_id="17585",
+    )
+    outcomes = []
+    event = MessageEvent(
+        text="plugin wake", source=source, message_id="opening-injection",
+        internal=True, allow_gateway_control=False,
+    )
+    event._injection_receipts.append(InjectionReceipt(outcomes.append))
+    pending_event = MessageEvent(
+        text="@file:/etc/shadow please", source=source, message_id="blocked-followup",
+    )
+    runner._prepare_profile_scoped_inbound_message_text = AsyncMock(return_value=None)
+    runner._run_agent = AsyncMock()
+    runner._pop_post_delivery_callback = lambda *_args: None
+    ctx = SimpleNamespace(
+        source=source, session_id="receipt-fallback", session_key=_SESSION_KEY, run_generation=1,
+        _interrupt_depth=0, history=[], _status_thread_metadata=None,
+        stream_consumer_holder=[None], event_message_id=None,
+        inbound_message_id=event.message_id, _queued_receipt_owner=event,
+        mute_notification_reply=False, persist_user_display_kind=None,
+    )
+    result = {"final_response": "opening answer", "messages": []}
+    phase = "queued"
+    sends = []
+    before_completion = []
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        sends.append((phase, content, list(outcomes)))
+        success = initial_success if phase == "queued" else footer is None
+        return SendResult(success=success, error=None if success else "delivery refused")
+
+    async def handle(opening_event):
+        nonlocal phase
+        returned = await runner._run_agent_queued_followup(
+            ctx, adapter, pending_event.text, pending_event, result, result, None,
+        )
+        before_completion.append(list(outcomes))
+        phase = "completion"
+        return await runner._hmwa_deliver_turn_response(
+            opening_event, source, SimpleNamespace(session_id=ctx.session_id),
+            _SESSION_KEY, 1, returned, [], returned["final_response"], footer, False,
+        )
+
+    adapter.send = AsyncMock(side_effect=send)
+    adapter.set_message_handler(handle)
+    adapter._active_sessions[_SESSION_KEY] = asyncio.Event()
+
+    await adapter._process_message_background(event, _SESSION_KEY)
+
+    runner._prepare_profile_scoped_inbound_message_text.assert_awaited_once()
+    runner._run_agent.assert_not_awaited()
+    assert before_completion == [[]]
+    assert outcomes == [expected_outcome]
+    assert all(not receipt_outcomes for _, _, receipt_outcomes in sends)
+    queued_sends = [content for stage, content, _ in sends if stage == "queued"]
+    assert queued_sends and set(queued_sends) == {"opening answer"}
+    assert [content for stage, content, _ in sends if stage == "completion"] == [
+        footer if footer is not None else "opening answer",
+    ]

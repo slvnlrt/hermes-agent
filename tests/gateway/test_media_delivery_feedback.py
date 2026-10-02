@@ -49,7 +49,7 @@ def _adapter():
 
 def _background_runner(adapter):
     runner = object.__new__(GatewayRunner)
-    runner._adapter_for_source = lambda source: adapter
+    runner._delivery_adapter_for = lambda source: adapter
     runner._thread_metadata_for_source = lambda source, anchor=None: None
     runner._resolve_session_agent_runtime = lambda **kwargs: ("test-model", {"api_key": "test-key"})
     runner._resolve_turn_toolsets = lambda *args: ([], None)

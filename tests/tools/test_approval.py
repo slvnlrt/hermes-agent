@@ -519,6 +519,23 @@ class TestSensitiveRedirectPattern:
             assert dangerous is True, command
             assert key is not None, command
 
+    @pytest.mark.parametrize("home", ["/root", "/home/alice", r"C:\Users\alice"])
+    def test_resolved_home_redirect_requires_approval(self, monkeypatch, home):
+        monkeypatch.setenv("HOME", home)
+        monkeypatch.setattr(approval_detection.os.path, "expanduser", lambda _path: home)
+        command = f"cat key >> {home}/.ssh/authorized_keys"
+        dangerous, key, _ = detect_dangerous_command(command)
+        assert dangerous is True
+        assert key is not None
+
+    @pytest.mark.parametrize("home", ["/", "C:\\"])
+    def test_filesystem_root_is_not_a_sensitive_home(self, monkeypatch, home):
+        monkeypatch.setenv("HOME", home)
+        monkeypatch.setattr(approval_detection.os.path, "expanduser", lambda _path: home)
+        monkeypatch.setattr(approval_detection.os.path, "realpath", lambda path: path)
+        command = f"cat key >> {home}.ssh/authorized_keys"
+        assert detect_dangerous_command(command) == (False, None, None)
+
 
     def test_project_env_config_write_requires_approval(self):
         for command in (
@@ -1512,6 +1529,16 @@ class TestApprovalTimeoutIsNotConsent:
     SESSION_KEY = "test-no-consent-session"
     REQUESTER_ID = "test-no-consent-user"
 
+    @pytest.fixture(autouse=True)
+    def _isolate_external_approval_work(self, monkeypatch):
+        # Exercise approval hooks without discovering/running installed plugins.
+        monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_a, **_kw: [])
+        monkeypatch.setattr(
+            "tools.tirith_security.check_command_security",
+            lambda _command: {"action": "allow", "findings": []},
+        )
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+
     def setup_method(self):
         """Reset module state and force a tight approval timeout for fast tests."""
         from tools import approval as mod
@@ -1693,7 +1720,13 @@ class TestApprovalTimeoutIsNotConsent:
 
         self._force_short_timeout(monkeypatch, seconds=2)
         notified = []
-        mod.register_gateway_notify(self.SESSION_KEY, lambda data: notified.append(data))
+        published = threading.Event()
+
+        def notify(data):
+            notified.append(data)
+            published.set()
+
+        mod.register_gateway_notify(self.SESSION_KEY, notify)
         result_holder = {}
 
         thread = threading.Thread(
@@ -1702,10 +1735,7 @@ class TestApprovalTimeoutIsNotConsent:
             ))
         )
         thread.start()
-        for _ in range(200):
-            if notified:
-                break
-            time.sleep(0.005)
+        assert published.wait(5), "approval did not reach the gateway"
 
         request_id = notified[0]["request_id"]
         assert request_id
@@ -1723,7 +1753,13 @@ class TestApprovalTimeoutIsNotConsent:
 
         self._force_short_timeout(monkeypatch, seconds=2)
         notified = []
-        mod.register_gateway_notify(self.SESSION_KEY, lambda data: notified.append(data))
+        published = threading.Event()
+
+        def notify(data):
+            notified.append(data)
+            published.set()
+
+        mod.register_gateway_notify(self.SESSION_KEY, notify)
         result_holder = {}
         thread = threading.Thread(
             target=propagate_context_to_thread(lambda: result_holder.setdefault(
@@ -1731,10 +1767,7 @@ class TestApprovalTimeoutIsNotConsent:
             ))
         )
         thread.start()
-        for _ in range(200):
-            if notified:
-                break
-            time.sleep(0.005)
+        assert published.wait(5), "approval did not reach the gateway"
 
         request_id = notified[0]["request_id"]
         assert mod.resolve_gateway_approval(
@@ -1763,6 +1796,16 @@ class TestConcurrentApprovalCoalescing:
     SESSION_KEY = "test-coalesce-session"
     REQUESTER_ID = "test-coalesce-user"
 
+    @pytest.fixture(autouse=True)
+    def _observe_coalesced_waits(self, monkeypatch):
+        self._followers_ready = threading.Semaphore(0)
+
+        def capture(hook_name, **kwargs):
+            if hook_name == "pre_approval_request" and kwargs.get("coalesced"):
+                self._followers_ready.release()
+
+        monkeypatch.setattr(approval_context, "_fire_approval_hook", capture)
+
     def setup_method(self):
         from tools import approval as mod
         mod._gateway_queues.clear()
@@ -1790,31 +1833,26 @@ class TestConcurrentApprovalCoalescing:
         }
 
     def _spawn_waits(self, mod, notified, n=2, command="rm -rf .git"):
-        import threading
+        leader_notified = threading.Event()
+
+        def notify(data):
+            notified.append(data)
+            leader_notified.set()
+
         results = [None] * n
         threads = []
         for i in range(n):
             def _run(idx=i):
                 results[idx] = mod._await_gateway_decision(
-                    self.SESSION_KEY, notified.append, self._data(command)
+                    self.SESSION_KEY, notify, self._data(command)
                 )
             t = threading.Thread(target=_run)
             t.start()
             threads.append(t)
             if i == 0:
-                # Wait for the leader to enqueue AND for its notify_cb to
-                # fire (the pre-approval hook dispatch runs between the
-                # queue append and the notify, and can be slow on first
-                # call) so follower threads deterministically find it and
-                # coalesce against a fully-presented prompt.
-                for _ in range(400):
-                    if mod._gateway_queues.get(self.SESSION_KEY) and notified:
-                        break
-                    time.sleep(0.005)
+                assert leader_notified.wait(5), "leader did not publish its approval"
             else:
-                # Followers never enqueue; give the thread a beat to reach
-                # the leader wait.
-                time.sleep(0.05)
+                assert self._followers_ready.acquire(timeout=5), "follower did not coalesce"
         return results, threads
 
     def test_identical_concurrent_approvals_send_one_prompt(self, monkeypatch):

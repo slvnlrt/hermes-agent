@@ -180,12 +180,14 @@ class TestRequestToolApproval:
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         monkeypatch.setenv("HERMES_SESSION_PLATFORM", "api_server")
 
+        requester_token = approval_context.set_current_requester_id("api-user")
         notified = []
 
         def approve(data):
             notified.append(data)
             assert approval.resolve_gateway_approval(
-                "test-session", "once", request_id=data["request_id"]
+                "test-session", "once", request_id=data["request_id"],
+                clicker_id="api-user",
             ) == 1
 
         approval.register_gateway_notify("test-session", approve)
@@ -193,6 +195,7 @@ class TestRequestToolApproval:
             res = request_tool_approval("home_lock", "unlock the front door", rule_key="unlock")
         finally:
             approval.unregister_gateway_notify("test-session")
+            approval_context.reset_current_requester_id(requester_token)
 
         assert res["approved"] is True
         assert len(notified) == 1
