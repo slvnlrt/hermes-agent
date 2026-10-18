@@ -27,7 +27,7 @@ def _isolate_approval_state(monkeypatch):
         lambda default="default": "test-session",
     )
     # Empty session + permanent approval stores so nothing pre-approves.
-    monkeypatch.setattr(approval, "is_approved", lambda sk, pk: False)
+    monkeypatch.setattr(approval, "is_approved", lambda sk, pk, rid="": False)
     # Not a yolo session (the shared gate checks this first).
     monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: False)
     monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", False, raising=False)
@@ -40,7 +40,7 @@ def _isolate_approval_state(monkeypatch):
 
 class TestRequestToolApproval:
     def test_session_cached_approval_short_circuits(self, monkeypatch):
-        monkeypatch.setattr(approval, "is_approved", lambda sk, pk: True)
+        monkeypatch.setattr(approval, "is_approved", lambda sk, pk, rid="": True)
         # Should NOT prompt at all.
         monkeypatch.setattr(
             approval, "prompt_dangerous_approval",
@@ -103,7 +103,7 @@ class TestRequestToolApproval:
         monkeypatch.setattr(approval_prompt, "prompt_dangerous_approval", lambda *a, **k: "session")
         calls = {"session": [], "permanent": []}
         monkeypatch.setattr(approval, "approve_session",
-                            lambda sk, pk: calls["session"].append(pk))
+                            lambda sk, pk, rid="": calls["session"].append(pk))
         monkeypatch.setattr(approval, "approve_permanent",
                             lambda pk: calls["permanent"].append(pk))
         monkeypatch.setattr(approval, "save_permanent_allowlist", lambda x: None)
@@ -180,12 +180,14 @@ class TestRequestToolApproval:
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         monkeypatch.setenv("HERMES_SESSION_PLATFORM", "api_server")
 
+        requester_token = approval_context.set_current_requester_id("api-user")
         notified = []
 
         def approve(data):
             notified.append(data)
             assert approval.resolve_gateway_approval(
-                "test-session", "once", request_id=data["request_id"]
+                "test-session", "once", request_id=data["request_id"],
+                clicker_id="api-user",
             ) == 1
 
         approval.register_gateway_notify("test-session", approve)
@@ -193,6 +195,7 @@ class TestRequestToolApproval:
             res = request_tool_approval("home_lock", "unlock the front door", rule_key="unlock")
         finally:
             approval.unregister_gateway_notify("test-session")
+            approval_context.reset_current_requester_id(requester_token)
 
         assert res["approved"] is True
         assert len(notified) == 1

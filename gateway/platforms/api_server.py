@@ -4277,21 +4277,25 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     )
                     if relay_metadata:
                         conversation_kwargs["relay_metadata"] = relay_metadata
-                    approval_token = None
+                    approval_token = requester_token = None
                     if approval_notify_callback is not None and approval_session_key:
                         # Same machinery as /v1/runs (_run_agent_sync): the contextvar scopes
                         # this turn's approvals to the key the resolve endpoint looks up.
                         from tools.approval import register_gateway_notify
-                        from tools.approval_context import set_current_session_key
+                        from tools.approval_context import set_current_requester_id, set_current_session_key
                         approval_token = set_current_session_key(approval_session_key)
+                        requester_token = set_current_requester_id(
+                            self._run_owners.get(approval_session_key, ""))
                         register_gateway_notify(approval_session_key, approval_notify_callback)
                     try:
                         with notification_turn(agent, muted=muted, session_id=session_id or ""):
                             result = agent.run_conversation(**conversation_kwargs)
                     finally:
                         if approval_token is not None:
-                            from tools.approval_context import reset_current_session_key
+                            from tools.approval_context import reset_current_requester_id, reset_current_session_key
                             _api_runs._unregister_approval_notify(approval_session_key)
+                            with suppress(Exception):
+                                reset_current_requester_id(requester_token)
                             with suppress(Exception):
                                 reset_current_session_key(approval_token)
                     result, usage = self._finish_turn_result(

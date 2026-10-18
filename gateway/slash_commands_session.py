@@ -558,7 +558,8 @@ class GatewaySessionCommandsMixin:
         # the transport applies its default effort — a 400 on non-reasoning models.
         runtime_kwargs["reasoning_config"] = self._resolve_session_reasoning_config(source=source, model=model)
 
-        tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
+        tmp_agent = await self._build_manual_compression_agent(
+            session_entry.session_id, model, runtime_kwargs, source=source)
         try:
             # Not a bare run_in_executor: the profile secret scope is a contextvar the default
             # executor hop would drop, failing aux-client credential resolution closed.
@@ -580,7 +581,8 @@ class GatewaySessionCommandsMixin:
             await self._cleanup_agent_resources_off_loop(tmp_agent, context="manual compression")
         return "\n".join(_manual_compression_reply_lines(summary, compressor, request.focus_topic))
 
-    async def _build_manual_compression_agent(self, session_id: str, model, runtime_kwargs: dict):
+    async def _build_manual_compression_agent(self, session_id: str, model, runtime_kwargs: dict,
+                                               source=None):
         """Build the throwaway AIAgent that performs a manual /compress rewrite of *session_id*."""
         from run_agent import AIAgent
         from gateway.run import _GATEWAY_HYGIENE_PLATFORM, _seed_hygiene_system_prompt
@@ -605,10 +607,24 @@ class GatewaySessionCommandsMixin:
         _checkpoint_required = _is_truthy(
             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"),
             default=False)
-        tmp_agent = AIAgent(**runtime_kwargs, model=model, max_iterations=4, quiet_mode=True,
-                            skip_memory=not _checkpoint_required, enabled_toolsets=["memory"],
-                            session_id=session_id,
-                            session_db=getattr(self._session_db, "_db", self._session_db))
+        # Thread the gateway user identity so a checkpoint targets the correct principal.
+        _gw_identity = {}
+        if source is not None:
+            for _id_key in ("user_id", "user_id_alt", "user_name", "chat_id", "chat_name",
+                             "chat_type", "thread_id"):
+                _id_val = getattr(source, _id_key, None)
+                if _id_val:
+                    _gw_identity[_id_key] = _id_val
+        # The execution context is separate from platform: preserve the gateway
+        # source for routing while making this checkpoint writer non-primary.
+        tmp_agent = AIAgent(
+            **runtime_kwargs, model=model, max_iterations=4, quiet_mode=True,
+            skip_memory=not _checkpoint_required, enabled_toolsets=["memory"],
+            session_id=session_id,
+            session_db=getattr(self._session_db, "_db", self._session_db),
+            _execution_context=_GATEWAY_HYGIENE_PLATFORM,
+            **_gw_identity,
+        )
         _seed_hygiene_system_prompt(tmp_agent, session_row)
         # Real platform during construction (context engines bind correctly); the stamp afterwards
         # only marks this agent as no real surface. Since #104414 Platform is not a restore-identity

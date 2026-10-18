@@ -116,9 +116,18 @@ class HostedRoomServerRPC:
             return result
 
     def approve(self, *, session_id: str, request_id: str, choice: str) -> Mapping[str, Any]:
-        """Resolve one exact local room approval without broad policy changes."""
-        return self._call("approval.respond", {
-            "session_id": session_id, "request_id": request_id, "choice": choice, "all": False})
+        """Resolve one exact local room approval under its in-process session owner."""
+        record = self._session_record(session_id)
+        if record is None:
+            return self._call("approval.respond", {
+                "session_id": session_id, "request_id": request_id, "choice": choice, "all": False})
+        from tui_gateway.transport import bind_transport, reset_transport
+        token = bind_transport(record.get("transport"))
+        try:
+            return self._call("approval.respond", {
+                "session_id": session_id, "request_id": request_id, "choice": choice, "all": False})
+        finally:
+            reset_transport(token)
 
     def interrupt(
         self, *, profile: str, session_id: str, source: str, expected_task_id: str

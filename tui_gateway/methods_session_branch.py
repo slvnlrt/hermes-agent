@@ -36,7 +36,8 @@ def _build_branch_agent(session: dict, new_sid: str, new_key: str, history: list
             agent = _make_agent_in_context(new_sid, new_key, session_db=branch_db, platform_override=source,
                                            cwd_override=_session_cwd(session),
                                            context_cwd_is_launch_artifact=_context_cwd_is_launch_artifact(session),
-                                           auth_user_id=parent_user_id)
+                                           auth_user_id=parent_user_id,
+                                           _local_owner_provenance=_session_is_local_provenance(session))
             _init_session(new_sid, new_key, agent, list(history), cols=session.get("cols", 80),
                           cwd=_session_cwd(session), session_db=branch_db, source=source, profile_home=parent_home,
                           explicit_cwd=bool(session.get("explicit_cwd")))

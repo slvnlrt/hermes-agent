@@ -202,6 +202,62 @@ def auth_adapter():
     return _make_adapter(api_key="sk-secret")
 
 
+@pytest.mark.asyncio
+async def test_run_guard_approval_binds_admitted_scope_through_http_response(auth_adapter, monkeypatch):
+    from tools import approval_context
+
+    monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+    monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+    monkeypatch.setattr(approval_mod, "_YOLO_MODE_FROZEN", False)
+    monkeypatch.setattr(approval_context, "_get_approval_config", lambda: {"mode": "manual", "timeout": 5})
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *_args, **_kwargs: [])
+    decisions = []
+    requesters = []
+    agent = MagicMock()
+    agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
+
+    def run_conversation(**_kwargs):
+        requesters.append(approval_context.get_current_requester_id())
+        decisions.append(approval_mod.check_all_command_guards(
+            "rm -rf ./synthetic-approval-fixture", "local"))
+        return {"final_response": "finished"}
+
+    agent.run_conversation.side_effect = run_conversation
+    headers = {"Authorization": "Bearer sk-secret"}
+    async with TestClient(TestServer(_create_runs_app(auth_adapter))) as cli:
+        with patch.object(auth_adapter, "_create_agent", return_value=agent):
+            response = await cli.post("/v1/runs", headers=headers, json={"input": "synthetic approval"})
+            assert response.status == 202
+            run_id = (await response.json())["run_id"]
+            task = auth_adapter._active_run_tasks[run_id]
+            try:
+                for _ in range(500):
+                    pending = approval_mod.list_gateway_approvals(run_id)
+                    if pending:
+                        break
+                    await asyncio.sleep(0.01)
+                assert pending
+                scope = auth_adapter._run_owners[run_id]
+                assert requesters == [scope]
+                assert pending[0]["requester_id"] == scope
+                assert approval_mod.resolve_gateway_approval(
+                    run_id, "once", clicker_id="foreign-scope") == approval_mod.REQUESTER_MISMATCH
+                denied = await cli.post(
+                    f"/v1/runs/{run_id}/approval",
+                    headers={"Authorization": "Bearer wrong-key"}, json={"choice": "once"})
+                assert denied.status == 401
+                assert approval_mod.has_blocking_approval(run_id)
+                accepted = await cli.post(
+                    f"/v1/runs/{run_id}/approval", headers=headers,
+                    json={"choice": "once", "request_id": pending[0]["request_id"]})
+                assert accepted.status == 200, await accepted.text()
+                await asyncio.wait_for(asyncio.shield(task), 5)
+                assert decisions[0]["approved"] is True
+            finally:
+                approval_mod.unregister_gateway_notify(run_id)
+                await asyncio.wait_for(asyncio.shield(task), 5)
+
+
 # ---------------------------------------------------------------------------
 # POST /v1/runs — start a run
 # ---------------------------------------------------------------------------

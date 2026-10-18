@@ -207,6 +207,28 @@ def declare_stateless_channel() -> None:
     _SESSION_ASYNC_DELIVERY.set(False)
 
 
+def get_verified_principal(default: str = "") -> str:
+    """Return the verified platform identity of the current message's speaker.
+
+    This is a documented accessor over the ``HERMES_SESSION_USER_ID`` context
+    variable, which the gateway sets **per message** from the transport-verified
+    ``source.user_id`` (e.g. Teams ``aad_object_id``, Signal UUID) and
+    propagates into tool threads via ``copy_context``.  In a shared/group
+    session the same cached agent handles several speakers, but this var is
+    rebound on every turn, so it always reflects the current turn's speaker.
+
+    On gateway turns the value is the platform's verified id for the speaker.
+    The display name (``HERMES_SESSION_USER_NAME``) is user-controlled and is
+    never an authorization signal.
+
+    This accessor preserves ``get_session_env`` semantics: an unbound context
+    falls back to the process environment, then *default*. It does not verify
+    that fallback or establish trusted local admission. Authorization callers
+    must use a transport-bound context and fail closed when its id is empty.
+    """
+    return get_session_env("HERMES_SESSION_USER_ID", default)
+
+
 def async_delivery_supported() -> bool:
     """Whether the current session can deliver a background completion later.  False for
     stateless channels (:func:`declare_stateless_channel`) and Kanban workers

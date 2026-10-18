@@ -603,6 +603,8 @@ class PluginContext:
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
         origin: Mapping[str, Any] | None = None,
+        request_id: str | None = None, expires_at: float | None = None,
+        on_complete: Callable[[str], None] | None = None,
     ) -> bool:
         """Inject a message into a CLI, Ink TUI/desktop, or messaging-gateway conversation.
 
@@ -615,9 +617,15 @@ class PluginContext:
         target another profile. Non-CLI injection needs ``session_key`` or ``origin`` plus
         ``plugins.entries.<plugin_id>.allow_gateway_injection`` in the plugin's profile config.
         ``True`` means a host accepted the request, not that the turn completed.
+        Messaging-gateway requests may carry a process-local terminal ``on_complete`` callback,
+        an opaque ``request_id``, and an ``expires_at`` deadline for waiting work. Synchronous
+        refusal never calls the callback; CLI/TUI admission is not a delivery receipt.
         """
         from hermes_cli.plugins_injection import inject_plugin_message
-        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin)
+        return inject_plugin_message(
+            self, content, role, session_key=session_key, origin=origin,
+            request_id=request_id, expires_at=expires_at, on_complete=on_complete,
+        )
 
     def _gateway_injection_allowed(self) -> bool:
         """Return whether this plugin may trigger gateway session turns (read from the plugin's

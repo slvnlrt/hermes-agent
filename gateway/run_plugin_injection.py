@@ -13,10 +13,11 @@ import concurrent.futures
 import contextlib
 import logging
 import weakref
+import time
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import InjectionReceipt, MessageEvent, MessageType
 from gateway.session import SessionSource
 
 logger = logging.getLogger("gateway.run")
@@ -38,6 +39,8 @@ class GatewayPluginInjectionMixin:
     def _schedule_plugin_message_injection(
         self, *, content: str, plugin_id: str, session_key: Optional[str] = None,
         origin: Optional[Mapping[str, Any]] = None, plugin_home: Optional[Path] = None,
+        request_id: Optional[str] = None, expires_at: Optional[float] = None,
+        on_complete: Any = None,
     ) -> bool:
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe).
 
@@ -47,17 +50,24 @@ class GatewayPluginInjectionMixin:
         loop = getattr(self, "_gateway_loop", None)
         if not getattr(self, "_running", False) or loop is None or loop.is_closed():
             return False
+        if expires_at is not None and expires_at <= time.time():
+            return False
+        receipt = self._plugin_injection_receipt(on_complete, expires_at)
+        lifecycle = dict(request_id=request_id, expires_at=expires_at, on_complete=receipt)
 
         if origin is not None:
             source = self._plugin_origin_source(origin, plugin_home=plugin_home, plugin_id=plugin_id)
             if source is None:
                 return False
             target = f"origin={source.platform.value}/{source.chat_id}"
-            coro = self._dispatch_plugin_origin_injection(source=source, content=content, plugin_id=plugin_id)
+            coro = self._dispatch_plugin_origin_injection(
+                source=source, content=content, plugin_id=plugin_id, **lifecycle,
+            )
         else:
             target = f"session={session_key}"
             coro = self._dispatch_plugin_message_injection(
                 session_key=session_key, content=content, plugin_id=plugin_id,
+                **lifecycle,
             )
         try:
             current_loop = asyncio.get_running_loop()
@@ -86,13 +96,50 @@ class GatewayPluginInjectionMixin:
                 if completed.result():
                     return
             except (asyncio.CancelledError, concurrent.futures.CancelledError):
+                if receipt is not None:
+                    receipt.terminal("cancelled")
                 return
             except Exception:  # dispatch boundary: the plugin already got True; log, never raise
+                if receipt is not None:
+                    receipt.terminal("failure")
                 logger.warning("Plugin message injection failed: plugin=%s %s", plugin_id, target, exc_info=True)
                 return
+            if receipt is not None:
+                receipt.terminal("not_routed")
             logger.warning("Plugin message injection was not routed: plugin=%s %s", plugin_id, target)
 
         future.add_done_callback(_log_result)
+        return True
+
+    @staticmethod
+    def _plugin_injection_receipt(callback, expires_at):
+        if isinstance(callback, InjectionReceipt):
+            return callback
+        if callback is not None or expires_at is not None:
+            return InjectionReceipt(callback, expires_at)
+        return None
+
+    async def _admit_plugin_injection(self, event, adapter, receipt, request_id):
+        if request_id is not None:
+            event.metadata["hermes_injection_request_id"] = request_id
+        event._injection_lifecycle_managed = receipt is not None
+        if receipt is not None:
+            event._injection_receipts.append(receipt)
+        try:
+            async with self._plugin_injection_scope(event.source):
+                await adapter.handle_message(event)
+        except asyncio.CancelledError:
+            if receipt is not None:
+                receipt.terminal("cancelled")
+            raise
+        except Exception:
+            if receipt is not None:
+                receipt.terminal("failure")
+            raise
+        if not event._gateway_accepted:
+            if receipt is not None:
+                receipt.terminal("not_routed")
+            return False
         return True
 
     def _plugin_injection_accepting(self) -> bool:
@@ -124,34 +171,44 @@ class GatewayPluginInjectionMixin:
         return authorized
 
     async def _dispatch_plugin_message_injection(
-        self, *, session_key: str, content: str, plugin_id: str
+        self, *, session_key: str, content: str, plugin_id: str,
+        request_id: Optional[str] = None, expires_at: Optional[float] = None,
+        on_complete: Any = None,
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
-        if not self._plugin_injection_accepting():
+        receipt = self._plugin_injection_receipt(on_complete, expires_at)
+        def refuse(outcome="not_routed"):
+            if receipt is not None:
+                receipt.terminal(outcome)
             return False
+        if expires_at is not None and expires_at <= time.time():
+            return refuse("expired")
+        if not self._plugin_injection_accepting():
+            return refuse()
         entry = await self.async_session_store.lookup_by_session_key(session_key)
         if entry is None or entry.origin is None or not self._plugin_injection_accepting():
-            return False
+            return refuse()
 
         from gateway.session_identity import replace_source
         source = replace_source(self._restored_source(entry))
         if not self._plugin_injection_authorized(source, plugin_id=plugin_id, target=f"session={session_key}"):
-            return False
+            return refuse()
 
         adapter = self._delivery_adapter_for(source)
         if adapter is None:
-            return False
+            return refuse()
 
-        async with self._plugin_injection_scope(source):
-            await adapter.handle_message(MessageEvent(
-                text=content, message_type=MessageType.TEXT, source=source, internal=True,
-                allow_gateway_control=False,
-                metadata={
-                    "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
-                    "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
-                    "gateway_session_strict": True,
-                },
-            ))
+        event = MessageEvent(
+            text=content, message_type=MessageType.TEXT, source=source, internal=True,
+            allow_gateway_control=False,
+            metadata={
+                "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
+                "gateway_session_key": session_key, "gateway_session_id": entry.session_id,
+                "gateway_session_strict": True,
+            },
+        )
+        if not await self._admit_plugin_injection(event, adapter, receipt, request_id):
+            return False
         logger.info(
             "Plugin message injection dispatched: plugin=%s session=%s session_id=%s",
             plugin_id, session_key, entry.session_id,
@@ -216,29 +273,39 @@ class GatewayPluginInjectionMixin:
         return source
 
     async def _dispatch_plugin_origin_injection(
-        self, *, source: SessionSource, content: str, plugin_id: str
+        self, *, source: SessionSource, content: str, plugin_id: str,
+        request_id: Optional[str] = None, expires_at: Optional[float] = None,
+        on_complete: Any = None,
     ) -> bool:
         """Start (or continue) the session at a plugin-supplied origin through the adapter's normal
         message path: ``get_or_create_session`` creates it, the reply goes back to that chat."""
+        receipt = self._plugin_injection_receipt(on_complete, expires_at)
+        def refuse(outcome="not_routed"):
+            if receipt is not None:
+                receipt.terminal(outcome)
+            return False
+        if expires_at is not None and expires_at <= time.time():
+            return refuse("expired")
         target = f"origin={source.platform.value}/{source.chat_id}"
         if not self._plugin_injection_accepting():
-            return False
+            return refuse()
         adapter = self._delivery_adapter_for(source)
         if adapter is None:
             logger.warning("Plugin message injection: adapter for %s went away before dispatch", target)
-            return False
+            return refuse()
         if not self._plugin_injection_authorized(source, plugin_id=plugin_id, target=target):
-            return False
+            return refuse()
         session_key = self._session_key_for_source(source)
-        async with self._plugin_injection_scope(source):
-            await adapter.handle_message(MessageEvent(
-                text=content, message_type=MessageType.TEXT, source=source, internal=True,
-                allow_gateway_control=False,
-                # Non-strict: the key is pinned against topic recovery, the session may not exist yet.
-                metadata={
-                    "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
-                    "gateway_session_key": session_key,
-                },
-            ))
+        event = MessageEvent(
+            text=content, message_type=MessageType.TEXT, source=source, internal=True,
+            allow_gateway_control=False,
+            # Non-strict: the key is pinned against topic recovery, the session may not exist yet.
+            metadata={
+                "hermes_plugin_id": plugin_id, "hermes_plugin_injection": True,
+                "gateway_session_key": session_key,
+            },
+        )
+        if not await self._admit_plugin_injection(event, adapter, receipt, request_id):
+            return False
         logger.info("Plugin message injection dispatched: plugin=%s %s session=%s", plugin_id, target, session_key)
         return True

@@ -28,11 +28,44 @@ _approval_tool_call_id: contextvars.ContextVar[str] = _ctx("approval_tool_call_i
 # hooks so observer plugins attach marks to the REAL session scope — otherwise they fall back to a synthetic "default"
 # session whose scope never closes, so close-time exporters never ship them.
 _approval_session_id: contextvars.ContextVar[str] = _ctx("approval_session_id")
+# Verified platform identity of the user whose message triggered the current
+# approval request. Set by the gateway alongside the session key from the
+# adapter's callback-capable primary ``source.user_id``. An empty value is
+# valid only for local operator surfaces; requester-bound gateways fail closed
+# rather than treating it as a wildcard.
+_approval_requester_id: contextvars.ContextVar[str] = _ctx("approval_requester_id")
 # Interactive-CLI flag. Concurrent ACP sessions share a ThreadPoolExecutor, so mutating
 # os.environ["HERMES_INTERACTIVE"] races: one session's `finally` restore can clobber another's set mid-run, dropping
 # it onto the non-interactive auto-approve path so a dangerous command runs without the approval callback firing
 # (GHSA-96vc-wcxf-jjff). None = unset → env fallback.
 _hermes_interactive_ctx: contextvars.ContextVar[str | None] = _ctx("hermes_interactive", None)
+# Server-authenticated native-session authority. Unlike ``HERMES_SESSION_PLATFORM`` or a
+# persisted session ``source``, this scope is minted only from TUI/Desktop transport
+# admission: ``"local"`` for stdio/loopback, otherwise the authenticated WS principal.
+_approval_session_owner: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_session_owner", default="")
+
+
+def set_current_approval_session_owner(owner_scope: "str | bool") -> contextvars.Token[str]:
+    """Bind the server-verified native owner scope for the current turn."""
+    scope = "local" if owner_scope is True else str(owner_scope or "")
+    return _approval_session_owner.set(scope)
+
+
+def reset_current_approval_session_owner(token: contextvars.Token[str]) -> None:
+    """Restore the prior native-session approval authority."""
+    _approval_session_owner.reset(token)
+
+
+def current_approval_session_owner() -> bool:
+    """Whether this turn has a server-verified native session owner."""
+    return bool(_approval_session_owner.get())
+
+
+def current_approval_session_owner_is_local() -> bool:
+    """Whether native approval authority came from local stdio/loopback admission."""
+    return _approval_session_owner.get() == "local"
+
 
 
 def set_hermes_interactive_context(interactive: bool) -> contextvars.Token:
@@ -81,6 +114,31 @@ def set_current_session_key(session_key: str) -> contextvars.Token[str]:
 def reset_current_session_key(token: contextvars.Token[str]) -> None:
     """Restore the prior approval session key context."""
     _approval_session_key.reset(token)
+
+
+def set_current_requester_id(requester_id: str) -> contextvars.Token[str]:
+    """Bind the verified requester id for the current context.
+
+    Symmetric to :func:`set_current_session_key`. The messaging gateway sets
+    this from its adapter-verified message source. Empty means there is no
+    messaging principal; only a separately server-admitted native session
+    owner may then receive and resolve a gateway-style prompt.
+    """
+    return _approval_requester_id.set(requester_id or "")
+
+
+def reset_current_requester_id(token: contextvars.Token[str]) -> None:
+    """Restore the prior requester id context."""
+    _approval_requester_id.reset(token)
+
+
+def get_current_requester_id() -> str:
+    """Return the verified messaging requester id bound to the current context.
+
+    Empty string when unset. It is never a wildcard: gateway callers either
+    carry native session-owner authority or fail closed.
+    """
+    return _approval_requester_id.get()
 
 
 _Tokens = tuple[contextvars.Token[str], contextvars.Token[str], contextvars.Token[str]]
@@ -320,6 +378,21 @@ def _get_unattended_approval_mode() -> str:
     deny — an unattended session never silently runs a flagged action unless the
     operator explicitly trusts it."""
     return _binary_approval_mode("unattended_mode")
+
+
+def _get_require_requester_match() -> bool:
+    """Whether an approval may only be resolved by its verified requester.
+
+    Reads ``approvals.require_requester_match`` (default ``True``). When True,
+    a click or ``/approve`` must carry the exact verified requester identity;
+    missing gateway requester/clicker identities fail closed. Setting False is
+    the deliberate compatibility opt-out for shared approval authority.
+    """
+    try:
+        value = _get_approval_config().get("require_requester_match", True)
+    except Exception:
+        return True
+    return is_truthy_value(value) if not isinstance(value, bool) else value
 
 
 def _get_approval_transport_config() -> tuple[str, str | None]:

@@ -262,6 +262,20 @@ def _decline(rid: str, transport: Any) -> bool:
     return True
 
 
+def approval_owner_session(request_id: str) -> str:
+    """Owning runtime session for a native approval response, else ``""``.
+
+    Only approvals explicitly minted under server-verified native authority are
+    transport-bound here; messaging requester checks remain in ``tools.approval``.
+    """
+    with _lock:
+        req = _open.get(request_id)
+        if (req is None or req.method != "approval"
+                or not req.params.get("session_owner_required")):
+            return ""
+        return req.sid
+
+
 def resolve_response(frame: dict, transport: Any = None) -> bool:
     """Route one client response frame to its open request. False when nothing is waiting for that id
     (already timed out / cancelled, or owned by another process — see the compute-host bridge).

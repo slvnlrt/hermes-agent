@@ -3,6 +3,10 @@ gateway (existing ``session_key`` or a new session at ``origin``)."""
 from __future__ import annotations
 
 import logging
+import inspect
+import math
+import re
+import time
 from collections.abc import Mapping
 from typing import Any, Optional
 
@@ -12,12 +16,33 @@ logger = logging.getLogger("hermes_cli.plugins")
 def inject_plugin_message(
     ctx: Any, content: str, role: str, *, session_key: Optional[str],
     origin: Optional[Mapping[str, Any]],
+    request_id: Optional[str] = None, expires_at: Optional[float] = None,
+    on_complete: Any = None,
 ) -> bool:
+    if request_id is not None and (
+        not isinstance(request_id, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", request_id)
+    ):
+        raise ValueError("request_id must contain 1-128 letters, digits, '.', '_', ':' or '-'")
+    if expires_at is not None and (
+        isinstance(expires_at, bool) or not isinstance(expires_at, (int, float))
+        or not math.isfinite(expires_at)
+    ):
+        raise ValueError("expires_at must be a finite Unix timestamp")
+    if on_complete is not None and (
+        not callable(on_complete) or inspect.iscoroutinefunction(on_complete)
+    ):
+        raise TypeError("on_complete must be a synchronous callable")
+    lifecycle = request_id is not None or expires_at is not None or on_complete is not None
+    if expires_at is not None and expires_at <= time.time():
+        return False
     manager = ctx._manager
     msg = content if role == "user" else f"[{role}] {content}"
     cli = manager._cli_ref
     # An origin names a messaging chat; the local REPL is never that chat.
     if cli is not None and origin is None:
+        if lifecycle:
+            logger.warning("inject_message: CLI mode does not support injection lifecycle receipts")
+            return False
         queue_ = cli._interrupt_queue if getattr(cli, "_agent_running", False) else cli._pending_input
         queue_.put(msg)
         return True
@@ -39,7 +64,7 @@ def inject_plugin_message(
     # session_key; a miss falls through so a co-resident messaging gateway
     # still receives its own keys. An exception fails closed — do not also
     # hand the same text to the gateway.
-    if session_key and manager.has_tui_message_injector:
+    if session_key and manager.has_tui_message_injector and not lifecycle:
         try:
             if manager.inject_tui_message(session_key=session_key, content=msg, plugin_id=ctx.plugin_id):
                 return True
@@ -55,6 +80,13 @@ def inject_plugin_message(
         # The manager's immutable home is the plugin's profile: the gateway creates the session
         # there or nowhere (never the ambient HERMES_HOME of whatever thread called us).
         target = {"origin": dict(origin), "plugin_home": manager.home_path}
+    if request_id is not None:
+        target["request_id"] = request_id
+    if expires_at is not None:
+        target["expires_at"] = expires_at
+    if on_complete is not None:
+        from gateway.platforms.event import InjectionReceipt
+        target["on_complete"] = InjectionReceipt(on_complete, expires_at)
     try:
         return bool(manager.inject_gateway_message(**target, content=msg, plugin_id=ctx.plugin_id))
     except Exception:

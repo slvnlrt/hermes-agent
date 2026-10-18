@@ -1242,7 +1242,7 @@ class GatewayTurnMixin:
             _hyg_codex_outcome, session_entry.session_id, _hyg_codex_auto, f"{plan.approx_tokens:,}",
         )
 
-    async def _hmwa_hygiene_build_agent(self, _hyg_model, _hyg_runtime, session_entry):
+    async def _hmwa_hygiene_build_agent(self, _hyg_model, _hyg_runtime, session_entry, source=None):
         """Build the detached hygiene ``AIAgent`` with the live session's system prompt. Returns
         ``(agent, sync_session_db)``."""
         from gateway.run import _GATEWAY_HYGIENE_PLATFORM, _seed_hygiene_system_prompt
@@ -1265,10 +1265,25 @@ class GatewayTurnMixin:
         _hyg_checkpoint_required = _is_truthy(
             ((_load_cfg() or {}).get("compression") or {}).get("checkpoint_required"), default=False,
         )
+        # Pass platform at construction so memory init sees the correct non-primary context.
+        # gateway_hygiene is in the _automated set, so agent_context will not be "primary".
+        # _local_owner_provenance defaults to False → no local_user_id inheritance.
+        # Thread the gateway user identity so a checkpoint targets the correct principal.
+        _hyg_gw_identity = {}
+        _id_source = source or getattr(session_entry, "origin", None)
+        if _id_source is not None:
+            for _id_key in ("user_id", "user_id_alt", "user_name", "chat_id", "chat_name",
+                             "chat_type", "thread_id"):
+                _id_val = getattr(_id_source, _id_key, None)
+                if _id_val:
+                    _hyg_gw_identity[_id_key] = _id_val
         _hyg_agent = AIAgent(
             **_hyg_runtime, model=_hyg_model, max_iterations=4, quiet_mode=True,
             skip_memory=not _hyg_checkpoint_required, enabled_toolsets=["memory"],
             session_id=session_entry.session_id, session_db=_hyg_session_db,
+            platform=_GATEWAY_HYGIENE_PLATFORM,
+            _execution_context=_GATEWAY_HYGIENE_PLATFORM,
+            **_hyg_gw_identity,
         )
         _seed_hygiene_system_prompt(_hyg_agent, _hyg_session_row)
         # The stamp only marks this agent as no real surface. Since #104414 Platform is not a
@@ -1285,7 +1300,8 @@ class GatewayTurnMixin:
         continue with (compressed or original) on ``attempt.history``."""
         from gateway.run import HygieneTurnHoldExceeded
         from agent.conversation_compression import CompressionCommitFence
-        _hyg_agent, _hyg_session_db = await self._hmwa_hygiene_build_agent(_hyg_model, _hyg_runtime, session_entry)
+        _hyg_agent, _hyg_session_db = await self._hmwa_hygiene_build_agent(
+            _hyg_model, _hyg_runtime, session_entry, source=source)
         attempt.agent = _hyg_agent
         try:
             # Hygiene owns the session binding, so prefer in-place compaction over minting a
@@ -1918,11 +1934,17 @@ class GatewayTurnMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
+        if agent_result.get("failed"):
+            event._injection_delivery_confirmed = False
+        if agent_result.get("interrupted"):
+            event._injection_terminal_outcome = "cancelled"
         if diagnostic_wake_muted(event):
+            event._injection_intentional_silence = True
             return None
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
+            event._injection_intentional_silence = True
             response = ""
 
         adapter = self._delivery_adapter_for(source)
@@ -1938,16 +1960,23 @@ class GatewayTurnMixin:
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
         if agent_result.get("already_sent") and not agent_result.get("failed"):
+            delivery_succeeded = agent_result.get("_queued_delivery_succeeded", True)
             # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
             # would upload every file a second time.
             if response and adapter and not agent_result.get("media_already_delivered"):
-                await self._deliver_media_from_response(response, event, adapter)
+                media_succeeded = await self._deliver_media_from_response(response, event, adapter)
+                delivery_succeeded = delivery_succeeded and media_succeeded is not False
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
             if _footer_line and adapter:
                 try:
-                    await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
+                    footer_result = await adapter.send(
+                        source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
+                    delivery_succeeded = delivery_succeeded and bool(getattr(footer_result, "success", False))
                 except Exception as _e:
+                    delivery_succeeded = False
                     logger.debug("trailing footer send failed: %s", _e)
+            # Streamed text alone does not acknowledge failed attachment/footer obligations.
+            event._injection_delivery_confirmed = delivery_succeeded
             # Return None so the body isn't sent twice; stash the delivered text on the event for the
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):
@@ -2193,6 +2222,7 @@ class GatewayTurnMixin:
                 # Persist the coherent context+channel pair before execution: a crash during the
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
+            from gateway.platforms.event import event_receipts
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -2209,8 +2239,18 @@ class GatewayTurnMixin:
                     **reply_expected_metadata(event.reply_expected), **diagnostic_metadata(event)},
                 message_type=event.message_type,
                 scheduled_heartbeat=bool(getattr(event, "_heartbeat_session_id", None)),
+                receipt_owner=event if event_receipts(event) else None,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
+
+            # Earlier queued owners are closed by their own in-band final delivery.  The terminal
+            # owner is the sole exception: its final response is still sent by this root adapter task.
+            if isinstance(agent_result, dict):
+                from gateway.platforms.event import transfer_event_receipts
+
+                terminal_receipt_owner = agent_result.pop("_queued_terminal_receipt_owner", None)
+                if terminal_receipt_owner is not None and terminal_receipt_owner is not event:
+                    transfer_event_receipts(terminal_receipt_owner, event)
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
             # send (bracketed by the adapter against this event) must be ledgered under that
@@ -2475,7 +2515,10 @@ class GatewayTurnMixin:
                     provider_require_parameters=pr.get("require_parameters", False),
                     provider_data_collection=pr.get("data_collection"),
                     session_id=task_id,
+                    # This preserves the gateway's native platform and authenticated principal
+                    # for routing/scoping, while marking /bg non-primary before provider init.
                     platform=platform_key,
+                    _execution_context="background",
                     **{k: getattr(source, k) for k in (
                         "user_id", "user_id_alt", "user_name", "chat_id", "chat_name", "chat_type", "thread_id",
                     )},
@@ -2491,8 +2534,23 @@ class GatewayTurnMixin:
 
             result = await self._run_in_executor_with_context(run_sync)
 
-            response = result.get("final_response", "") if result else ""
-            if not response and result and result.get("error"):
+            if not isinstance(result, dict):
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=f"❌ Background task {task_id} failed: no result returned.",
+                    metadata=_thread_metadata,
+                )
+                return
+            if result.get("failed"):
+                await adapter.send(
+                    chat_id=source.chat_id,
+                    content=f"❌ Background task {task_id} failed: {result.get('error') or 'agent run failed'}",
+                    metadata=_thread_metadata,
+                )
+                return
+
+            response = result.get("final_response", "")
+            if not response and result.get("error"):
                 response = t("gateway.shared.error_prefix", error=result["error"])
             # Fresh conversation, so history_offset=0: every message in the run belongs to this turn.
             if response:
@@ -2500,31 +2558,44 @@ class GatewayTurnMixin:
 
             preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
             header = t("gateway.background.complete_header", preview=preview)
-            images, media_files, text_content = [], [], ""
+            images, media_files, text_content, dropped_media = [], [], "", []
             if response:
+                from gateway.run_notifications import _split_media_by_delivery_policy
+
                 media_files, response = adapter.extract_media(response)
-                media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+                media_files, _, dropped_media = _split_media_by_delivery_policy(media_files, [])
                 images, text_content = adapter.extract_images(response)
-            if text_content:
-                await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
-            elif not images and not media_files:
-                await adapter.send(
-                    chat_id=source.chat_id, content=header + t("gateway.background.no_response"), metadata=_thread_metadata,
-                )
+
+            from gateway.run_notifications import _attachment_basename
+
+            delivery_failures = list(dropped_media)
+            delivered_attachments = False
             for image_url, alt_text in (images or []):
-                with suppress(Exception):
-                    await adapter.send_image(
+                try:
+                    image_result = await adapter.send_image(
                         chat_id=source.chat_id, image_url=image_url, caption=alt_text, metadata=_thread_metadata,
                     )
+                except Exception as exc:
+                    logger.warning("Background task image delivery failed: %s", exc)
+                    delivery_failures.append(image_url)
+                else:
+                    if getattr(image_result, "success", True) is False:
+                        logger.warning(
+                            "Background task image delivery failed: %s",
+                            getattr(image_result, "error", None) or "send returned success=False",
+                        )
+                        delivery_failures.append(image_url)
+                    else:
+                        delivered_attachments = True
             # Route each media file by type (voice bubble / video / image / document), as the
             # streaming + kanban paths do.
             from gateway.platforms.base import should_send_media_as_audio as _should_send_media_as_audio
             from gateway.run_notifications import _IMAGE_EXTS, _VIDEO_EXTS
             for media_path, _is_voice in (media_files or []):
                 _ext = os.path.splitext(media_path)[1].lower()
-                with suppress(Exception):
+                try:
                     if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                        await adapter.send_voice(
+                        media_result = await adapter.send_voice(
                             chat_id=source.chat_id, audio_path=media_path, metadata=_thread_metadata,
                             is_voice=_is_voice,
                         )
@@ -2534,7 +2605,67 @@ class GatewayTurnMixin:
                             else (adapter.send_image_file, "image_path") if _ext in _IMAGE_EXTS
                             else (adapter.send_document, "file_path")
                         )
-                        await sender(chat_id=source.chat_id, metadata=_thread_metadata, **{key: media_path})
+                        media_result = await sender(
+                            chat_id=source.chat_id, metadata=_thread_metadata, **{key: media_path},
+                        )
+                except Exception as exc:
+                    logger.warning("Background task media delivery failed: %s", exc)
+                    delivery_failures.append(media_path)
+                else:
+                    if getattr(media_result, "success", True) is False:
+                        logger.warning(
+                            "Background task media delivery failed: %s",
+                            getattr(media_result, "error", None) or "send returned success=False",
+                        )
+                        delivery_failures.append(media_path)
+                    else:
+                        delivered_attachments = True
+
+            if delivery_failures:
+                failed_names = ", ".join(sorted({_attachment_basename(path) for path in delivery_failures}))
+                delivery_status = "partially delivered" if text_content or delivered_attachments else "delivery failed"
+                failure_content = (
+                    f"⚠️ Background task {delivery_status}\nPrompt: \"{preview}\"\n\n"
+                )
+                if text_content:
+                    failure_content += f"{text_content}\n\n"
+                failure_content += f"Couldn't deliver attachment(s): {failed_names}."
+                notice_result = await adapter.send(
+                    chat_id=source.chat_id, content=failure_content, metadata=_thread_metadata,
+                )
+                if getattr(notice_result, "success", True) is False:
+                    logger.warning(
+                        "Background task delivery-failure notice was not delivered: %s",
+                        getattr(notice_result, "error", None) or "send returned success=False",
+                    )
+            elif text_content:
+                text_result = await adapter.send(
+                    chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata,
+                )
+                if getattr(text_result, "success", True) is False:
+                    logger.warning(
+                        "Background task response was not delivered: %s",
+                        getattr(text_result, "error", None) or "send returned success=False",
+                    )
+            elif images or media_files:
+                completion_result = await adapter.send(
+                    chat_id=source.chat_id, content=header + "(Attachment delivered)", metadata=_thread_metadata,
+                )
+                if getattr(completion_result, "success", True) is False:
+                    logger.warning(
+                        "Background task completion marker was not delivered: %s",
+                        getattr(completion_result, "error", None) or "send returned success=False",
+                    )
+            else:
+                completion_result = await adapter.send(
+                    chat_id=source.chat_id, content=header + t("gateway.background.no_response"),
+                    metadata=_thread_metadata,
+                )
+                if getattr(completion_result, "success", True) is False:
+                    logger.warning(
+                        "Background task completion marker was not delivered: %s",
+                        getattr(completion_result, "error", None) or "send returned success=False",
+                    )
 
         except Exception:
             logger.exception("Background task %s failed", task_id)
@@ -2928,10 +3059,27 @@ class GatewayTurnMixin:
         self, message: str, context_prompt: str, history: list[dict[str, Any]],
         source: SessionSource, session_id: str, **turn_kwargs,
     ) -> dict[str, Any]:
-        """Profile-scoping wrapper around ``_run_agent_inner`` (same keyword parameters; pass-through
-        when multiplexing is off)."""
-        with self._profile_scope_for_source(source):
-            return await self._run_agent_inner(message, context_prompt, history, source, session_id, **turn_kwargs)
+        """Run in the source profile and retain process-local receipt ownership on every exit."""
+        from gateway.platforms.event import terminalize_event_receipts
+
+        receipt_owner = turn_kwargs.get("receipt_owner")
+        try:
+            with self._profile_scope_for_source(source):
+                response = await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id, **turn_kwargs)
+        except asyncio.CancelledError:
+            terminalize_event_receipts(receipt_owner, "cancelled")
+            raise
+        except BaseException:
+            terminalize_event_receipts(receipt_owner, "failure")
+            raise
+        if receipt_owner is not None:
+            if isinstance(response, dict):
+                # A deeper follow-up owns the terminal send; early returns retain this turn's owner.
+                response.setdefault("_queued_terminal_receipt_owner", receipt_owner)
+            else:
+                terminalize_event_receipts(receipt_owner, "failure")
+        return response
 
     def _run_agent_display_settings(self, source: SessionSource) -> GatewayRunner._RunAgentDisplay:
         """Resolve per-platform display, progress, status and streaming-surface settings for a turn."""
@@ -3710,7 +3858,8 @@ class GatewayTurnMixin:
                 )
 
         # Safety net: a pending slash command is never passed to the agent as user input.
-        if pending and pending.strip().startswith("/"):
+        if (pending and pending.strip().startswith("/")
+                and (pending_event is None or pending_event.allow_gateway_control)):
             _pending_cmd_word = pending.strip().split(None, 1)[0][1:].lower()
             if _pending_cmd_word:
                 with suppress(Exception):
@@ -3728,17 +3877,26 @@ class GatewayTurnMixin:
                 "Discarding pending follow-up for session %s during gateway %s",
                 session_key or "?", self._status_action_label(),
             )
+            from gateway.platforms.event import terminalize_event_receipts
+            if pending_event is not None:
+                terminalize_event_receipts(pending_event, "cancelled")
+            for queued_event in list(self._overflow_queue(session_key) or ()):
+                terminalize_event_receipts(queued_event, "cancelled")
+            overflow = self._overflow_queue(session_key)
+            if overflow is not None:
+                overflow.clear()
             pending_event = None
             pending = None
         return pending_event, pending
 
     async def _run_agent_deliver_first_response(
         self, turn_ctx: TurnContext, adapter: Any, response: Any, result: Any, stream_task: Any,
-    ) -> None:
-        """Deliver the first response before a queued follow-up runs, unless streaming already did."""
-        if turn_ctx.mute_notification_reply:
-            return
+    ) -> bool:
+        """Deliver an in-band response and report whether all its obligations succeeded."""
         session_key = turn_ctx.session_key
+        if turn_ctx.mute_notification_reply:
+            muted_result = response if isinstance(response, dict) else (result or {})
+            return not muted_result.get("failed", False)
         _sc = turn_ctx.stream_consumer_holder[0]
         if _sc and stream_task:
             try:
@@ -3751,6 +3909,7 @@ class GatewayTurnMixin:
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
+        delivery_succeeded = False
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
         if self._is_intentional_silence(_delivery_result, first_response):
             if silence_allowed(turn_ctx.persist_user_display_kind, turn_ctx.reply_expected):
@@ -3759,6 +3918,7 @@ class GatewayTurnMixin:
                     session_key or "?",
                 )
                 first_response = ""
+                delivery_succeeded = True
             else:
                 logger.warning(
                     "Queued follow-up for session %s: replacing a human-turn silence marker.",
@@ -3776,6 +3936,7 @@ class GatewayTurnMixin:
                 session_key or "?",
             )
             try:
+                delivery_status = {}
                 _text_delivered = await self._deliver_queued_first_response(
                     first_response, source=turn_ctx.source, adapter=adapter,
                     metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
@@ -3784,10 +3945,12 @@ class GatewayTurnMixin:
                     # The text send records a delivery-ledger obligation under this key, keyed on
                     # the raw inbound id (the anchor above is only the reply target).
                     session_key=session_key, inbound_message_id=turn_ctx.inbound_message_id,
+                    delivery_status=delivery_status,
                 )
             except Exception as e:
                 logger.warning("Failed to send first response before queued message: %s", e)
             else:
+                delivery_succeeded = delivery_status.get("success", False)
                 # One source of truth for "this turn's final already reached the chat": the normal
                 # completion path (`_hmwa_deliver_turn_response`) consults ``already_sent`` on the
                 # result the queued lane hands back. Every early `return result` after this point
@@ -3799,6 +3962,7 @@ class GatewayTurnMixin:
                     # The queued lane already uploaded this response's MEDIA: attachments; without
                     # this the completion path's already_sent rescan uploads every file twice.
                     result["media_already_delivered"] = _deliver_media
+                    result["_queued_delivery_succeeded"] = delivery_succeeded
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
         _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
         if callable(_bg_cb):
@@ -3806,12 +3970,29 @@ class GatewayTurnMixin:
                 _bg_result = _bg_cb()
                 if inspect.isawaitable(_bg_result):
                     await _bg_result
+        return delivery_succeeded and not _delivery_result.get("failed", False)
 
     async def _run_agent_queued_followup(
         self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
+        from gateway.platforms.event import terminalize_event_receipts
+        try:
+            return await self._run_agent_queued_followup_inner(
+                turn_ctx, adapter, pending, pending_event, response, result, stream_task)
+        except asyncio.CancelledError:
+            terminalize_event_receipts(pending_event, "cancelled")
+            raise
+        except BaseException:
+            terminalize_event_receipts(pending_event, "failure")
+            raise
+
+    async def _run_agent_queued_followup_inner(
+        self, turn_ctx: TurnContext, adapter: Any, pending: Optional[str], pending_event: Any,
+        response: Any, result: Any, stream_task: Any,
+    ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
+        from gateway.platforms.event import terminalize_event_receipts
         from gateway.platforms.base import merge_pending_message_event
         from gateway.run import _preserve_queued_followup_history_offset
         source, session_id, session_key, run_generation = (
@@ -3820,7 +4001,17 @@ class GatewayTurnMixin:
         _interrupt_depth, history, _status_thread_metadata = (
             turn_ctx._interrupt_depth, turn_ctx.history, turn_ctx._status_thread_metadata,
         )
-        logger.debug("Processing pending message: '%s...'", pending[:40])
+        logger.debug("Processing pending message: '%s...'", (pending or "")[:40])
+        pending_receipts = ()
+        if pending_event is not None:
+            from gateway.platforms.event import (
+                event_receipts, expire_event_receipts, mark_event_receipts_started,
+            )
+            pending_receipts = event_receipts(pending_event)
+            if getattr(pending_event, "_injection_expired_while_waiting", False) or (
+                pending_receipts and expire_event_receipts(pending_event)
+            ):
+                return result
 
         # Clear the interrupt event so the recursive _run_agent isn't re-interrupted (infinite loop).
         _active = getattr(adapter, "_active_sessions", None) if adapter else None
@@ -3840,10 +4031,20 @@ class GatewayTurnMixin:
             elif adapter and hasattr(adapter, 'queue_message'):
                 adapter.queue_message(session_key, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
+        if pending_receipts:
+            if not mark_event_receipts_started(pending_event):
+                return result
+            cancel_deadline = getattr(adapter, "_cancel_injection_deadline", None)
+            if callable(cancel_deadline):
+                cancel_deadline(pending_event)
 
-        # Interrupted: discard the response ("Operation interrupted." is noise).
+        # Do not close this turn's receipt yet: a refused follow-up returns its result for
+        # outer completion, which can retry the body or still owe a trailing footer.
+        delivery_succeeded = False
         if not result.get("interrupted"):
-            await self._run_agent_deliver_first_response(turn_ctx, adapter, response, result, stream_task)
+            delivery_succeeded = await self._run_agent_deliver_first_response(
+                turn_ctx, adapter, response, result, stream_task,
+            )
 
         updated_history = result.get("messages", history)
         next_source, next_message, next_session_key = source, pending, session_key
@@ -3865,6 +4066,8 @@ class GatewayTurnMixin:
                     "Discarding stale goal continuation for session %s — goal is no longer active",
                     session_key or "?",
                 )
+                for receipt in pending_receipts:
+                    receipt.terminal("cancelled")
                 return result
             # Resolve the follow-up's session key BEFORE preparing the inbound text: native image
             # paths are buffered under the key given and consumed under next_session_key.
@@ -3879,6 +4082,8 @@ class GatewayTurnMixin:
                 event=pending_event, source=next_source, history=updated_history, session_key=next_session_key,
             )
             if next_message is None:
+                for receipt in pending_receipts:
+                    receipt.terminal("failure")
                 return result
             from gateway.run_inbound import strip_discord_triggering_note
             next_persist_message = strip_discord_triggering_note(pending_event, next_message)
@@ -3931,8 +4136,17 @@ class GatewayTurnMixin:
         await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")
         # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker
         # (the helper's own ``except Exception`` does not catch cancellation).
+        followup_result = None
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
+            # Advancing relinquishes the outer send to the follow-up. Only now is this
+            # turn's own in-band delivery final; all early returns keep its receipt open.
+            receipt_owner = getattr(turn_ctx, "_queued_receipt_owner", None)
+            terminalize_event_receipts(
+                receipt_owner,
+                "cancelled" if result.get("interrupted") else
+                ("success" if delivery_succeeded else "failure"),
+            )
 
             followup_result = await self._run_agent(
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
@@ -3945,17 +4159,26 @@ class GatewayTurnMixin:
                 reply_expected=next_reply_expected,
                 persist_user_display_metadata={
                     **reply_expected_metadata(next_reply_expected), **diagnostic_metadata(pending_event)} or None,
+                receipt_owner=pending_event if pending_receipts else None,
             )
+            await _run_followup_processing_hook(
+                _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
         except asyncio.CancelledError:
+            terminalize_event_receipts(pending_event, "cancelled")
+            if isinstance(followup_result, dict):
+                terminalize_event_receipts(
+                    followup_result.get("_queued_terminal_receipt_owner"), "cancelled")
             await _run_followup_processing_hook(
                 _hook_adapter, pending_event, "on_processing_complete", _followup_cancel_outcome(_hook_adapter))
             raise
         except BaseException:
+            terminalize_event_receipts(pending_event, "failure")
+            if isinstance(followup_result, dict):
+                terminalize_event_receipts(
+                    followup_result.get("_queued_terminal_receipt_owner"), "failure")
             await _run_followup_processing_hook(
                 _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.FAILURE)
             raise
-        await _run_followup_processing_hook(
-            _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
         merged = _preserve_queued_followup_history_offset(result, followup_result)
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal
@@ -4273,16 +4496,18 @@ class GatewayTurnMixin:
         reply_expected: Optional[bool] = None,
         scheduled_heartbeat: bool = False,
         title_user_message: Optional[str] = None,
+        receipt_owner: Any = None,
     ) -> dict[str, Any]:
         """Run the agent; returns the full run_conversation result dict.
 
         Keys: "final_response", "messages", "api_calls", "completed"."""
         if self._get_proxy_url():
-            return await self._run_agent_via_proxy(
+            response = await self._run_agent_via_proxy(
                 message=message, context_prompt=context_prompt, history=history, source=source,
                 session_id=session_id, session_key=session_key, run_generation=run_generation,
                 event_message_id=event_message_id, scheduled_heartbeat=scheduled_heartbeat,
             )
+            return response
 
         from run_agent import AIAgent
 
@@ -4313,6 +4538,7 @@ class GatewayTurnMixin:
             persist_user_display_metadata=persist_user_display_metadata, scheduled_heartbeat=scheduled_heartbeat,
             voice_turn=str(getattr(message_type, "value", message_type) or "").lower() == "voice",
         )
+        turn_ctx._queued_receipt_owner = receipt_owner
         _status_thread_metadata = self._run_agent_bind_turn_wiring(
             turn_ctx, turn_runner, source, event_message_id, disp._native_slack_task_cards,
         )
@@ -4353,9 +4579,16 @@ class GatewayTurnMixin:
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
             if pending_event or pending:
-                return await self._run_agent_queued_followup(
-                    turn_ctx, adapter, pending, pending_event, response, result, stream_task,
-                )
+                try:
+                    return await self._run_agent_queued_followup(
+                        turn_ctx, adapter, pending, pending_event, response, result, stream_task,
+                    )
+                except BaseException as exc:
+                    from gateway.platforms.event import terminalize_event_receipts
+
+                    terminalize_event_receipts(
+                        pending_event, "cancelled" if isinstance(exc, asyncio.CancelledError) else "failure")
+                    raise
         finally:
             await self._run_agent_cleanup_turn_tasks(
                 turn_ctx, progress_task=progress_task, log_task=log_task, interrupt_monitor=interrupt_monitor,

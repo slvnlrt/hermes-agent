@@ -101,7 +101,15 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             if _action == "rewrite":
                 _new_text = _result.get("text")
                 if isinstance(_new_text, str):
-                    event = dataclasses.replace(event, text=_new_text)
+                    rewritten = dataclasses.replace(event, text=_new_text)
+                    from gateway.platforms.event import event_receipts
+                    if event_receipts(event):
+                        # replace() deliberately omits process-local state. Keep the adapter's
+                        # opening event connected to the rewritten turn's eventual delivery.
+                        rewritten._injection_receipts = event_receipts(event)
+                        rewritten._injection_lifecycle_managed = True
+                        event._injection_processing_event = rewritten
+                    event = rewritten
                 break
             if _action == "allow":
                 break
@@ -1807,6 +1815,7 @@ class GatewayInboundMixin(GatewayPluginInjectionMixin):
             for attr in ("_gateway_active_turn_session_key", "_gateway_active_turn_token"):
                 with suppress(AttributeError):
                     delattr(event, attr)
+
 
     def _decide_image_input_mode(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,

@@ -452,6 +452,34 @@ def test_window_owned_request_refuses_at_once_when_no_window_shows_the_session(s
     assert server_requests.open_requests("s-none") == []
 
 
+def test_native_approval_accepts_attached_nonowner_decline_but_not_consent(server):
+    from tui_gateway import server_requests
+
+    sid = "native-declines"
+    owner, bystander = _two_window_session(server, sid)
+    owner.auth_identity = {"provider": "oidc", "user_id": "alice"}
+    bystander.auth_identity = {"provider": "oidc", "user_id": "bob"}
+    server._sessions[sid]["auth_user_id"] = "oidc:alice"
+    settled = []
+    settle = server_requests.send_async(
+        "approval", sid, {"session_owner_required": True}, settled.append)
+    req = _wait_open(server_requests)
+    try:
+        server.dispatch(
+            {"jsonrpc": "2.0", "id": req.id, "result": {"choice": "once"}}, bystander)
+        assert settled == []
+        server.dispatch(_not_shown(req), owner)
+        assert settled == []
+        server.dispatch(_not_shown(req), bystander)
+        assert len(settled) == 1
+        assert json.loads(settled[0]["value"]) == {
+            "success": False, "error": server_requests.NOT_SHOWN_MESSAGE}
+        assert server_requests.open_requests(sid) == []
+    finally:
+        settle("session_closed")
+        owner._loop.call_soon_threadsafe(owner._loop.stop)
+
+
 def test_window_owned_request_decline_does_not_beat_the_owner_window(server):
     """#113348 stays fixed: one bystander window declining leaves the request open for the window that
     shows the session, and its answer is the result."""
@@ -627,7 +655,12 @@ def test_approval_received_acknowledges_exact_request(server, monkeypatch):
 def test_approval_response_correlates_request_id(server, monkeypatch):
     from tools import approval
 
-    server._sessions["ui-1"] = {"session_key": "agent-1", "history": []}
+    from tui_gateway.transport import FanoutTransport
+    owner = types.SimpleNamespace(auth_identity={"provider": "oidc", "user_id": "alice"})
+    stranger = types.SimpleNamespace(auth_identity={"provider": "oidc", "user_id": "bob"})
+    server._sessions["ui-1"] = {
+        "session_key": "agent-1", "history": [],
+        "transport": FanoutTransport(owner, stranger), "auth_user_id": "oidc:alice"}
     calls = []
     monkeypatch.setattr(
         approval,
@@ -635,16 +668,19 @@ def test_approval_response_correlates_request_id(server, monkeypatch):
         lambda key, choice, **kwargs: calls.append((key, choice, kwargs)) or 1,
     )
 
-    response = server.handle_request(
-        {
-            "id": "r3",
-            "method": "approval.respond",
-            "params": {"session_id": "ui-1", "request_id": "req-1", "choice": "once"},
-        }
-    )
+    request = {
+        "id": "r3",
+        "method": "approval.respond",
+        "params": {"session_id": "ui-1", "request_id": "req-1", "choice": "once"},
+    }
+    refused = server.dispatch(request, transport=stranger)
+    assert refused["error"]["code"] == 4001
+    assert calls == []
 
+    response = server.dispatch(request, transport=owner)
     assert response["result"] == {"resolved": 1}
-    assert calls == [("agent-1", "once", {"resolve_all": False, "request_id": "req-1"})]
+    assert calls == [("agent-1", "once", {
+        "resolve_all": False, "request_id": "req-1", "session_owner": True})]
 
 
 def test_approval_respond_falls_back_to_request_id_lookup(server, monkeypatch):
@@ -652,7 +688,10 @@ def test_approval_respond_falls_back_to_request_id_lookup(server, monkeypatch):
     resolves to a live session (durable-identity fallback, #91684)."""
     from tools import approval
 
-    live = {"session_key": "agent-live", "history": []}
+    owner = types.SimpleNamespace(auth_identity={"provider": "oidc", "user_id": "alice"})
+    live = {
+        "session_key": "agent-live", "history": [], "transport": owner,
+        "auth_user_id": "oidc:alice"}
     server._sessions["ui-live"] = live
     calls = []
     monkeypatch.setattr(
@@ -666,7 +705,7 @@ def test_approval_respond_falls_back_to_request_id_lookup(server, monkeypatch):
         lambda key, choice, **kwargs: calls.append((key, choice, kwargs)) or 1,
     )
 
-    response = server.handle_request(
+    response = server.dispatch(
         {
             "id": "r-fallback",
             "method": "approval.respond",
@@ -675,12 +714,14 @@ def test_approval_respond_falls_back_to_request_id_lookup(server, monkeypatch):
                 "request_id": "req-91684",
                 "choice": "once",
             },
-        }
+        },
+        transport=owner,
     )
 
     assert response["result"] == {"resolved": 1}
     assert calls == [
-        ("agent-live", "once", {"resolve_all": False, "request_id": "req-91684"})
+        ("agent-live", "once", {
+            "resolve_all": False, "request_id": "req-91684", "session_owner": True})
     ]
 
 
@@ -688,7 +729,10 @@ def test_approval_respond_falls_back_to_stored_session_id(server, monkeypatch):
     """session_id holding a STORED id maps to the live runtime record."""
     from tools import approval
 
-    live = {"session_key": "stored-91684", "history": []}
+    owner = types.SimpleNamespace(auth_identity={"provider": "oidc", "user_id": "alice"})
+    live = {
+        "session_key": "stored-91684", "history": [], "transport": owner,
+        "auth_user_id": "oidc:alice"}
     server._sessions["ui-stored"] = live
     calls = []
     monkeypatch.setattr(approval, "list_gateway_approvals", lambda key: [])
@@ -698,17 +742,19 @@ def test_approval_respond_falls_back_to_stored_session_id(server, monkeypatch):
         lambda key, choice, **kwargs: calls.append((key, choice, kwargs)) or 1,
     )
 
-    response = server.handle_request(
+    response = server.dispatch(
         {
             "id": "r-stored",
             "method": "approval.respond",
             "params": {"session_id": "stored-91684", "choice": "deny"},
-        }
+        },
+        transport=owner,
     )
 
     assert response["result"] == {"resolved": 1}
     assert calls == [
-        ("stored-91684", "deny", {"resolve_all": False, "request_id": None})
+        ("stored-91684", "deny", {
+            "resolve_all": False, "request_id": None, "session_owner": True})
     ]
 
 

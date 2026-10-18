@@ -103,7 +103,7 @@ Every `ctx.*` API below is available inside a plugin's `register(ctx)` function.
 | Add slash commands | `ctx.register_command(name, handler, description)` — adds `/name` in CLI and gateway sessions |
 | Dispatch tools from commands | `ctx.dispatch_tool(name, args)` — invokes a registered tool with parent-agent context auto-wired |
 | Add CLI commands | `ctx.register_cli_command(name, help, setup_fn, handler_fn)` — adds `hermes <plugin> <subcommand>` |
-| Inject messages | `ctx.inject_message(content, role="user", session_key=... \| origin=...)` - see [Injecting Messages](#injecting-messages) |
+| Inject messages | `ctx.inject_message(content, role="user", session_key=... \| origin=..., request_id=..., expires_at=..., on_complete=...)` - see [Injecting Messages](#injecting-messages) |
 | Ship data files | `Path(__file__).parent / "data" / "file.yaml"` |
 | Bundle skills | `ctx.register_skill(name, path)` — namespaced as `plugin:skill`, loaded via `skill_view("plugin:skill")` |
 | Gate on env vars | `requires_env: [API_KEY]` in plugin.yaml — prompted during `hermes plugins install` |
@@ -926,7 +926,7 @@ ctx.inject_message(
 )
 ```
 
-**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None, origin: Mapping[str, Any] | None = None) -> bool`
+**Signature:** `ctx.inject_message(content: str, role: str = "user", *, session_key: str | None = None, origin: Mapping[str, Any] | None = None, request_id: str | None = None, expires_at: float | None = None, on_complete: Callable[[str], None] | None = None) -> bool`
 
 In CLI mode:
 
@@ -937,7 +937,7 @@ In CLI mode:
 
 In gateway mode:
 
-- `session_key` is required and must identify an existing gateway session. It is the stable routing key, not the CLI session ID.
+- Pass either `session_key` identifying an existing gateway session, or `origin` as described below. The session key is the stable routing key, not the CLI session ID.
 - Hermes reuses that session's stored platform, chat, thread, profile, and conversation history. Plugins cannot change that route through `session_key`.
 - Hermes rechecks the stored route against the gateway's current authorisation rules before dispatch.
 - Routes that relied only on an adapter-time or upstream authorisation decision are rejected unless Hermes can revalidate them from current core allowlists, pairing, or explicit allow-all configuration.
@@ -945,7 +945,7 @@ In gateway mode:
 - The route and conversation are pinned while dispatch is pending. Hermes drops the request if topic recovery changes the route or the session rotates before handling starts.
 - The request enters the platform adapter's normal message path. Active sessions use the existing busy-session queue rather than starting a competing turn.
 - Returns `True` when the live gateway accepts the request for asynchronous dispatch. This does not confirm that the agent turn or platform delivery has completed.
-- Returns `False` when neither `session_key` nor `origin` is given (or both are), the permission is not granted, or no live host can accept the request. Unknown or unroutable session keys discovered after asynchronous acceptance are written to the gateway log.
+- Returns `False` when neither `session_key` nor `origin` is given (or both are), the permission is not granted, no live host can accept the request, or `expires_at` has already passed. Unknown or unroutable session keys discovered after asynchronous acceptance are written to the gateway log. On synchronous refusal, `on_complete` is never called; the caller owns fallback notification.
 
 Starting a session with `origin` (gateway mode only):
 
@@ -956,6 +956,34 @@ Starting a session with `origin` (gateway mode only):
 - The same text rules apply: no slash commands, approvals, or prompt resolution. The permission below is read from the plugin's own profile `config.yaml`.
 
 Ink TUI (`hermes --tui`) and the desktop / dashboard chat are a third host. They do not set the classic CLI reference and they do not register on the messaging-gateway injector — those two hosts stay separate so a live gateway cannot clobber the TUI (or the reverse). Pass the session's durable `session_key` (the `ses_…` id), not the ephemeral UI session id. Hermes queues the text on that session's prompt queue: a busy session keeps the message for the next turn, an idle session starts one. A key that is not a live TUI session is left for the messaging gateway when one is running, and is never rerouted to a different chat.
+
+### Receipt Lifecycle (optional)
+
+Plugins that need to track injection outcomes can pass receipt lifecycle parameters:
+
+- **`request_id`** — opaque identifier forwarded to the gateway scheduler and event metadata (1–128 letters, digits, `.`, `_`, `:` or `-`).
+- **`expires_at`** — Unix epoch deadline. Injections are rejected immediately if already expired, and again at dispatch time and when dequeued for processing. Outcome: `"expired"`.
+- **`on_complete`** — synchronous, process-local callback invoked **at most once** after terminal resolution. Callbacks, locks and deadlines are never serialized; a process crash may prevent acknowledgement:
+  - `"success"` — the agent processed the injection and delivered a response (or intentionally stayed silent).
+  - `"failure"` — the handler failed or platform delivery raised, refused or declined an obligation.
+  - `"cancelled"` — the gateway shut down or the processing task was cancelled.
+  - `"expired"` — the injection's `expires_at` deadline passed before processing started.
+  - `"not_routed"` — the session was not found, authorization was denied, or no adapter was available.
+
+Lifecycle parameters are supported by the messaging gateway, including `origin` injections, not by CLI or TUI queues. Once processing has started, the deadline does not cancel the active turn. Terminal success waits for final text and requested attachments; follow-up turns own their own receipts.
+
+`on_complete` fires only for accepted injections. When `inject_message()` returns `False`, the caller handles the rejection directly.
+
+```python
+# Example: track injection outcome
+ctx.inject_message(
+    "Machine event for processing",
+    session_key="agent:main:telegram:dm:123456789",
+    request_id="evt-abc123",
+    expires_at=time.time() + 120,
+    on_complete=lambda outcome: store.finish("evt-abc123", outcome),
+)
+```
 
 This enables plugins like remote control viewers, messaging bridges, or webhook receivers to feed messages into the conversation from external sources.
 

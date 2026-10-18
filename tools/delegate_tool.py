@@ -29,11 +29,12 @@ from tools.delegate_tool_child_run import (
     _lease_child_credential, _merge_late_steer, _register_child, _start_heartbeat, _validate_child_output_schema,
 )
 from tools.delegate_tool_config import (
-    _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
-    _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
-    _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
-    _resolve_child_runtime, _resolve_delegation_credentials,
-    _subagent_auto_approve, _subagent_auto_deny,
+    _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children,
+    _get_max_concurrent_children, _get_max_spawn_depth, _get_oneshot_max_children,
+    _get_orchestrator_enabled, _get_subagent_approval_callback,
+    _get_worktree_isolation, _inherit_parent_capabilities, _load_config, _merge_request_overrides,
+    _resolve_child_credential_pool, _resolve_child_runtime, _resolve_delegation_credentials,
+    _resolve_task_credentials, _subagent_auto_approve, _subagent_auto_deny, _task_route_pins,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
 from tools.delegate_tool_progress import (
@@ -214,6 +215,8 @@ def _build_child_agent(
     # callers such as /review pass auxiliary.review here so fallback policy is
     # not accidentally read from the general delegation block.
     routing_cfg: Optional[dict[str, Any]] = None,
+    # Raw per-task routing intent, distinct from a batch credential bundle.
+    task_pinned: bool = False,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
 ):
@@ -259,14 +262,16 @@ def _build_child_agent(
         override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
         override_acp_command=override_acp_command,
         override_acp_args=override_acp_args,
-        routing_cfg=routing_cfg,
+        routing_cfg=routing_cfg, task_pinned=task_pinned,
     )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
         # _resolve_delegation_credentials already merged OVER the parent's
         request_overrides = dict(override_request_overrides)
     else:
-        request_overrides = {} if override_provider else dict(getattr(parent_agent, "request_overrides", {}) or {})
+        request_overrides = (
+            {} if override_provider or override_base_url else dict(getattr(parent_agent, "request_overrides", {}) or {})
+        )
     parent_sid = getattr(parent_agent, "session_id", None)
     child_session_db = _open_child_session_db(parent_agent)
     with delegated_child_context():
@@ -400,7 +405,9 @@ def _run_single_child(
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
 
 
-def _credential_overrides(creds: dict[str, Any], routing_cfg: dict[str, Any]) -> dict[str, Any]:
+def _credential_overrides(
+    creds: dict[str, Any], routing_cfg: dict[str, Any], *, task_pinned: bool = False,
+) -> dict[str, Any]:
     """``_build_child_agent`` override kwargs for a resolved credential bundle (delegate_task and the lifecycle API)."""
     return {
         "override_provider": creds["provider"], "override_base_url": creds["base_url"],
@@ -409,34 +416,77 @@ def _credential_overrides(creds: dict[str, Any], routing_cfg: dict[str, Any]) ->
         "override_acp_command": creds.get("command"),
         "override_acp_args": creds.get("args"),
         "routing_cfg": routing_cfg,
+        "task_pinned": task_pinned,
     }
 
 
+def _resolve_all_task_routes(
+    task_list: List[Dict[str, Any]], creds: Dict[str, Any], routing_cfg: Dict[str, Any], parent_agent,
+) -> tuple[Optional[List[tuple]], Optional[str]]:
+    """Resolve and validate every task's route BEFORE any child construction.
+
+    Returns ``(routes, None)`` where routes is a list of ``(creds_i, routing_i)`` per task,
+    or ``(None, error)`` with a task-indexed error message.  Non-string pin values, unknown
+    providers, and credential failures all surface here — no child is ever built.
+    """
+    routes = []
+    for i, t in enumerate(task_list):
+        try:
+            creds_i, routing_i = _resolve_task_credentials(t, creds, routing_cfg, parent_agent)
+        except ValueError as exc:
+            return None, f"Task {i}: {exc}"
+        routes.append((creds_i, routing_i))
+    return routes, None
+
+
 def _build_children(
-    task_list: list[dict[str, Any]], task_schemas: list[Optional[dict[str, Any]]], creds: dict[str, Any], *,
-    top_role: str, max_iterations: int, parent_agent, routing_cfg: dict[str, Any],
-    live_deleg_id: Optional[str], live_writers: list, task_images: Optional[list[Optional[list[str]]]] = None,
-) -> tuple[list[tuple], Optional[str]]:
-    """Build every child on the main thread (construction is not thread-safe);
-    ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
+    task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]],
+    task_routes: List[tuple], *,
+    top_role: str, max_iterations: int, parent_agent,
+    live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
+) -> tuple[List[tuple], Optional[str]]:
+    """Build every child on the main thread (construction is not thread-safe).
+
+    ``task_routes`` must be pre-resolved by ``_resolve_all_task_routes`` — this function
+    never calls the resolver.  On construction failure at task N, all previously-built
+    children are closed and detached before returning the error.
+    """
     from tools.delegation_live_log import wrap_progress_callback
     from tools.delegation_output_schema import append_output_contract
-    overrides = _credential_overrides(creds, routing_cfg)
     children = []
     for i, t in enumerate(task_list):
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
+        creds_i, routing_i = task_routes[i]
+        pin_provider, pin_model = _task_route_pins(t)
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
-                model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
+                model=creds_i["model"], max_iterations=max_iterations, task_count=len(task_list),
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
+                **_credential_overrides(
+                    creds_i, routing_i, task_pinned=bool(pin_provider or pin_model),
+                ),
             )
         except ValueError as exc:
-            return [], str(exc)
+            # Expected construction failure (config/credential issue) → cleanup + tool_error.
+            from tools.delegate_tool_child_run import _close_child, _detach_child
+            for _j, _t, _c in children:
+                with _quiet("cleanup child %d after construction failure at %d", _j, i):
+                    _detach_child(parent_agent, _c)
+                    _close_child(_c, f"close child {_j} after construction failure at task {i}")
+            return [], f"Task {i}: {exc}"
+        except BaseException:
+            # Unexpected failure (OOM, test doubles, runtime errors) — still cleanup, then propagate.
+            from tools.delegate_tool_child_run import _close_child, _detach_child
+            for _j, _t, _c in children:
+                with _quiet("cleanup child %d after construction failure at %d", _j, i):
+                    _detach_child(parent_agent, _c)
+                    _close_child(_c, f"close child {_j} after construction failure at task {i}")
+            raise
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
                 child._delegate_output_schema = _task_schema
@@ -553,6 +603,13 @@ def delegate_task(
         return tool_error(err)
 
     overall_start = time.monotonic()
+
+    # Resolve all per-task routes BEFORE any child construction (Finding 2: a late-invalid pin
+    # must not leak already-constructed children).
+    task_routes, err = _resolve_all_task_routes(task_list, creds, routing_cfg, parent_agent)
+    if err:
+        return tool_error(err)
+
     # Live transcripts: cache/delegation/live/<id>/task-<n>.log per task, a side channel with zero effect on message
     # content or prompt caching. Best-effort: on failure live_paths is empty and delegation proceeds.
     #
@@ -569,15 +626,15 @@ def delegate_task(
 
     from tools.delegation_live_log import create_live_transcripts
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider"),
-        home=_live_home,
+        task_list, context, task_routes=task_routes, home=_live_home,
     )
     _announce_batch(parent_agent, len(task_list), live_deleg_id)
     origin = _capture_origin()
 
     children, err = _build_children(
-        task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
-        routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        task_list, task_schemas, task_routes, top_role=top_role, max_iterations=default_max_iter,
+        parent_agent=parent_agent,
+        live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
     )
     if err:
         return tool_error(err)
@@ -647,7 +704,8 @@ _DESCRIPTION_HEAD = (
     "the parent applies the transition.\n"
 )
 _DESCRIPTION_TAIL = (
-    "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml."
+    "- Children inherit the parent model unless a task sets provider/model, or via "
+    "delegation.provider / delegation.model in config.yaml."
 )
 
 def _build_tasks_param_description() -> str:
@@ -741,6 +799,16 @@ DELEGATE_TASK_SCHEMA = {
                             "is enabled; otherwise the whole call returns as one message). Tasks sharing a group return "
                             "together in ONE message; ungrouped tasks return individually as each finishes. This does not "
                             "order execution; if B needs A's output, dispatch B after A returns.",
+                        ),
+                        "provider": _p(
+                            "string",
+                            "Optional provider pin for THIS child only (named provider or a custom providers: table "
+                            "entry). Resolved like CLI/config. Unknown providers fail the spawn; omit or leave blank "
+                            "to inherit the batch/parent route.",
+                        ),
+                        "model": _p(
+                            "string",
+                            "Optional model pin for THIS child only. Omit or leave blank to inherit the batch/parent model.",
                         ),
                     },
                     "required": ["goal"],

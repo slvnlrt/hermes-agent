@@ -1687,10 +1687,14 @@ class TurnRunner:
         approval blocks the agent thread (mirrors CLI input()); the callback bridges sync→async."""
         from gateway.run import _wrap_current_message_with_observed_context
         from tools.approval import register_gateway_notify, unregister_gateway_notify
-        from tools.approval_context import reset_current_session_key, set_current_session_key
+        from tools.approval_context import reset_current_requester_id, reset_current_session_key, set_current_requester_id, set_current_session_key
         ctx = self._ctx
         session_key = ctx.session_key or ""
         token = set_current_session_key(session_key)
+        # Only the adapter's authenticated primary actor can authorize callbacks.
+        # user_id_alt is a session/memory routing fallback, not approval authority.
+        requester_id = ctx.source.user_id or ""
+        requester_token = set_current_requester_id(requester_id)
         register_gateway_notify(session_key, self._approval_notify_sync)
         try:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
@@ -1729,6 +1733,7 @@ class TurnRunner:
             with suppress(Exception):
                 from tools.clarify_gateway import clear_session
                 clear_session(session_key)
+            reset_current_requester_id(requester_token)
             reset_current_session_key(token)
 
     def _finish_stream_consumer(self, result, agent_history, stream_consumer):

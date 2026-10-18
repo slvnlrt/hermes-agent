@@ -2,10 +2,10 @@
 
 Previously async_delivery_supported()=False forced SYNCHRONOUS execution for
 every background dispatch on the API server, blocking the whole turn. Now
-that background completions can wake the originating session via the
-/v1/chat/completions self-post (gateway/wake.py), a session-continuable
-turn (raw session id bound as the api_server chat_id) dispatches async; only
-session-id-less one-shot requests keep the sync fallback.
+that background completions can persist into server-owned session history, a
+session-continuable turn (raw session id bound as the api_server chat_id)
+dispatches async; only session-id-less one-shot requests keep the sync fallback.
+The client owns the next turn; completion does not authorize a model wake.
 
 The wake target must be captured from the request-scoped chat_id binding,
 NOT from HERMES_SESSION_ID: constructing a child agent calls
@@ -80,6 +80,7 @@ def _patch_delegate(monkeypatch):
     fake_child = MagicMock()
     fake_child._delegate_role = "leaf"
     fake_child._subagent_id = "s1"
+    fake_child.model = "m"
 
     def fast_child(task_index, goal, child=None, parent_agent=None, **kw):
         return {
@@ -109,9 +110,8 @@ def _patch_delegate(monkeypatch):
 
 
 def test_apiserver_session_with_id_dispatches_background(monkeypatch):
-    """async_delivery=False + a raw session id (HERMES_SESSION_ID) →
-    background dispatch (the completion wakes the session via the
-    api_server self-post), NOT the forced-sync fallback."""
+    """A raw session id plus server-history delivery allows background dispatch
+    without authorizing a model wake or forcing a synchronous join."""
     dt = _patch_delegate(monkeypatch)
     monkeypatch.setenv("HERMES_SESSION_ID", "raw-sid-7")
     set_session_vars(
@@ -134,12 +134,37 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
     evt = _drain_one()
     assert evt is not None
     assert evt["type"] == "async_delegation"
-    # The raw session id is stamped so the gateway drain can self-post the
-    # wake to the REAL session (session_key alone is the raw id here, which
-    # carries no parseable routing metadata). Crucially this is the SPAWNER's
-    # id, not the subagent-internal id the child build clobbered
-    # HERMES_SESSION_ID with (see clobbering_build_child).
+    # The raw id targets the SPAWNER's durable history, not the subagent-internal
+    # id that child construction wrote into HERMES_SESSION_ID.
     assert evt["origin_session_id"] == "raw-sid-7"
+
+
+def test_mixed_model_background_completion_has_no_false_global_attribution(monkeypatch):
+    dt = _patch_delegate(monkeypatch)
+    set_session_vars(
+        platform="api_server", chat_id="mixed-session", session_key="mixed-session",
+        session_id="mixed-session", session_history_delivery="1", async_delivery=False,
+    )
+
+    def build_child(**kwargs):
+        return MagicMock(model=kwargs["model"], _delegate_role="leaf",
+                         _subagent_id=f"child-{kwargs['task_index']}")
+
+    def run_child(task_index, goal, child=None, **kwargs):
+        return {"task_index": task_index, "status": "completed", "summary": goal,
+                "api_calls": 1, "model": child.model, "exit_reason": "completed"}
+
+    monkeypatch.setattr(dt, "_build_child_agent", build_child)
+    monkeypatch.setattr(dt, "_run_single_child", run_child)
+    result = json.loads(dt.delegate_task(
+        tasks=[{"goal": "Summarize the first input", "model": "model-a"},
+               {"goal": "Summarize the second input", "model": "model-b"}],
+        background=True, parent_agent=_fake_parent(),
+    ))
+    assert result.get("status") == "dispatched", result
+    event = _drain_one()
+    assert event["model"] is None
+    assert {item["model"] for item in event["results"]} == {"model-a", "model-b"}
 
 
 # ---------------------------------------------------------------------------

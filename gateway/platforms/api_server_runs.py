@@ -790,7 +790,10 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     # held by a live transport are never reaped, so with the desktop app open for days those fleets
     # accumulate until the OS refuses new process spawns.
     from tools.approval import register_gateway_notify, unregister_gateway_notify
-    from tools.approval_context import reset_current_session_key, set_current_session_key
+    from tools.approval_context import (
+        reset_current_requester_id, reset_current_session_key,
+        set_current_requester_id, set_current_session_key,
+    )
     session_id = run.session_id
     effective_task_id = session_id or run.run_id
     # (token, reset) pairs unwound in the finally block; bound only once each step succeeds.
@@ -799,6 +802,10 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
         try:
             # Contextvars, not process env: concurrent runs must not share identity.
             resets.append((set_current_session_key(run.approval_session_key), reset_current_session_key))
+            # The run's opaque auth/profile scope was established at admission, not supplied
+            # in the prompt or turn_author. The response endpoint proves that same scope.
+            resets.append((set_current_requester_id(self._run_owners.get(run.run_id, "")),
+                           reset_current_requester_id))
             # chat_id carries the raw session id like _run_agent() does; without it
             # tools.async_delegation sees no HERMES_SESSION_CHAT_ID and forces delegations sync.
             session_tokens = self._bind_api_server_session(
@@ -1202,7 +1209,8 @@ async def _handle_run_approval(self, request: web.Request, *, _api_server) -> we
     try:
         from tools.approval import resolve_gateway_approval
         resolved = resolve_gateway_approval(
-            approval_session_key, choice, resolve_all=resolve_all, request_id=request_id or None)
+            approval_session_key, choice, resolve_all=resolve_all, request_id=request_id or None,
+            clicker_id=self._run_idempotency_scope(request))
     except Exception as exc:
         logger.exception("[api_server] approval resolution failed for run %s", run_id)
         return _json_error(_openai_error, str(exc), status=500)

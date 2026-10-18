@@ -4728,7 +4728,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             return
         session_key = await self._claim_callback_state(
             query, cb, self._approval_state, approval_id, _unauthorized(),
-            _toast("platform.telegram.approval.toast_already_resolved"))
+            _toast("platform.telegram.approval.toast_already_resolved"), pop=False)
         if not session_key:
             return
         user_display = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
@@ -4738,8 +4738,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
             # Rendering happens after so the message reflects what actually occurred: a tap that lands after
             # the approval wait timed out (count == 0) must NOT claim "Approved" — the command was already
             # denied and will not run (#63501 regression follow-up: 60s waits made stale taps common).
-            from tools.approval import resolve_gateway_approval
-            count = resolve_gateway_approval(session_key, choice)
+            from tools.approval import resolve_gateway_approval, REQUESTER_MISMATCH
+            clicker_id = str(query.from_user.id) if query.from_user else None
+            count = resolve_gateway_approval(session_key, choice, clicker_id=clicker_id)
+            if count == REQUESTER_MISMATCH:
+                await query.answer(text="Only the user who triggered this command can approve/deny it.")
+                return
+            self._approval_state.pop(approval_id, None)
             logger.info(
                 "Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)", count, session_key, choice, user_display)
         except Exception as exc:

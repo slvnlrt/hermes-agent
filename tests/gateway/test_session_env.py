@@ -316,3 +316,41 @@ async def test_plugin_slash_command_sees_session_env(monkeypatch):
     # Bound only for the handler call, not leaked past dispatch
     assert get_session_env("HERMES_SESSION_KEY") == ""
 
+
+# ---------------------------------------------------------------------------
+# get_verified_principal accessor
+# ---------------------------------------------------------------------------
+
+
+def test_get_verified_principal_returns_user_id(monkeypatch):
+    """get_verified_principal reads HERMES_SESSION_USER_ID from the contextvar."""
+    from gateway.session_context import get_verified_principal
+    tokens = set_session_vars(user_id="U12345")
+    try:
+        assert get_verified_principal() == "U12345"
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_get_verified_principal_returns_default_when_unset(monkeypatch):
+    """When neither context nor environment binds an id, return the default."""
+    from gateway.session_context import get_verified_principal
+    monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
+    reset_session_vars()
+    assert get_verified_principal() == ""
+    assert get_verified_principal("fallback") == "fallback"
+
+
+def test_get_verified_principal_rebinds_current_speaker_and_masks_stale_env(monkeypatch):
+    from gateway.session_context import get_verified_principal
+    monkeypatch.setenv("HERMES_SESSION_USER_ID", "stale-env-user")
+    tokens = set_session_vars(user_id="alice", user_name="bob")
+    try:
+        assert get_verified_principal() == "alice"
+        set_session_vars(user_id="bob", user_name="alice")
+        assert get_verified_principal() == "bob"
+        set_session_vars(user_id_alt="routing-only-id", user_name="alice")
+        assert get_verified_principal("fallback") == ""
+    finally:
+        clear_session_vars(tokens)
+    assert get_verified_principal("fallback") == ""

@@ -173,6 +173,8 @@ Four tools are intercepted before registry dispatch because they need agent-leve
 
 These tools' schemas are still registered in the registry (for `get_tool_definitions`), but their handlers return a stub error if dispatch somehow reaches them directly.
 
+Delegation resolves every `tasks[].provider` / `tasks[].model` route before constructing any child. Provider pins use a complete runtime-resolved credential bundle; model-only pins retain the selected account and endpoint while updating model-dependent wire policy. Direct endpoint overrides require their own credential rather than inheriting a parent key. `SubagentLifecycleService` uses the same `_credential_overrides` constructor contract and model-pin policy, while retaining its request-provider precedence and serialized lifecycle handles. Live manifests combine per-task route attribution with the parent's explicit profile home; they never persist credential bundles.
+
 ### Async bridging
 
 When a tool handler is async, `_run_async()` bridges it to the sync dispatch path:
@@ -201,9 +203,31 @@ The terminal tool integrates a dangerous-command approval system defined in `too
    - **Gateway mode** — an async approval callback sends the request to the messaging platform
    - **Smart approval** — optionally, an auxiliary LLM can auto-approve low-risk commands that match patterns (e.g., `rm -rf node_modules/` is safe but matches "recursive delete")
 
-4. **Session state** — approvals are tracked per-session. Once you approve "recursive delete" for a session, subsequent `rm -rf` commands don't re-prompt.
+4. **Session state** — approvals are tracked per-session and per verified requester. A grant for one
+   participant in a shared gateway conversation never authorizes another participant.
 
-5. **Permanent allowlist** — the "allow permanently" option writes the pattern to `config.yaml`'s `command_allowlist`, persisting across sessions.
+5. **Permanent allowlist** — local operator entries live in `config.yaml`'s
+   `command_allowlist`. Gateway **Always** choices instead persist under
+   `approvals.requester_allowlist` using an exact `platform:principal` key (for example,
+   `telegram:123456`). Existing global `command_allowlist` entries are intentionally not applied
+   to authenticated gateway requesters.
+
+   Messaging callbacks and `/approve` or `/deny` use the adapter-authenticated primary
+   user ID, never a display name or alternate session-routing ID. A mismatched actor
+   leaves the prompt pending for its requester.
+
+   Native TUI/Desktop prompts instead require the server-admitted transport that owns
+   the live session; they do not require a Telegram or other messaging identity.
+   Authenticated remote native owners can approve one operation, but cannot inherit
+   local allowlists or create reusable session/permanent grants. Strict `require_human`
+   prompts and smart-denial overrides also remain one-operation decisions.
+
+   API run and streaming-completion approvals use the opaque auth/profile scope
+   established by API admission. The response endpoint authenticates and proves run
+   ownership before submitting that scope; prompt fields and `turn_author` grant no authority.
+   Native continuations recover authority from a live attached owner, not from the
+   fanout transport itself. Attached non-owner windows may report that a prompt was
+   not displayed, but cannot consent to its execution.
 
 ## Terminal/runtime environments
 
