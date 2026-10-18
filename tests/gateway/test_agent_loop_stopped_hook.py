@@ -12,7 +12,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.event import InjectionReceipt, MessageEvent
 from gateway.session import SessionSource, build_session_key
+from gateway.session_state import SessionState
 
 
 def _make_source() -> SessionSource:
@@ -38,6 +40,7 @@ def _make_runner():
     # await on a non-awaitable.
     adapter = SimpleNamespace(send=AsyncMock())
     runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._profile_adapters = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
     runner._running_agents = {}
     runner._pending_messages = {}
@@ -47,6 +50,24 @@ def _make_runner():
     runner._invalidate_session_run_generation = lambda *a, **kw: None
     runner._release_running_agent_state = lambda *a, **kw: None
     return runner
+
+
+class _Deadline:
+    def __init__(self):
+        self.cancelled = False
+
+    def cancel(self):
+        self.cancelled = True
+
+
+def _waiting_injection(source, callback):
+    event = MessageEvent(
+        text="wake", source=source, internal=True, allow_gateway_control=False,
+        metadata={"hermes_plugin_injection": True},
+    )
+    event._injection_receipts.append(InjectionReceipt(callback))
+    event._injection_deadline_handle = _Deadline()
+    return event
 
 
 
@@ -159,3 +180,55 @@ async def test_hook_dispatch_failure_does_not_break_interrupt(mock_invoke_hook):
 
     # The interrupt itself still happened despite the hook blowing up.
     running_agent.interrupt.assert_called_once_with("user_stop")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ("stop", "new"))
+@pytest.mark.parametrize("wake_position", (None, "head", "overflow"))
+async def test_busy_stop_and_new_cancel_head_and_fifo_injections(command, wake_position):
+    """Discard old injections exactly once without losing the parked internal wake."""
+    from gateway.run import GatewayRunner
+
+    runner = _make_runner()
+    source = _make_source()
+    session_key = build_session_key(source)
+    runner._sessions = {session_key: SessionState()}
+    runner._sessions[session_key].turn.agent = MagicMock()
+    runner._drop_turn_slot = lambda *_args, **_kwargs: None
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter._pending_messages = {}
+    adapter.get_pending_message = lambda key: adapter._pending_messages.pop(key, None)
+    adapter.handle_message = AsyncMock()
+    outcomes = []
+    head = _waiting_injection(source, outcomes.append)
+    overflow = _waiting_injection(source, outcomes.append)
+    adapter._pending_messages[session_key] = head
+    runner._sessions[session_key].conversation.queued_events.append(overflow)
+    queue = runner._sessions[session_key].conversation.queued_events
+    queue.append(MessageEvent(
+        text="callbackless plugin follow-up", source=source, internal=True,
+        allow_gateway_control=False, metadata={"hermes_plugin_injection": True},
+    ))
+    wake = MessageEvent(text="delegation complete", source=source, internal=True)
+    if wake_position == "head":
+        adapter._pending_messages[session_key] = wake
+        queue.insert(0, head)
+    elif wake_position == "overflow":
+        queue.append(wake)
+    command_event = MessageEvent(text=f"/{command}", source=source)
+
+    if command == "stop":
+        await GatewayRunner._busy_stop_command(runner, command_event, session_key, source)
+    else:
+        runner._handle_reset_command = AsyncMock(return_value="new conversation")
+        await GatewayRunner._busy_new_command(runner, command_event, session_key, source)
+
+    assert outcomes == ["cancelled", "cancelled"]
+    assert head._injection_deadline_handle.cancelled
+    assert overflow._injection_deadline_handle.cancelled
+    if wake_position is None:
+        assert session_key not in adapter._pending_messages
+    else:
+        assert adapter._pending_messages[session_key] is wake
+    assert runner._sessions[session_key].conversation.queued_events == []
+    adapter.handle_message.assert_not_awaited()

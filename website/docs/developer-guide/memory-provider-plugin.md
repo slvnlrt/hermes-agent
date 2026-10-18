@@ -105,11 +105,25 @@ class MyMemoryProvider(MemoryProvider):
         """Called once at agent startup.
 
         kwargs always includes:
+          platform (str): Session surface ("cli", "telegram", "cron", …).
           hermes_home (str): Active HERMES_HOME path. Use for storage.
+          session_source (str): Effective source; may differ from platform
+              when HERMES_SESSION_SOURCE overrides it (e.g. "kanban", "tool").
+          agent_context (str): "primary" for human-facing turns; the execution
+              context, source, or platform ("cron", "tool", "kanban", "subagent",
+              "gateway_hygiene", "background") for automated work.
+
+        Gateway sessions add user_id, user_id_alt, chat_id, chat_type,
+        thread_id, gateway_session_key. Verified local factories may supply
+        user_id from memory.local_user_id when no gateway identity exists (see
+        the user guide). The trust fact is stamped at server admission from
+        stdio or an authenticated Desktop/internal-PTY channel; it is never
+        inferred from platform/session_source strings, persisted state, RPC
+        input, or environment alone. `agent_context` is non-primary for
+        automated work even when its platform remains a human-facing gateway.
         """
         self._api_key = get_secret("MY_API_KEY") or ""
         self._session_id = session_id
-
     # ... implement remaining methods
 ```
 
@@ -127,9 +141,9 @@ fields; callers may initialize a provider without an agent or a session database
 | `session_title_source` | Stored title provenance, when available: `derived`, `llm`, or `user`. Automatic sources must not be mistaken for explicit identity overrides; missing provenance retains a provider's legacy behavior. Shared constants live in `hermes_state_common.py`. |
 | `cwd` | Non-empty logical workspace supplied as `AIAgent(cwd=...)`, available before provider initialization. Omitted for `None` or an empty string. |
 | `gateway_session_key` | Stable messaging-chat identity for per-chat session isolation. |
-| `user_id`, `user_id_alt`, `user_name`, `chat_id` | Gateway identity fields, included when present. |
+| `user_id`, `user_id_alt`, `user_name`, `chat_id` | Transport identity fields, included when present. Only trusted local admission may supply `user_id` from `memory.local_user_id`, and only if neither transport user identifier exists. |
 | `agent_identity` | Active profile name, when available. |
-| `agent_workspace`, `agent_context` | Runtime agent scope. `agent_workspace` is `hermes`; `agent_context` is `cron` for scheduler runs, `subagent` for `delegate_task` children, else `primary` — skip automatic writes for the non-primary values. |
+| `agent_workspace`, `agent_context` | Runtime agent scope. `agent_workspace` is `hermes`; automated execution contexts, session sources, or platforms (`cron`, `tool`, `kanban`, `subagent`, `gateway_hygiene`, `background`) make `agent_context` non-primary, even when the public platform remains human-facing. Otherwise it is `primary`. Skip automatic writes for non-primary values. |
 
 Do not assume `os.getcwd()` identifies the conversation's workspace: one Desktop
 or gateway backend can serve several sessions. If `cwd` is absent and directory

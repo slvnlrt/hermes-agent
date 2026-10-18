@@ -636,7 +636,7 @@ class TeamsAdapter(BasePlatformAdapter):
     async def _on_card_action(
         self, ctx: ActivityContext[AdaptiveCardInvokeActivity]
     ) -> InvokeResponse[AdaptiveCardActionMessageResponse]:
-        from tools.approval import resolve_gateway_approval, has_blocking_approval
+        from tools.approval import resolve_gateway_approval, has_blocking_approval, REQUESTER_MISMATCH
 
         data = ctx.activity.value.action.data or {}
         hermes_action = data.get("hermes_action", "")
@@ -651,7 +651,12 @@ class TeamsAdapter(BasePlatformAdapter):
             return self._invoke_message(t("platform.teams.approval.unknown_action"))
         if not has_blocking_approval(session_key):
             return self._invoke_card([TextBlock(text=t("platform.shared.approval_expired"), wrap=True)])
-        resolve_gateway_approval(session_key, choice)
+        clicker_id = getattr(ctx.activity.from_, "aad_object_id", None) or getattr(ctx.activity.from_, "id", None)
+        count = resolve_gateway_approval(session_key, choice, clicker_id=clicker_id)
+        if count == REQUESTER_MISMATCH:
+            return self._invoke_card([TextBlock(text=t("gateway.approve.wrong_requester"), wrap=True)])
+        if count <= 0:
+            return self._invoke_card([TextBlock(text=t("platform.shared.approval_expired"), wrap=True)])
         body = _approval_body(data.get("cmd", ""), data.get("desc", ""))
         body.append(TextBlock(text=t(_APPROVAL_LABEL_KEYS[choice]), wrap=True, weight="Bolder"))
         return self._invoke_card(body)

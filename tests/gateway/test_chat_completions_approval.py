@@ -51,8 +51,14 @@ async def test_streamed_completion_approval_resolves_via_runs_endpoint(monkeypat
                 return None
             event = await asyncio.wait_for(_first_approval(), 10)
             assert event and event["run_id"].startswith("chatcmpl") and event["command"]
+            from tools import approval as approval_core
+            pending = approval_core.list_gateway_approvals(event["run_id"])
+            assert pending[0]["requester_id"] == adapter._run_owners[event["run_id"]]
+            assert approval_core.resolve_gateway_approval(
+                event["run_id"], "once", clicker_id="foreign-scope") == approval_core.REQUESTER_MISMATCH
             approval = await cli.post(f"/v1/runs/{event['run_id']}/approval", json={"choice": "once"})
             assert approval.status == 200, await approval.text()
+            assert not approval_core.has_blocking_approval(event["run_id"])
             assert "[DONE]" in (await asyncio.wait_for(resp.text(), 10))
     assert decisions and decisions[0]["choice"] == "once"
     assert event["run_id"] not in adapter._run_approval_sessions

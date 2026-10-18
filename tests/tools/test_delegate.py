@@ -2075,10 +2075,8 @@ class TestAtomicChildCredentialBundle(unittest.TestCase):
 
     def test_provider_override_never_borrows_parent_base_url(self):
         parent = _make_mock_parent(depth=0)
-        kwargs = self._build(parent, override_provider="copilot", override_base_url=None, override_api_key="gh-x")
-        self.assertEqual(kwargs["provider"], "copilot")
-        self.assertIsNone(kwargs["base_url"])
-        self.assertNotEqual(kwargs["base_url"], parent.base_url)
+        with self.assertRaisesRegex(ValueError, "API key and base URL"):
+            self._build(parent, override_provider="copilot", override_base_url=None, override_api_key="gh-x")
 
     def test_no_override_inherits_live_endpoint_and_key_together(self):
         parent = _make_mock_parent(depth=0)

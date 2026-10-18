@@ -101,7 +101,8 @@ def _deferred_build_agent_kwargs(current: dict, session_db) -> dict:
     runtime identity (like the eager resume's overrides splat) so the build can't drop the provider. No
     stored runtime, or an unroutable provider → this session's picked model/effort/tier, else the default."""
     kw = {"session_db": session_db, "context_cwd_is_launch_artifact": _context_cwd_is_launch_artifact(current),
-          "platform_override": _session_source(current), "cwd_override": _session_cwd(current)}
+          "platform_override": _session_source(current), "cwd_override": _session_cwd(current),
+          "_local_owner_provenance": _session_is_local_provenance(current)}
     if resume_sid := current.get("resume_session_id"):
         kw["session_id"] = resume_sid
     resume_overrides = current.get("resume_runtime_overrides")
@@ -354,6 +355,9 @@ def _init_session(
             # Async events go to the transport that created the session (stdio for Ink, WS for the dashboard).
             "transport": current_transport() or _stdio_transport,
             "auth_user_id": _transport_auth_user_id(current_transport()),
+            "_local_owner_provenance": (
+                bool(getattr(agent, "_local_owner_provenance", False))
+                or _transport_has_local_owner_provenance(current_transport() or _stdio_transport)),
         }
         _session_todo_state(_sessions[sid])
     _hydrate_session_cwd(sid, key, session_db, profile_home)
@@ -475,6 +479,8 @@ def _deferred_session_record(
         "tool_started_at": {}, "todo_state": todo_state,
         "transport": current_transport() or _stdio_transport,
         "auth_user_id": _transport_auth_user_id(current_transport()),
+        "_local_owner_provenance": _transport_has_local_owner_provenance(
+            current_transport() or _stdio_transport),
     }
 
 

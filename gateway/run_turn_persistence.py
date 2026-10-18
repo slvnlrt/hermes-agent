@@ -558,11 +558,17 @@ class GatewayTurnPersistenceMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
+        if agent_result.get("failed"):
+            event._injection_delivery_confirmed = False
+        if agent_result.get("interrupted"):
+            event._injection_terminal_outcome = "cancelled"
         if diagnostic_wake_muted(event):
+            event._injection_intentional_silence = True
             return None
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
+            event._injection_intentional_silence = True
             response = ""
 
         adapter = self._delivery_adapter_for(source)
@@ -578,16 +584,23 @@ class GatewayTurnPersistenceMixin:
         # Streamed responses still need MEDIA: files delivered (chunks carry the tags verbatim). Never
         # skip when the agent failed: the error text is new content streaming didn't show.
         if agent_result.get("already_sent") and not agent_result.get("failed"):
+            delivery_succeeded = agent_result.get("_queued_delivery_succeeded", True)
             # The queued-follow-up lane uploads this response's attachments itself; re-scanning here
             # would upload every file a second time.
             if response and adapter and not agent_result.get("media_already_delivered"):
-                await self._deliver_media_from_response(response, event, adapter)
+                media_succeeded = await self._deliver_media_from_response(response, event, adapter)
+                delivery_succeeded = delivery_succeeded and media_succeeded is not False
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
             if _footer_line and adapter:
                 try:
-                    await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
+                    footer_result = await adapter.send(
+                        source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
+                    delivery_succeeded = delivery_succeeded and bool(getattr(footer_result, "success", False))
                 except Exception as _e:
+                    delivery_succeeded = False
                     logger.debug("trailing footer send failed: %s", _e)
+            # Streamed text alone does not acknowledge failed attachment/footer obligations.
+            event._injection_delivery_confirmed = delivery_succeeded
             # Return None so the body isn't sent twice; stash the delivered text on the event for the
             # /loop and /goal hooks that read the return value.
             with suppress(Exception):

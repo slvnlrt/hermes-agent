@@ -29,11 +29,12 @@ from tools.delegate_tool_child_run import (
     _lease_child_credential, _merge_late_steer, _register_child, _start_heartbeat, _validate_child_output_schema,
 )
 from tools.delegate_tool_config import (
-    _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children, _get_max_concurrent_children,
-    _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled, _get_subagent_approval_callback, _get_worktree_isolation,
-    _inherit_parent_capabilities, _load_config, _merge_request_overrides, _resolve_child_credential_pool,
-    _resolve_child_runtime, _resolve_delegation_credentials,
-    _subagent_auto_approve, _subagent_auto_deny,
+    _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_child_timeout, _get_max_async_children,
+    _get_max_concurrent_children, _get_max_spawn_depth, _get_oneshot_max_children,
+    _get_orchestrator_enabled, _get_subagent_approval_callback,
+    _get_worktree_isolation, _inherit_parent_capabilities, _load_config, _merge_request_overrides,
+    _resolve_child_credential_pool, _resolve_child_runtime, _resolve_delegation_credentials,
+    _resolve_task_credentials, _subagent_auto_approve, _subagent_auto_deny, _task_route_pins,
 )
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
 from tools.delegate_tool_progress import (
@@ -223,6 +224,8 @@ def _build_child_agent(
     # callers such as /review pass auxiliary.review here so fallback policy is
     # not accidentally read from the general delegation block.
     routing_cfg: Optional[dict[str, Any]] = None,
+    # Raw per-task routing intent, distinct from a batch credential bundle.
+    task_pinned: bool = False,
     # Legacy; accepted for wire compat but ignored (capability is depth-derived).
     role: str = "leaf",
     # Per-task route from the delegation provider (tools/delegate_tool_routes.py): a reasoning
@@ -277,15 +280,16 @@ def _build_child_agent(
             override_acp_command=override_acp_command,
             override_acp_args=override_acp_args,
             routing_cfg=routing_cfg, override_reasoning_effort=override_reasoning_effort,
+            task_pinned=task_pinned, override_service_tier=override_service_tier,
         )
-        if override_service_tier:
-            rt["service_tier"] = override_service_tier
         if override_request_overrides is not None:
             # honored whenever set, incl. the inherit branch where
             # _resolve_delegation_credentials already merged OVER the parent's
             request_overrides = dict(override_request_overrides)
         else:
-            request_overrides = {} if override_provider else dict(getattr(parent_agent, "request_overrides", {}) or {})
+            request_overrides = (
+                {} if override_provider or override_base_url else dict(getattr(parent_agent, "request_overrides", {}) or {})
+            )
         parent_sid = getattr(parent_agent, "session_id", None)
         child_session_db = _open_child_session_db(parent_agent)
         with delegated_child_context():
@@ -425,7 +429,9 @@ def _run_single_child(
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
 
 
-def _credential_overrides(creds: dict[str, Any], routing_cfg: dict[str, Any]) -> dict[str, Any]:
+def _credential_overrides(
+    creds: dict[str, Any], routing_cfg: dict[str, Any], *, task_pinned: bool = False,
+) -> dict[str, Any]:
     """``_build_child_agent`` override kwargs for a resolved credential bundle (delegate_task and the lifecycle API)."""
     return {
         "override_provider": creds["provider"], "override_base_url": creds["base_url"],
@@ -435,13 +441,17 @@ def _credential_overrides(creds: dict[str, Any], routing_cfg: dict[str, Any]) ->
         "override_acp_args": creds.get("args"),
         "override_service_tier": creds.get("service_tier"),
         "routing_cfg": routing_cfg,
+        "task_pinned": task_pinned,
     }
 
 
-def _route_overrides(route: Any) -> dict[str, Any]:
-    """``_build_child_agent`` kwargs for one task route (``tools.delegate_tool_routes.TaskRoute``)."""
+def _route_overrides(route: Any, *, task_pinned: bool = False) -> dict[str, Any]:
+    """``_build_child_agent`` kwargs for one task route (``tools.delegate_tool_routes.TaskRoute``).
+
+    ``task_pinned`` is the task's raw ``tasks[]`` provider/model intent (see ``_apply_task_pins``): the route
+    object itself carries no record of the intent it was resolved from."""
     return {
-        **_credential_overrides(route.creds, route.routing_cfg),
+        **_credential_overrides(route.creds, route.routing_cfg, task_pinned=task_pinned),
         "override_reasoning_effort": route.reasoning_effort, "profile_home": route.profile_home,
     }
 
@@ -465,18 +475,28 @@ def _build_children(
         if _task_schema is not None:
             _child_context = append_output_contract(_child_context, _task_schema)
         try:
+            pin_provider, pin_model = _task_route_pins(t)
             child = _build_child_preserving_parent_tools(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
                 model=route.creds["model"], max_iterations=max_iterations, task_count=len(task_list),
-                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **_route_overrides(route),
+                parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role),
+                **_route_overrides(route, task_pinned=bool(pin_provider or pin_model)),
             )
         except ValueError as exc:
             # An owner refusal can land mid-batch: the siblings built so far hold reservations.
             for _, _, built in children:
-                _detach_child(parent_agent, built)
-                _close_child(built, "Failed to close child after a refused sibling")
-            return [], str(exc)
+                with _quiet("Failed to close child after a refused sibling"):
+                    _detach_child(parent_agent, built)
+                    _close_child(built, "Failed to close child after a refused sibling")
+            return [], f"Task {i}: {exc}"
+        except BaseException:
+            # Not a route refusal (OOM, a test double, a runtime error): still release the siblings' reservations.
+            for _, _, built in children:
+                with _quiet("Failed to close child after a construction failure"):
+                    _detach_child(parent_agent, built)
+                    _close_child(built, "Failed to close child after a construction failure")
+            raise
         pin_child_service_tier(child, route.creds)
         if _task_schema is not None:
             with _quiet("Could not attach output schema to child %d", i):
@@ -503,13 +523,59 @@ def _build_children(
     return children, None
 
 
+def _apply_task_pins(task_list: list[dict[str, Any]], routes: list[Any], parent_agent: Any,
+                     ) -> tuple[list[Any], Optional[str]]:
+    """Re-route each task that pins ``tasks[].provider``/``model`` on top of its delegation-provider route.
+
+    The provider's route vocabulary is the delegation backend's (``agent.delegation_provider``); a task pin is the
+    finer, task-scoped intent on top of it and wins for that child alone. Pins are preflight: an invalid pin
+    (explicit null, a non-string, a provider that cannot resolve) refuses the whole call before any child is
+    constructed, so a late-invalid pin never leaks already-built siblings. A profile route owns its profile's
+    model and credentials (that profile's config decides them), so a pin beside one is refused rather than mixed
+    in. Refused routes keep their refusal entry. Returns ``(routes, None)`` or ``([], "Task <n>: <reason>")``.
+    """
+    from dataclasses import replace
+
+    resolved: list[Any] = []
+    for i, route in enumerate(routes):
+        task = task_list[i]
+        if route.error:
+            resolved.append(route)  # already refused by its backend; its result entry is the refusal
+            continue
+        try:
+            pin_provider, pin_model = _task_route_pins(task)
+            if not (pin_provider or pin_model):
+                resolved.append(route)
+                continue
+            if route.profile_home is not None:
+                raise ValueError(
+                    "a provider/model pin cannot be combined with a profile route; that profile's own config "
+                    "decides its model and credentials"
+                )
+            creds_i, routing_i = _resolve_task_credentials(task, route.creds, route.routing_cfg, parent_agent)
+            declared_tier = route.routing_cfg.get("service_tier") if isinstance(route.routing_cfg, dict) else None
+            if declared_tier not in (None, ""):
+                # A route's speed tier belongs to the route being left: re-check it on the pinned route, so a
+                # tier that route cannot serve refuses this task instead of the child silently running at another.
+                from tools.delegate_tool_tuning import task_service_tier
+                creds_i = {**creds_i, **task_service_tier(str(declared_tier), creds_i, parent_agent)}
+        except ValueError as exc:
+            return [], f"Task {i}: {exc}"
+        resolved.append(replace(route, creds=creds_i, routing_cfg=routing_i))
+    return resolved, None
+
+
 def _routes_for(task_list: list[dict[str, Any]], cfg: dict[str, Any], credentials_cfg: Optional[dict[str, Any]],
                 parent_agent: Any) -> tuple[list[Any], Optional[str]]:
     """Per-task routes: an internal caller's explicit ``credentials_cfg`` (e.g. /review → auxiliary.review) owns
-    every task's route; otherwise the active delegation provider decides each one."""
+    every task's route; otherwise the active delegation provider decides each one, and each task's own
+    ``provider``/``model`` pin then re-routes that child on top of the backend's answer."""
     from tools.delegate_tool_routes import resolve_task_routes, route_for_config
     if credentials_cfg is None:
-        return resolve_task_routes(task_list, cfg, parent_agent)
+        routes, err = resolve_task_routes(task_list, cfg, parent_agent)
+        if err:
+            return [], err
+        return _apply_task_pins(task_list, routes, parent_agent)
     try:
         route = route_for_config(credentials_cfg, parent_agent)
     except ValueError as exc:
@@ -642,8 +708,7 @@ def delegate_task(
 
     from tools.delegation_live_log import create_live_transcripts
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider"),
-        home=_live_home,
+        task_list, context, task_routes=[(r.creds, r.routing_cfg) for r in routes], home=_live_home,
     )
     if refused:  # settled before anything runs: transcripts and manifest show the refusal (async units skip them)
         _settle_refused_transcripts(refused, live_deleg_id, live_writers, _live_home)
@@ -722,7 +787,8 @@ _DESCRIPTION_HEAD = (
     "the parent applies the transition.\n"
 )
 _DESCRIPTION_TAIL = (
-    "- Children inherit the parent model unless pinned via delegation.provider / delegation.model in config.yaml."
+    "- Children inherit the parent model unless a task sets provider/model, or via "
+    "delegation.provider / delegation.model in config.yaml."
 )
 
 def _build_tasks_param_description() -> str:
@@ -824,6 +890,16 @@ DELEGATE_TASK_SCHEMA = {
                             "is enabled; otherwise the whole call returns as one message). Tasks sharing a group return "
                             "together in ONE message; ungrouped tasks return individually as each finishes. This does not "
                             "order execution; if B needs A's output, dispatch B after A returns.",
+                        ),
+                        "provider": _p(
+                            "string",
+                            "Optional provider pin for THIS child only (named provider or a custom providers: table "
+                            "entry). Resolved like CLI/config. Unknown providers fail the spawn; omit or leave blank "
+                            "to inherit the batch/parent route.",
+                        ),
+                        "model": _p(
+                            "string",
+                            "Optional model pin for THIS child only. Omit or leave blank to inherit the batch/parent model.",
                         ),
                     },
                     "required": ["goal"],

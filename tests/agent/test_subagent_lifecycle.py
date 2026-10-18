@@ -283,6 +283,8 @@ def test_routing_delegation_provider_bundle(routing_lifecycle):
     handle = service.launch(SubagentLaunchRequest(goal="route", model="request-model"))
     assert service.wait(handle, timeout_seconds=2).state is SubagentState.SUCCEEDED
     assert build.call_args.kwargs["model"] == "request-model"
+    assert build.call_args.kwargs["task_pinned"] is True
+    assert build.call_args.kwargs["routing_cfg"]["model"] == "request-model"
 
 
 @pytest.mark.parametrize("wire", [False, True])
@@ -313,6 +315,7 @@ def test_routing_request_provider_wins_without_mixing_bundles(routing_lifecycle,
     assert kwargs["override_acp_args"] == []
     assert kwargs["routing_cfg"] == {"provider": "openrouter", "model": "m"}
     resolve.assert_called_once_with(requested="openrouter", target_model="m")
+    assert kwargs["task_pinned"] is True
 
 
 @pytest.mark.parametrize("per_launch", [False, True])
@@ -347,12 +350,33 @@ def test_plugin_toolsets_are_known_toolsets(lifecycle, monkeypatch):
         narrow.launch(SubagentLaunchRequest(goal="use the plugin", allowed_toolsets=("plugin-tools",)))
 
 
-def test_provider_is_plugin_facing_only():
-    """``provider`` lives on the plugin request; no model-facing delegate_task field can carry a route."""
+def test_provider_pins_are_per_task_but_credentials_remain_config_only():
+    """Plugin launch and per-task pins expose identity, never transport credentials."""
     import dataclasses
     from tools.delegate_tool import DELEGATE_TASK_SCHEMA
 
     assert "provider" in {field.name for field in dataclasses.fields(SubagentLaunchRequest)}
     props = DELEGATE_TASK_SCHEMA["parameters"]["properties"]
-    exposed = set(props) | set(props["tasks"]["items"]["properties"])
-    assert not exposed & {"provider", "model", "base_url", "api_key"}
+    assert not set(props) & {"provider", "model", "base_url", "api_key"}
+    task_props = props["tasks"]["items"]["properties"]
+    assert {"provider", "model"} <= set(task_props)
+    assert not set(task_props) & {"base_url", "api_key", "api_mode"}
+
+
+def test_routing_model_only_pin_updates_wire_without_reselecting_account(routing_lifecycle, monkeypatch):
+    service, build, config, resolve = routing_lifecycle
+    config.return_value = {"provider": "opencode-go", "model": "deepseek-v4-flash"}
+    resolve.return_value = {
+        "provider": "opencode-go", "model": "deepseek-v4-flash",
+        "base_url": "https://opencode.ai/zen/go/v1", "api_key": "resolved-account",
+        "api_mode": "chat_completions",
+    }
+    monkeypatch.setattr("hermes_cli.runtime_provider_custom._get_named_custom_provider", lambda _provider: None)
+    handle = service.launch(SubagentLaunchRequest(goal="route", model="minimax-m3"))
+    assert service.wait(handle, timeout_seconds=2).state is SubagentState.SUCCEEDED
+    kwargs = build.call_args.kwargs
+    assert kwargs["model"] == "minimax-m3"
+    assert kwargs["override_api_mode"] == "anthropic_messages"
+    assert kwargs["override_api_key"] == "resolved-account"
+    assert kwargs["override_base_url"] == "https://opencode.ai/zen/go"
+    resolve.assert_called_once_with(requested="opencode-go", target_model="deepseek-v4-flash")

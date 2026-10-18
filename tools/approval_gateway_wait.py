@@ -142,11 +142,25 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     when the notify callback raised. Persisting the choice and building the
     tool-facing result stay with the caller.
 
-    Identical concurrent approvals (same command text + pattern-key set) are
-    coalesced: parallel tool calls would otherwise fire N identical prompts
-    the user must /approve N times while the agent sits wedged. Followers adopt
-    the leader's ``session``/``always``/``deny``/timeout; a ``once`` covers only
-    the leader, so the followers fall through to ONE fresh prompt they coalesce on."""
+    Identical concurrent approvals (same command text, pattern-key set,
+    verified requester, and offered scope policy) are coalesced: parallel tool
+    calls would otherwise fire N identical prompts the user must /approve N
+    times while the agent sits wedged. Followers adopt only a same-principal
+    leader's ``session``/``always``/``deny``/timeout; a ``once`` covers only the
+    leader, so the follower falls through to ONE fresh prompt it coalesces on.
+    Prepared terminal approvals always register their own request so each batch
+    slot publishes a prompt and retains its own cancellation lifecycle."""
+    requester_id = _ctx.get_current_requester_id()
+    approval_data.setdefault("requester_id", requester_id)
+    session_owner = _ctx.current_approval_session_owner()
+    approval_data.setdefault("session_owner_required", session_owner)
+    approval_data.setdefault(
+        "requester_required",
+        surface == "gateway" and _ctx._get_require_requester_match() and not session_owner,
+    )
+    if session_owner and not _ctx.current_approval_session_owner_is_local():
+        approval_data["allow_session"] = False
+        approval_data["allow_permanent"] = False
     from tools import approval as _approval
     from agent.terminal_approval_batch import approval_published, preparing_terminal_approval, register_prepared_approval
 
@@ -158,7 +172,9 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
         "description": approval_data.get("description", ""),
         "pattern_key": primary_key,
         "pattern_keys": list(approval_data.get("pattern_keys", [primary_key])),
-        "session_key": session_key, "surface": surface,
+        "requester_id": approval_data["requester_id"],
+        "session_key": session_key,
+        "surface": surface,
     }
     keys = list(approval_data.get("pattern_keys") or [])
     entry = _ApprovalEntry(approval_data)
@@ -170,14 +186,24 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict, *,
     # The leader lookup and our enqueue are ONE critical section: split, two identical requests both
     # miss each other, both enqueue and the user gets duplicate prompts. A ``once`` releases the
     # followers to prompt for themselves; they re-coalesce behind whichever re-prompts first, so the
-    # user still sees one prompt at a time (the answered leader is already off the queue).
+    # user still sees one prompt at a time (the answered leader is already off the queue). A follower
+    # only adopts a leader bound to the same verified requester and the same offered scope policy.
     while True:
         with _approval._lock:
             leader = None
             if not preparing_terminal_approval():
                 leader = next((e for e in _approval._gateway_queues.get(session_key, [])
                                if e.data.get("command") == approval_data.get("command")
-                               and list(e.data.get("pattern_keys") or []) == keys), None)
+                               and list(e.data.get("pattern_keys") or []) == keys
+                               and e.data.get("requester_id", "") == approval_data["requester_id"]
+                               and bool(e.data.get("requester_required")) == bool(approval_data["requester_required"])
+                               and bool(e.data.get("session_owner_required")) == bool(
+                                   approval_data.get("session_owner_required"))
+                               and (e.data.get("allow_session") is not False) == (
+                                   approval_data.get("allow_session") is not False)
+                               and (e.data.get("allow_permanent") is not False) == (
+                                   approval_data.get("allow_permanent") is not False)
+                               ), None)
             if leader is None:
                 _enqueue()
                 break

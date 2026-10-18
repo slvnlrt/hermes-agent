@@ -730,6 +730,8 @@ async def gateway_ws(ws: WebSocket) -> None:
         ws,
         auth_identity=identity,
         operator=True,  # The dashboard upgrade gate above has verified this operator.
+        # Server admission, not the RPC payload, determines owner eligibility.
+        local_owner_eligible=bool(getattr(ws, "_hermes_local_owner_eligible", False)),
         subprotocol=getattr(ws, "_hermes_ws_subprotocol", None),
     )
 

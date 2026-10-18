@@ -1751,6 +1751,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 with suppress(AttributeError):
                     delattr(event, attr)
 
+
     def _decide_image_input_mode(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
         user_config: Optional[dict] = None, provider: Optional[str] = None,

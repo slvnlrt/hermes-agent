@@ -596,11 +596,23 @@ class PluginContext:
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
         origin: Mapping[str, Any] | None = None,
+        request_id: str | None = None, expires_at: float | None = None,
+        on_complete: Callable[[str], None] | None = None,
     ) -> bool:
-        """Queue *content* for a session (``session_key``) or a chat in this plugin's own profile
-        (``origin``); ``True`` means a host accepted it. Contract: plugins_injection.py, plugin docs."""
+        """Queue *content* for a session (``session_key``), a chat in this plugin's own profile
+        (``origin``), or — with neither — the local session this call is working for (the live gateway
+        picks it); ``True`` means a host accepted it, not that the turn completed. Contract:
+        plugins_injection.py, plugin docs.
+
+        Messaging-gateway requests may carry a process-local terminal ``on_complete`` callback, an
+        opaque ``request_id``, and an ``expires_at`` deadline for waiting work. Synchronous refusal
+        never calls the callback; CLI/TUI admission is not a delivery receipt.
+        """
         from hermes_cli.plugins_injection import inject_plugin_message
-        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin)
+        return inject_plugin_message(
+            self, content, role, session_key=session_key, origin=origin,
+            request_id=request_id, expires_at=expires_at, on_complete=on_complete,
+        )
 
     def session_cwd(self) -> str:
         """The calling session's recorded cwd, never the gateway's own (``plugin_session``)."""

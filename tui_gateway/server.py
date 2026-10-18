@@ -858,8 +858,11 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
                                                     "(update the Hermes app)")
             return
         choice = str(result.get("choice") or "deny")
-        _approval.resolve_gateway_approval(session_key, choice, resolve_all=bool(result.get("all")),
-                                           request_id=request_id or None)
+        _approval.resolve_gateway_approval(
+            session_key, choice, resolve_all=bool(result.get("all")),
+            request_id=request_id or None,
+            session_owner=bool(payload.get("session_owner_required")),
+        )
 
     settle = server_requests.send_async("approval", sid, payload, on_result)
     # The wait can end between the frame going out and the hook attaching (the client answered by RPC, another
@@ -951,7 +954,77 @@ def _current_session_steer_authority(session_id: str) -> tuple[Transport | None,
         return transport, session
 
 
+def _transport_has_local_owner_provenance(transport) -> bool:
+    """Whether server admission, not a client surface claim, marked this transport the session owner.
 
+    Local Desktop/TUI is the stdio transport; the dashboard gate's verified operator and the
+    Desktop-loopback / server-internal PTY admission are the two WebSocket facts that qualify."""
+    return transport is not None and (
+        transport is _stdio_transport
+        or bool(getattr(transport, "_operator", False))
+        or bool(getattr(transport, "_local_owner_eligible", False)))
+
+
+def _configured_local_owner_id() -> bool:
+    """Whether a yet-to-build local session would apply the configured owner."""
+    memory = (_load_cfg().get("memory") or {})
+    value = memory.get("local_user_id", "") if isinstance(memory, dict) else ""
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _session_has_local_owner_scope(session: dict | None) -> bool:
+    """Whether an existing or pending build can use the local memory owner."""
+    session = session or {}
+    if not _session_is_local_provenance(session):
+        return False
+    agent = session.get("agent")
+    if agent is not None:
+        return bool(getattr(agent, "_memory_local_owner_applied", False))
+    return _configured_local_owner_id()
+
+
+def _session_is_local_provenance(session: dict | None) -> bool:
+    """Return the local admission fact unless an anonymous remote joined first."""
+    return bool((session or {}).get("_local_owner_provenance", False)) and not bool(
+        (session or {}).get("_local_owner_mixed", False))
+
+
+def _native_approval_owner_scope(session: dict | None, transport) -> str:
+    """Server-minted native owner scope for an attached transport, else ``""``.
+
+    Local Desktop/TUI uses ``"local"``. Remote dashboards use the authenticated WS
+    principal stamped on both transport and session; another attached login is
+    not interchangeable with that creator.
+    """
+    if not _session_transport_contains(session, transport):
+        return ""
+    if _session_is_local_provenance(session):
+        return "local" if _transport_has_local_owner_provenance(transport) else ""
+    expected = _session_auth_user_id(session)
+    actual = _transport_auth_user_id(transport)
+    return f"user:{expected}" if expected and actual == expected else ""
+
+
+def _attached_native_approval_owner_scope(session: dict | None) -> str:
+    """Recover continuation authority from a real attached owner, never from a fanout identity."""
+    transport = (session or {}).get("transport")
+    peers = transport.transports() if isinstance(transport, FanoutTransport) else (transport,)
+    for peer in peers:
+        if scope := _native_approval_owner_scope(session, peer):
+            return scope
+    return ""
+
+
+def _transport_owns_native_approval(session: dict | None, transport) -> bool:
+    """Whether an attached native transport is the session's admitted human owner."""
+    return bool(_native_approval_owner_scope(session, transport))
+
+
+def _current_native_approval_authority(session_id: str) -> tuple[Transport | None, dict | None]:
+    """Current RPC transport + session when it owns native human approval authority."""
+    transport, session = _current_session_steer_authority(session_id)
+    return ((transport, session) if _transport_owns_native_approval(session, transport)
+            else (None, None))
 
 
 # ── Config I/O ────────────────────────────────────────────────────────
@@ -1711,8 +1784,6 @@ class _RuntimeFallbackResolution(NamedTuple):
     used_fallback: bool
 
 
-
-
 def _hydrate_session_cwd(sid: str, key: str, session_db, profile_home: str | None) -> None:
     """Adopt the stored row's cwd and fill missing Git metadata, or persist a fresh cwd."""
     owns_db, db = False, session_db
@@ -1763,8 +1834,6 @@ def _hydrate_session_cwd(sid: str, key: str, session_db, profile_home: str | Non
         if owns_db and db is not None:
             with contextlib.suppress(Exception):
                 db.close()
-
-
 
 
 # Pet helpers are fail-open throughout: a decode hiccup degrades to a static fallback rather than

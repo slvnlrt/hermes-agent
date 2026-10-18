@@ -105,6 +105,13 @@ class GatewayInboundHooksMixin:
                     from gateway.session_ingress_context import carry_callback
                     rewritten = dataclasses.replace(event, text=_new_text)
                     carry_callback(event, rewritten)
+                    from gateway.platforms.event import event_receipts
+                    if event_receipts(event):
+                        # replace() deliberately omits process-local state. Keep the adapter's
+                        # opening event connected to the rewritten turn's eventual delivery.
+                        rewritten._injection_receipts = event_receipts(event)
+                        rewritten._injection_lifecycle_managed = True
+                        event._injection_processing_event = rewritten
                     event = rewritten
                 break
             if _action == "allow":

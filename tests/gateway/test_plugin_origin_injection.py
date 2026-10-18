@@ -134,10 +134,16 @@ async def test_origin_creates_session_in_own_profile_and_replies_to_origin(gatew
     runner, alpha, beta = gateway.runner, gateway.adapters["alpha"], gateway.adapters["beta"]
     ctx_alpha, mgr_alpha = _context(gateway.homes["alpha"])
     ctx_beta, mgr_beta = _context(gateway.homes["beta"])
+    outcomes = []
     with patch("hermes_cli.plugins._known_plugin_managers", return_value=[mgr_alpha, mgr_beta]):
         await _publish(runner)
-        assert ctx_alpha.inject_message("Kick off the review", origin=_origin("100")) is True
+        assert ctx_alpha.inject_message(
+            "Kick off the review", origin=_origin("100"), request_id="origin-review",
+            expires_at=10**12, on_complete=outcomes.append,
+        ) is True
+        assert outcomes == []
         await _settle(runner, alpha)
+        assert outcomes == ["success"]
         assert ctx_beta.inject_message("Beta's own post", origin=_origin("200")) is True
         await _settle(runner, beta)
         assert ctx_alpha.inject_message("Second post", origin=_origin("101")) is True
@@ -176,15 +182,19 @@ async def test_origin_cannot_reach_another_profile(gateway):
     through a chat the gateway routes to ``beta``. Refusal is synchronous and nothing is created."""
     runner, alpha = gateway.runner, gateway.adapters["alpha"]
     ctx_alpha, mgr_alpha = _context(gateway.homes["alpha"])
+    outcomes = []
     with patch("hermes_cli.plugins._known_plugin_managers", return_value=[mgr_alpha]):
         await _publish(runner)
-        assert ctx_alpha.inject_message("x", origin=_origin("100", profile="beta")) is False
+        assert ctx_alpha.inject_message(
+            "x", origin=_origin("100", profile="beta"), on_complete=outcomes.append,
+        ) is False
         assert ctx_alpha.inject_message("x", origin=_origin("999")) is False  # routed to beta
         assert ctx_alpha.inject_message("x", origin={"platform": "telegram"}) is False  # malformed
         await _settle(runner, alpha)
 
     assert gateway.turns == [] and alpha.sent == [] and gateway.adapters["beta"].sent == []
     assert runner.session_store._entries == {}
+    assert outcomes == []
 
 
 @pytest.mark.asyncio

@@ -135,7 +135,8 @@ class WSTransport:
     deadlock, so it detects that and fires-and-forgets. Loop-thread callers needing completion use ``write_async``."""
 
     def __init__(self, ws: Any, loop: asyncio.AbstractEventLoop, *, peer: str = "unknown",
-                 auth_identity: dict | None = None) -> None:
+                 auth_identity: dict | None = None, operator: bool = False,
+                 local_owner_eligible: bool = False) -> None:
         self._ws = ws
         self._loop = loop
         self._peer = peer
@@ -146,6 +147,12 @@ class WSTransport:
         self.desktop_local = False
         #: The served profile home whose skin this peer follows (None = the launch home); see change_watcher.
         self.skin_home: str | None = None
+        #: Server-admission fact for the local-owner fallback. Only web_server_chat passes True after
+        #: validating a Desktop loopback or server-internal PTY credential; never from RPC params.
+        self._local_owner_eligible = bool(local_owner_eligible)
+        #: Server-admission fact for the dashboard gate: True when the operator credential was verified
+        #: on this socket. Never from RPC params.
+        self._operator = bool(operator)
         self._closed = False
         # Token-coalescing buffer. The lock guards the buffer + "armed" flag against worker threads
         # calling write(); the timer handle is only ever touched on the loop thread.
@@ -404,10 +411,12 @@ class _SendFailed(Exception):
 
 
 async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: str | None = None,
-                    operator: bool = False) -> None:
+                    operator: bool = False, local_owner_eligible: bool = False) -> None:
     """Run one WebSocket session. Wire-compatible with ``tui_gateway.entry``. *auth_identity* is the server-minted
     ``{user_id, provider}`` recorded at WS-upgrade auth, stored as ``WSTransport.auth_identity`` (the only identity
-    authority for browser-controller registration); callers that omit it (harnesses, embedded TUI child) get None."""
+    authority for browser-controller registration); callers that omit it (harnesses, embedded TUI child) get None.
+    ``operator`` (dashboard gate verified) and ``local_owner_eligible`` are server-admission facts, never
+    RPC-provided values."""
     peer, transport = _ws_peer_label(ws), None
     authority_connection = None
     messages = parse_errors = dispatch_crashes = send_failures = 0
@@ -538,7 +547,9 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         _note_dashboard_client_activity(force=True)
         _disable_nagle(ws)
         _log.info("ws accepted peer=%s", peer)
-        transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer, auth_identity=auth_identity)
+        transport = WSTransport(
+            ws, asyncio.get_running_loop(), peer=peer, auth_identity=auth_identity,
+            operator=operator, local_owner_eligible=local_owner_eligible)
         authority_connection = _authority_connection(ws, transport, auth_identity, operator)
         # resolve_skin() is sync I/O + CPU; pooled so the read loop can drain the frontend's initial RPC burst.
         skin_payload = await asyncio.to_thread(server.resolve_skin)

@@ -197,12 +197,34 @@ def _ws_request_view(ws: WebSocket) -> Request:
     })
 
 
-def _ws_auth_reason(ws: WebSocket) -> tuple[Optional[str], str]:
-    """Validate WS-upgrade auth; return ``(reason, credential)``.
+def _is_loopback_ws_peer(ws: "WebSocket") -> bool:
+    return bool(ws.client and str(ws.client.host or "").strip().lower() in _LOOPBACK_HOSTS)
 
-    ``reason`` is None when accepted, else a short token (``no_credential``,
-    ``token_mismatch``, ``ticket_invalid``, ``internal_invalid``);
-    ``credential`` names what was presented so the accept path can log *how*.
+
+def _stamp_local_owner_eligibility(ws: "WebSocket", credential: str, token: str = "") -> None:
+    """Stamp the admission fact for local human channels, never a client claim.
+
+    Desktop must present the credential the Electron parent injected into this
+    loopback backend. The process-internal PTY credential is independently
+    minted and delivered only to the spawned child. Legacy tokens, including
+    arbitrary loopback dashboard clients, remain ineligible.
+    """
+    if credential == "internal" and _is_loopback_ws_peer(ws):
+        ws._hermes_local_owner_eligible = True
+        return
+    desktop_token = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN", "")
+    if (
+        credential == "token"
+        and _is_loopback_ws_peer(ws)
+        and os.environ.get("HERMES_DESKTOP") == "1"
+        and desktop_token
+        and hmac.compare_digest(token.encode(), desktop_token.encode())
+    ):
+        ws._hermes_local_owner_eligible = True
+
+
+def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
+    """Validate the WebSocket credential and stamp server-admission facts.
 
     Loopback / ``--insecure``: legacy ``?token=`` (constant-time compared).
     Gated: ``?ticket=`` (browser-minted, single-use, 30s TTL) or ``?internal=``
@@ -220,6 +242,9 @@ def _ws_auth_reason(ws: WebSocket) -> tuple[Optional[str], str]:
     (``/api/ws``, ``/api/pty``, the audio streams) the grant is refused
     (``native_invalid``) even when a valid ``token`` query credential rides along.
     That is intended; only the plugin WebSocket gate accepts the grant.
+    Legacy loopback tokens authenticate the dashboard but do not establish a
+    local-owner identity. Only the Desktop-owned loopback credential and the
+    server-internal PTY credential can stamp local-owner eligibility.
     """
     from hermes_cli.dashboard_auth.native_http import HEADER, authenticate_native_ws
     from hermes_cli.web_server import _SESSION_TOKEN, app
@@ -231,8 +256,6 @@ def _ws_auth_reason(ws: WebSocket) -> tuple[Optional[str], str]:
         return None, "native"
     auth_required = bool(getattr(app.state, "auth_required", False))
     if auth_required:
-        # Lazy import — keeps this function importable in test harnesses
-        # that don't bring in the dashboard_auth layer.
         from hermes_cli.dashboard_auth.audit import AuditEvent, audit_log
         from hermes_cli.dashboard_auth.ws_tickets import (
             TicketInvalid, consume_internal_credential, consume_ticket)
@@ -257,6 +280,7 @@ def _ws_auth_reason(ws: WebSocket) -> tuple[Optional[str], str]:
         if internal:
             try:
                 _stamp_identity(consume_internal_credential(internal))
+                _stamp_local_owner_eligibility(ws, "internal")
                 return None, "internal"
             except TicketInvalid as exc:
                 _reject(f"internal: {exc}")
@@ -336,6 +360,7 @@ def _ws_auth_reason(ws: WebSocket) -> tuple[Optional[str], str]:
     if not token:
         return "no_credential", "none"
     if hmac.compare_digest(token.encode(), _SESSION_TOKEN.encode()):
+        _stamp_local_owner_eligibility(ws, "token", token)
         return None, "token"
     return "token_mismatch", "token"
 
