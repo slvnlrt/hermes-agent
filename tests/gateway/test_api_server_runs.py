@@ -1958,12 +1958,37 @@ class TestRunIdempotency:
 class TestHostedRoomRuns:
     @pytest.mark.asyncio
     async def test_room_approval_requires_and_resolves_exact_request_id(
-        self, auth_adapter
+        self, auth_adapter, monkeypatch, tmp_path,
     ):
+        from gateway import hosted_rooms
+        from gateway.hosted_room_peer import decode_room_grant, issue_room_grant
+
+        monkeypatch.setattr(hosted_rooms, "default_db_path", lambda: tmp_path / "rooms.db")
+        monkeypatch.setattr(auth_adapter, "_room_grant_secret", lambda: b"x" * 32)
+        grant = issue_room_grant(
+            auth_adapter._room_grant_secret(),
+            grant_id="grant-approval", room_id="room-approval", home_install_id="install-home",
+            authority_gateway_id="gateway-home", authority_epoch=1, member_id="member-reviewer",
+            target_install_id="install-target", target_profile="default",
+        )
+        claims = decode_room_grant(auth_adapter._room_grant_secret(), grant, permission="approve")
+        hosted_rooms.reserve_peer_room(
+            hosted_rooms.default_db_path(), claims=claims,
+            expires_at=float(claims["status_expires_at"]),
+        )
+        headers = {"Authorization": f"HermesRoom {grant}"}
+        admitted_request = MagicMock()
+        admitted_request.headers = headers
+        admitted_request.method = "POST"
+        admitted_request.path = "/v1/runs"
+        scope = auth_adapter._run_idempotency_scope(admitted_request)
         run_id = "run-room-approval"
+        auth_adapter._run_owners[run_id] = scope
         current = approval_gateway_wait._ApprovalEntry({
             "request_id": "approval-B",
             "command": "rm -rf build-B",
+            "requester_id": scope,
+            "requester_required": True,
         })
         auth_adapter._run_approval_sessions[run_id] = run_id
         auth_adapter._run_statuses[run_id] = {
@@ -1975,29 +2000,22 @@ class TestHostedRoomRuns:
             approval_mod._gateway_queues[run_id] = [current]
         app = _create_runs_app(auth_adapter)
         try:
-            with (
-                patch.object(auth_adapter, "_check_run_auth", return_value=None),
-                patch.object(auth_adapter, "_request_owns_run", return_value=True),
-                patch.object(
-                    auth_adapter, "_room_grant_token", return_value="scoped-grant"
-                ),
-            ):
-                async with TestClient(TestServer(app)) as cli:
-                    missing = await cli.post(
-                        f"/v1/runs/{run_id}/approval",
-                        json={"choice": "once"},
-                    )
-                    stale = await cli.post(
-                        f"/v1/runs/{run_id}/approval",
-                        json={"choice": "once", "request_id": "approval-A"},
-                    )
-                    exact = await cli.post(
-                        f"/v1/runs/{run_id}/approval",
-                        json={"choice": "once", "request_id": "approval-B"},
-                    )
-                    missing_body = await missing.json()
-                    stale_body = await stale.json()
-                    exact_body = await exact.json()
+            async with TestClient(TestServer(app)) as cli:
+                missing = await cli.post(
+                    f"/v1/runs/{run_id}/approval", headers=headers,
+                    json={"choice": "once"},
+                )
+                stale = await cli.post(
+                    f"/v1/runs/{run_id}/approval", headers=headers,
+                    json={"choice": "once", "request_id": "approval-A"},
+                )
+                exact = await cli.post(
+                    f"/v1/runs/{run_id}/approval", headers=headers,
+                    json={"choice": "once", "request_id": "approval-B"},
+                )
+                missing_body = await missing.json()
+                stale_body = await stale.json()
+                exact_body = await exact.json()
         finally:
             approval_mod.unregister_gateway_notify(run_id)
 

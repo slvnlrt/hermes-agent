@@ -85,11 +85,15 @@ class TestSmartApproval:
         approval_module.clear_session(session_key)
         approval_module._permanent_approved.clear()
 
-        result = approval_module.check_all_command_guards(command, "local")
+        owner_token = approval_context.set_current_approval_session_owner(True)
+        try:
+            result = approval_module.check_all_command_guards(command, "local")
 
-        assert result["approved"] is True
-        assert result["smart_approved"] is True
-        assert is_approved(session_key, pattern_key) is False
+            assert result["approved"] is True
+            assert result["smart_approved"] is True
+            assert is_approved(session_key, pattern_key) is False
+        finally:
+            approval_context.reset_current_approval_session_owner(owner_token)
 
 
 class TestDetectDangerousRm:

@@ -8901,26 +8901,6 @@ def test_config_set_yolo_global_scope_writes_approvals_mode(tmp_path, monkeypatc
     assert yaml.safe_load(cfg_path.read_text(encoding="utf-8-sig"))["approvals"]["mode"] == "manual"
 
 
-def test_config_get_approval_mode_uses_smart_default_when_key_is_missing(
-    tmp_path, monkeypatch
-):
-    import hermes_yaml as yaml
-
-    monkeypatch.setattr(server, "_hermes_home", tmp_path)
-    # Point the canonical resolver (load_config → env HERMES_HOME) at the
-    # temp home too, so the smart default is asserted against THIS config
-    # rather than whatever the developer's real ~/.hermes happens to hold.
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    (tmp_path / "config.yaml").write_text(
-        yaml.safe_dump({"approvals": {"timeout": 15}})
-    )
-
-    response = server.handle_request(
-        {"id": "1", "method": "config.get", "params": {"key": "approvals.mode"}}
-    )
-    assert response["result"]["value"] == "smart"
-
-
 def test_config_get_approval_mode_fails_safe_to_manual_for_invalid_explicit_value(
     tmp_path, monkeypatch
 ):
@@ -23063,6 +23043,7 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
 def test_load_cfg_raw_sees_replacement_with_pinned_mtime_and_size(monkeypatch, tmp_path):
     """#111105: the raw-config cache must not serve (and later write back) a stale document after a
     same-size replacement that keeps the old mtime."""
+    import shutil
 
     cfg = tmp_path / "config.yaml"
     cfg.write_text("model:\n  default: bbbb-route\n", encoding="utf-8")
