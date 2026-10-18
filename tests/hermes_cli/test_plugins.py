@@ -412,25 +412,23 @@ class TestPluginDiscovery:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
 
         mgr = PluginManager()
+        monkeypatch.setattr(mgr, "_scan_entry_points", list)
 
         def _boom(self_inner):
             raise RuntimeError("sweep failed")
 
-        monkeypatch.setattr(PluginManager, "_discover_and_load_inner", _boom)
-        with pytest.raises(RuntimeError, match="sweep failed"):
-            mgr.discover_and_load()
-        assert mgr._discovered is False, "failed sweep was cached as discovered"
+        with monkeypatch.context() as discovery_patch:
+            discovery_patch.setattr(PluginManager, "_discover_and_load_inner", _boom)
+            with pytest.raises(RuntimeError, match="sweep failed"):
+                mgr.discover_and_load()
 
         # A later call (with discovery healthy again) must do the real scan.
-        monkeypatch.undo()
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
         mgr.discover_and_load()
-        assert mgr._discovered is True
         non_bundled = {
             n: p for n, p in mgr._plugins.items()
             if p.manifest.source != "bundled"
         }
-        assert len(non_bundled) == 1
+        assert set(non_bundled) == {"retry_plugin"}
 
 
     def test_entry_point_function_form_registers(self, tmp_path, monkeypatch):
