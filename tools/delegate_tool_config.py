@@ -351,23 +351,10 @@ def _provider_declares_keyless_or_native_auth(provider: Any, command: Optional[s
 def _require_pinned_transport_credentials(
     provider: Any, base_url: Any, api_key: Any, command: Optional[str] = None,
 ) -> None:
-    """Reject incomplete HTTP pins before ``AIAgent`` can enter ambient routing.
-
-    A named provider pin needs both halves, because a missing key would let the child fall back to
-    the ambient credential of whatever environment it inherits. A bare ``custom`` (or unnamed)
-    endpoint is not ambient: the explicit base URL is the whole route, so a keyless relay stays
-    legitimate and only the URL is mandatory.
-    """
+    """Reject incomplete HTTP pins before ``AIAgent`` can enter ambient routing."""
     if _provider_declares_keyless_or_native_auth(provider, command):
         return
     has_base_url = isinstance(base_url, str) and bool(base_url.strip())
-    if str(provider or "").strip().lower() in {"", "custom"}:
-        if has_base_url:
-            return
-        raise ValueError(
-            f"Pinned delegation endpoint '{provider}' resolved without a base URL. "
-            "Configure the provider route before delegating."
-        )
     has_api_key = bool(api_key.strip()) if isinstance(api_key, str) else api_key is not None
     if not (has_base_url and has_api_key):
         raise ValueError(

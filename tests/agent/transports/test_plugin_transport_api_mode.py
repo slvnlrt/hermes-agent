@@ -93,7 +93,7 @@ def test_registered_plugin_dialect_reaches_every_gate(install_dialect_plugin):
     assert _agent_ladder_mode(runtime["provider"], runtime["base_url"], runtime["api_mode"]) == "example_dialect"
     creds = _direct_endpoint_credentials(
         {"base_url": "https://relay.example.test/v1", "api_mode": "example_dialect", "provider": "", "model": "m",
-         "api_key": None}, None)
+         "api_key": "example-key"}, None)
     assert creds["api_mode"] == "example_dialect"
 
 
