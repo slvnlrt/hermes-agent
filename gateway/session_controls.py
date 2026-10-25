@@ -842,8 +842,12 @@ class AuthorityConnection:
     async def respond(self, ref, params):
         if set(params) != {"session_id", "execution_generation", "prompt_id", "choice"}:
             raise RuntimeStoreError("invalid_params")
+        # The dashboard gate's verified operator and the Desktop-loopback admission are the
+        # server-side facts that make this connection the live session's native owner.
+        owner = self._operator is True or bool(getattr(self.transport, "_local_owner_eligible", False))
         return await self.authority.respond(self.actor, ref, params["execution_generation"],
-                                            params["prompt_id"], {"choice": params["choice"]})
+                                            params["prompt_id"], {"choice": params["choice"]},
+                                            session_owner=owner)
 
     async def respond_clarify(self, ref, params):
         if set(params) != {"session_id", "execution_generation", "prompt_id", "answer"}:

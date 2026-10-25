@@ -124,13 +124,18 @@ async def respond_run(adapter, run_id, body, *, kind):
     if row['status'] != 'started' or type(generation) is not int or generation != row['generation']:
         raise RuntimeStoreError('stale_generation')
     ref = SessionRef(authority.profile_id, row['target_session_id'])
+    try:
+        run_owner_scope = (row['payload'].get('api_turn_v1') or {}).get('run_owner_scope')
+    except (KeyError, TypeError, AttributeError):
+        run_owner_scope = None
     actor = Principal('api', authority.profile_id,
         frozenset({'session:read', 'session:approve', 'session:respond'}), 'api-control:' + uuid.uuid4().hex)
     snapshot = await authority.attach(actor, ref)
     try:
         if not any(p['prompt_id'] == prompt_id and p['kind'] == kind for p in snapshot.prompts):
             raise RuntimeStoreError('approval_not_pending')
-        return await authority.respond(actor, ref, generation, prompt_id, {field: body[field]}, kind=kind)
+        return await authority.respond(actor, ref, generation, prompt_id, {field: body[field]}, kind=kind,
+                                       clicker_id=run_owner_scope or None)
     finally:
         await authority.detach(actor, snapshot.subscription_id)
 

@@ -12,7 +12,8 @@ from tools import approval_gateway_wait as wait_mod
 
 
 SESSION_KEY = "approval-coalesce-race"
-APPROVAL = {"command": "rm -rf build", "description": "d", "pattern_key": "dangerous", "pattern_keys": ["dangerous"]}
+APPROVAL = {"command": "rm -rf build", "description": "d", "pattern_key": "dangerous", "pattern_keys": ["dangerous"],
+            "requester_id": "tester"}
 # Long enough that a follower left waiting on a dead leader is unmistakable; the tests release it on failure.
 APPROVAL_TIMEOUT = 60
 
@@ -153,7 +154,7 @@ def test_identical_requests_racing_to_lead_send_one_prompt(monkeypatch):
     prompts = len(notified)
     queued = len(mod._gateway_queues.get(SESSION_KEY, []))
     # One /approve answers the only prompt (and, on failure, every duplicate so the threads exit).
-    mod.resolve_gateway_approval(SESSION_KEY, "session", resolve_all=True)
+    mod.resolve_gateway_approval(SESSION_KEY, "session", resolve_all=True, clicker_id="tester")
     for thread in threads:
         thread.join(10)
     assert (prompts, queued) == (1, 1)
@@ -191,14 +192,14 @@ def test_followers_released_by_once_share_one_fresh_prompt(monkeypatch):
         thread.start()
     wait_until(lambda: len(follows) == 2, what="both followers waiting on the leader")
 
-    assert mod.resolve_gateway_approval(SESSION_KEY, "once") == 1
+    assert mod.resolve_gateway_approval(SESSION_KEY, "once", clicker_id="tester") == 1
     # Settled: either a duplicate prompt went out per follower, or one follower re-led and the other follows it.
     wait_until(lambda: len(notified) == 3 or (len(notified) == 2 and len(follows) == 3),
                what="released followers re-prompted or re-coalesced")
     prompts = len(notified)
     queued = len(mod._gateway_queues.get(SESSION_KEY, []))
     while any(thread.is_alive() for thread in threads):  # answer each remaining execution once
-        mod.resolve_gateway_approval(SESSION_KEY, "once", resolve_all=True)
+        mod.resolve_gateway_approval(SESSION_KEY, "once", resolve_all=True, clicker_id="tester")
         for thread in threads:
             thread.join(0.05)
     assert (prompts, queued) == (2, 1)

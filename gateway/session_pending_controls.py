@@ -63,7 +63,8 @@ class PendingControls:
                         'execution_generation': prompt['execution_generation']}, event_type=prompt['kind'] + '.settled')
             return tuple(deepcopy(prompt) for _, prompt in self.pending.values())
 
-    def respond(self, session_id, generation, prompt_id, response, *, kind="approval"):
+    def respond(self, session_id, generation, prompt_id, response, *, kind="approval",
+                clicker_id=None, session_owner=False):
         with self.events.lock:
             self.snapshot(session_id, generation)
             entry = self.pending.get(prompt_id)
@@ -95,7 +96,11 @@ class PendingControls:
             if not isinstance(response, dict) or set(response) != {'choice'} or response['choice'] not in prompt['choices']:
                 raise RuntimeStoreError('invalid_params')
             # The tools lock arbitrates native taps versus attached responders;
-            # an exact request ID can never consume the next FIFO approval.
-            resolved = resolve_gateway_approval(route, response['choice'], request_id=prompt_id)
+            # an exact request ID can never consume the next FIFO approval. The
+            # resolver's server-verified identity rides along so a requester-bound
+            # prompt can only be settled by that requester (or its native owner).
+            resolved = resolve_gateway_approval(
+                route, response['choice'], request_id=prompt_id,
+                clicker_id=clicker_id, session_owner=session_owner)
             self.snapshot(session_id, generation)
-            return {'status': 'resolved' if resolved else 'already_resolved', 'prompt_id': prompt_id}
+            return {'status': 'resolved' if resolved > 0 else 'already_resolved', 'prompt_id': prompt_id}

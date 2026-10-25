@@ -3641,7 +3641,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     conversation_history=history, stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress, interim_assistant_callback=_commentary,
                     active_run_id=run_id, approval_notify_callback=approval_notify,
-                    approval_session_key=run_id, **ctx["run_kwargs"])
+                    approval_session_key=run_id, run_owner_scope=self._run_owners.get(run_id),
+                    **ctx["run_kwargs"])
                 await events.flush()
                 is_dict = isinstance(result, dict)
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")

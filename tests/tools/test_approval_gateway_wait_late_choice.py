@@ -10,7 +10,8 @@ from tools import approval_gateway_wait as wait_mod
 
 
 SESSION_KEY = "approval-late-choice"
-APPROVAL = {"command": "rm -rf build", "description": "d", "pattern_key": "dangerous", "pattern_keys": ["dangerous"]}
+APPROVAL = {"command": "rm -rf build", "description": "d", "pattern_key": "dangerous", "pattern_keys": ["dangerous"],
+            "requester_id": "tester"}
 
 
 def _clear():
@@ -25,7 +26,7 @@ def test_choice_landing_after_the_deadline_check_is_resolved(monkeypatch):
 
     def deadline_passed_then_user_answered(event, session_key, *, interrupt_log):
         # The poll loop has already decided "timeout"; the user's /approve lands before the entry leaves the queue.
-        assert mod.resolve_gateway_approval(session_key, "once") == 1
+        assert mod.resolve_gateway_approval(session_key, "once", clicker_id="tester") == 1
         return "timeout"
 
     monkeypatch.setattr(wait_mod, "_poll_event", deadline_passed_then_user_answered)
@@ -69,7 +70,7 @@ def test_resolve_commits_the_choice_before_releasing_the_approval_lock(monkeypat
             return real_lock.__exit__(*exc)
 
     monkeypatch.setattr(mod, "_lock", _Instrumented())
-    assert mod.resolve_gateway_approval(SESSION_KEY, "once", reason="fine") == 1
+    assert mod.resolve_gateway_approval(SESSION_KEY, "once", reason="fine", clicker_id="tester") == 1
     assert seen == {"result_at_release": "once", "event_at_release": True}
     assert entry.reason == "fine"
 

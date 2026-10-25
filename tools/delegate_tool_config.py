@@ -351,10 +351,23 @@ def _provider_declares_keyless_or_native_auth(provider: Any, command: Optional[s
 def _require_pinned_transport_credentials(
     provider: Any, base_url: Any, api_key: Any, command: Optional[str] = None,
 ) -> None:
-    """Reject incomplete HTTP pins before ``AIAgent`` can enter ambient routing."""
+    """Reject incomplete HTTP pins before ``AIAgent`` can enter ambient routing.
+
+    A named provider pin needs both halves, because a missing key would let the child fall back to
+    the ambient credential of whatever environment it inherits. A bare ``custom`` (or unnamed)
+    endpoint is not ambient: the explicit base URL is the whole route, so a keyless relay stays
+    legitimate and only the URL is mandatory.
+    """
     if _provider_declares_keyless_or_native_auth(provider, command):
         return
     has_base_url = isinstance(base_url, str) and bool(base_url.strip())
+    if str(provider or "").strip().lower() in {"", "custom"}:
+        if has_base_url:
+            return
+        raise ValueError(
+            f"Pinned delegation endpoint '{provider}' resolved without a base URL. "
+            "Configure the provider route before delegating."
+        )
     has_api_key = bool(api_key.strip()) if isinstance(api_key, str) else api_key is not None
     if not (has_base_url and has_api_key):
         raise ValueError(
@@ -396,7 +409,8 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
     # Explicit delegation.api_mode always wins over the URL heuristic; a provider plugin's
     # registered dialect counts as explicit.
     from agent.transports import registered_api_modes
-    if v["api_mode"] in _EXPLICIT_API_MODES or (v["api_mode"] and v["api_mode"] in registered_api_modes()):
+    registered_dialect = bool(v["api_mode"] and v["api_mode"] in registered_api_modes())
+    if v["api_mode"] in _EXPLICIT_API_MODES or registered_dialect:
         api_mode = v["api_mode"]
 
     # Preserve the configured provider's request personality on an explicit endpoint.

@@ -276,6 +276,7 @@ async def execute_admission(authority, ref, row):
     captured = {}
     result_token = execution_result.set(captured)
     token = executing_admission.set(True)
+    requester_token = None
     # This drain, not the handler's unwind, releases the turn's crash marker (see below).
     event._turn_marker_handoff = True
     handed = False
@@ -285,6 +286,15 @@ async def execute_admission(authority, ref, row):
                 # Committed media resolves under the owning profile's home, like admission did.
                 prepared = prepare_api_execution(authority, ref, row['payload'])
                 api_execution.set(prepared)
+                # The admission's own auth scope is the turn's verified requester: a requester-bound
+                # approval must be resoluble by that same principal through the control endpoints.
+                try:
+                    run_owner_scope = (row['payload'].get('api_turn_v1') or {}).get('run_owner_scope')
+                except (KeyError, TypeError, AttributeError):
+                    run_owner_scope = None
+                if run_owner_scope:
+                    from tools.approval_context import set_current_requester_id
+                    requester_token = set_current_requester_id(run_owner_scope)
                 if isinstance(event.text, list):
                     # The durable transcript keeps the committed media references (the same
                     # ``[Image attached ...]`` hints native transports persist), not only the caption.
@@ -333,6 +343,9 @@ async def execute_admission(authority, ref, row):
         api_execution.reset(api_token)
         admission_author.reset(author_token)
         viewer_turn.reset(viewer_token)
+        if requester_token is not None:
+            from tools.approval_context import reset_current_requester_id
+            reset_current_requester_id(requester_token)
 
 
 def _launch_body_if_launch_owner(authority):

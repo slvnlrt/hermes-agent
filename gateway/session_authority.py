@@ -987,7 +987,8 @@ class SessionAuthority:
             self.check_approval_generation(session_id, generation)
             live.controls.register_clarify(session_id, generation, entry, timeout_s=timeout_s)
 
-    async def respond(self, actor, ref, generation, prompt_id, response, *, kind="approval"):
+    async def respond(self, actor, ref, generation, prompt_id, response, *, kind="approval",
+                      clicker_id=None, session_owner=False):
         capability = {"approval": "session:approve", "clarify": "session:respond"}.get(kind)
         if capability is None:
             raise RuntimeStoreError("invalid_params")
@@ -1001,7 +1002,8 @@ class SessionAuthority:
             self.check_approval_generation(ref.session_id, generation)
             if not isinstance(prompt_id, str) or not prompt_id:
                 raise RuntimeStoreError("invalid_params")
-            return live.controls.respond(ref.session_id, generation, prompt_id, response, kind=kind)
+            return live.controls.respond(ref.session_id, generation, prompt_id, response, kind=kind,
+                                         clicker_id=clicker_id, session_owner=session_owner)
 
     async def _claim_next(self, ref, live):
         # False asks the pump to re-read after a queued head changed during preflight.

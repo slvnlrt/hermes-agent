@@ -297,7 +297,8 @@ class HostedRoomAuthorityRPC:
         if prompt is None:
             raise RuntimeStoreError('stale_generation')
         return await self.authority.respond(self.principal, self.ref,
-            snapshot.handle.execution_generation, params['request_id'], {'choice': params['choice']})
+            snapshot.handle.execution_generation, params['request_id'], {'choice': params['choice']},
+            clicker_id=self.principal.subject)
 
     def resolve_exact(self, *, profile, title, source):
         return self._call('resolve_exact', profile=profile, title=title, source=source)

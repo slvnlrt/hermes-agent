@@ -127,10 +127,11 @@ class TestApproval:
         approval_module._gateway_queues.pop(session_key, None)
 
         def notify(data):
-            threading.Timer(0.05, approval_module.resolve_gateway_approval, (session_key, "session")).start()
+            threading.Timer(0.05, approval_module.resolve_gateway_approval,
+                            (session_key, "session"), {"clicker_id": "tester"}).start()
 
         approval_data = {"command": SECRET_COMMAND, "description": "privileged install",
-                         "pattern_key": "sudo", "pattern_keys": ["sudo"]}
+                         "pattern_key": "sudo", "pattern_keys": ["sudo"], "requester_id": "tester"}
         decision = approval_gateway_wait._await_gateway_decision(session_key, notify, approval_data)
 
         assert decision["choice"] == "session"
