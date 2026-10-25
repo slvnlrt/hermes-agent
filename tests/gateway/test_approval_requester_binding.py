@@ -617,6 +617,7 @@ def test_turn_runner_approval_identity_uses_only_primary_actor(
     )
     runner = SimpleNamespace(
         _ctx=ctx, _native_image_run_message=lambda: "synthetic prompt",
+        _approval_owner=None,
         _approval_notify_sync=lambda _data: pytest.fail("missing primary actor must not prompt"),
     )
 
